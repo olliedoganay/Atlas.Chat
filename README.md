@@ -8,7 +8,7 @@
 
 Atlas Chat is a local-first desktop app for working with local Ollama models. It provides a multi-thread chat workspace, profile-scoped memory, hardware-aware model discovery, run inspection, and a built-in code runner while keeping Atlas-managed state on the local machine.
 
-Current version: `1.0.32`
+Current version: `1.0.33`
 
 <p align="center">
   <img src="docs/assets/atlas-chat-workspace.png" alt="Atlas Chat workspace" style="max-width: 100%; height: auto;">
@@ -47,7 +47,7 @@ Atlas Chat does not currently publish macOS installers. Use the source workflow 
 
 ## Requirements
 
-- Python 3.11+
+- Python 3.14+
 - Node.js 20+
 - Rust stable toolchain with Cargo
 - Ollama running locally

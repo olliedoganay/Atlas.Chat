@@ -23,7 +23,7 @@ from .graph.builder import AgentApplication, build_chat_application
 from .graph.builder import post_synthesis_node_sequence, pre_synthesis_node_sequence
 from .graph.context import GraphContext
 from .graph.nodes import _build_answer_messages, _finalize_answer_text, _latest_user_text
-from .llm import OllamaCatalogSnapshot, OllamaModelInfo, inspect_local_ollama_models
+from .llm import OllamaCatalogSnapshot, OllamaModelInfo, format_runtime_error, inspect_local_ollama_models
 from .memory.models import MemoryRecord
 from .run_contract import RunEvent, RunHub, TERMINAL_EVENT_TYPES
 from .run_store import PASSWORD_PROTECTED, RunStore
@@ -216,6 +216,8 @@ class AtlasBackendService:
                         )
                     else:
                         raise RuntimeError(f"Unsupported queued run mode: {job.mode}")
+                except Exception as exc:  # pragma: no cover - last-resort worker safety net
+                    self._fail_run_from_exception(job.run_id, exc)
                 finally:
                     with self._control_lock:
                         if self._active_run_id == job.run_id:
@@ -516,11 +518,7 @@ class AtlasBackendService:
         representation_tokens = summary_tokens + raw_message_tokens
 
         auto_compact_ratio = 0.72
-        auto_compact_threshold = (
-            max(1024, int(effective_context_window * auto_compact_ratio))
-            if effective_context_window > 0
-            else 0
-        )
+        auto_compact_threshold = _auto_compact_threshold(effective_context_window)
         auto_compact_margin_tokens = (
             max(0, auto_compact_threshold - representation_tokens)
             if auto_compact_threshold > 0
@@ -1105,7 +1103,7 @@ class AtlasBackendService:
             )
             effective_context_window = int(runtime.context.effective_context_window or 0)
             if effective_context_window > 0:
-                threshold = max(1024, int(effective_context_window * 0.72))
+                threshold = _auto_compact_threshold(effective_context_window)
                 uncompacted_messages = list(state.get("messages", []))[prior_compacted_count:]
                 if self._count_messages_tokens(model=chat_model, messages=uncompacted_messages) > threshold:
                     self._emit_stage(run_id, "compaction")
@@ -1132,6 +1130,8 @@ class AtlasBackendService:
                         after_message_count=len(prior_messages) + 1,
                         reason="auto",
                     )
+                    if updated_compacted_count <= len(prior_messages):
+                        self._checkpoint_compaction_state(config=config, state=state)
 
             self._raise_if_cancelled(run_id)
             self._emit_stage(run_id, "synthesis")
@@ -1251,7 +1251,10 @@ class AtlasBackendService:
                 thread_summary=str(state.get("thread_summary", "") or ""),
                 compacted_message_count=updated_compacted_count,
             )
-            if updated_compacted_count <= prior_compacted_count:
+            if updated_compacted_count <= prior_compacted_count and not (
+                manual_compaction_status == "tightened_summary"
+                and representation_tokens_after < representation_tokens_before
+            ):
                 if manual_compaction_status == "summary_too_large":
                     raise RuntimeError(
                         "Manual compact could not reduce this thread: the generated summary would be larger than "
@@ -1322,22 +1325,27 @@ class AtlasBackendService:
         answer_repair = MojibakeRepairStream()
         thinking_repair = MojibakeRepairStream()
         self._raise_if_cancelled(run_id)
-        for chunk in self.app.llm_provider.chat(
-            runtime.context.chat_model,
-            temperature=runtime.context.chat_temperature,
-            reasoning=runtime.context.reasoning_mode,
-        ).stream(messages):
-            self._raise_if_cancelled(run_id)
-            raw_answer_text, raw_thinking_text = _extract_chunk_stream_parts(chunk, stream_parser)
-            thinking_text = thinking_repair.consume(raw_thinking_text)
-            if thinking_text:
-                thinking_parts.append(thinking_text)
-                self._emit_event(run_id, "thinking_token", {"text": thinking_text})
-            answer_text = answer_repair.consume(raw_answer_text)
-            if answer_text:
-                answer_parts.append(answer_text)
-                self._emit_event(run_id, "token", {"text": answer_text})
-            self._raise_if_cancelled(run_id)
+        try:
+            for chunk in self.app.llm_provider.chat(
+                runtime.context.chat_model,
+                temperature=runtime.context.chat_temperature,
+                reasoning=runtime.context.reasoning_mode,
+            ).stream(messages):
+                self._raise_if_cancelled(run_id)
+                raw_answer_text, raw_thinking_text = _extract_chunk_stream_parts(chunk, stream_parser)
+                thinking_text = thinking_repair.consume(raw_thinking_text)
+                if thinking_text:
+                    thinking_parts.append(thinking_text)
+                    self._emit_event(run_id, "thinking_token", {"text": thinking_text})
+                answer_text = answer_repair.consume(raw_answer_text)
+                if answer_text:
+                    answer_parts.append(answer_text)
+                    self._emit_event(run_id, "token", {"text": answer_text})
+                self._raise_if_cancelled(run_id)
+        except Exception as exc:
+            if self._is_cancelled(run_id):
+                raise
+            raise format_runtime_error(self.config, exc, chat_model=runtime.context.chat_model) from exc
         trailing_answer, trailing_thinking = stream_parser.flush()
         trailing_thinking = thinking_repair.consume(trailing_thinking) + thinking_repair.flush()
         if trailing_thinking:
@@ -1378,6 +1386,22 @@ class AtlasBackendService:
         if self._is_cancelled(run_id):
             raise RuntimeError("Run stopped by user.")
 
+    def _fail_run_from_exception(self, run_id: str, exc: Exception) -> None:
+        error_message = "Run stopped by user." if self._is_cancelled(run_id) else str(exc)
+        try:
+            artifact = self.run_store.get_run(run_id)
+        except Exception:
+            artifact = {}
+        if artifact.get("status") not in {"completed", "failed"}:
+            self.run_store.fail_run(run_id, error=error_message)
+        existing_terminal_events = {
+            str(event.get("type", "") or "")
+            for event in artifact.get("events", [])
+            if isinstance(event, dict)
+        }
+        if "run_completed" not in existing_terminal_events and "run_failed" not in existing_terminal_events:
+            self._emit_event(run_id, "run_failed", {"error": error_message})
+
     def _persist_compaction_event(
         self,
         *,
@@ -1413,6 +1437,18 @@ class AtlasBackendService:
             }
         ]
 
+    def _checkpoint_compaction_state(self, *, config: dict[str, Any], state: dict[str, Any]) -> None:
+        self.app.graph.update_state(
+            config,
+            {
+                "thread_summary": str(state.get("thread_summary", "") or ""),
+                "compacted_message_count": int(state.get("compacted_message_count", 0) or 0),
+                "detected_context_window": int(state.get("detected_context_window", 0) or 0),
+                "timeline_events": list(state.get("timeline_events", [])),
+            },
+            as_node="persist",
+        )
+
     def _maybe_compact_context(self, *, state: dict[str, Any], runtime: SimpleNamespace) -> dict[str, Any]:
         if not getattr(runtime.context, "auto_compact_long_chats", True):
             return {"detected_context_window": int(runtime.context.effective_context_window or 0)}
@@ -1422,20 +1458,27 @@ class AtlasBackendService:
             return {}
 
         all_messages = list(state.get("messages", []))
-        threshold = max(1024, int(effective_context_window * 0.72))
+        threshold = _auto_compact_threshold(effective_context_window)
+        target_after_compaction = _compaction_target_tokens(effective_context_window)
         updated_summary = str(state.get("thread_summary", "") or "")
         compacted_count = max(0, min(int(state.get("compacted_message_count", 0) or 0), len(all_messages)))
         if self._count_messages_tokens(model=runtime.context.chat_model, messages=all_messages[compacted_count:]) <= threshold:
             return {"detected_context_window": effective_context_window}
 
-        recent_window = min(8, max(2, len(all_messages) // 2))
+        protected_recent_count = 1 if all_messages else 0
         max_iterations = 3
 
         while (
             max_iterations > 0
-            and self._count_messages_tokens(model=runtime.context.chat_model, messages=all_messages[compacted_count:]) > threshold
+            and self._count_thread_representation_tokens(
+                model=runtime.context.chat_model,
+                messages=all_messages,
+                thread_summary=updated_summary,
+                compacted_message_count=compacted_count,
+            )
+            > target_after_compaction
         ):
-            cutoff = len(all_messages) - recent_window
+            cutoff = len(all_messages) - protected_recent_count
             if cutoff <= compacted_count:
                 break
             batch_messages, consumed = _select_messages_for_compaction(
@@ -1455,6 +1498,12 @@ class AtlasBackendService:
                 model=runtime.context.chat_model,
                 existing_summary=updated_summary,
                 messages=batch_messages,
+                target_words=_summary_target_words(
+                    existing_summary=updated_summary,
+                    messages=batch_messages,
+                    replacement_tokens=current_representation_tokens,
+                    effective_context_window=effective_context_window,
+                ),
             )
             proposed_compacted_count = compacted_count + consumed
             proposed_representation_tokens = self._count_thread_representation_tokens(
@@ -1528,17 +1577,48 @@ class AtlasBackendService:
             "detected_context_window": effective_context_window,
             "manual_compaction_status": "nothing_to_compact",
         }
-        if len(remaining_messages) <= 2:
-            return no_change_payload
-
         current_representation_tokens = self._count_thread_representation_tokens(
             model=runtime.context.chat_model,
             messages=all_messages,
             thread_summary=updated_summary,
             compacted_message_count=compacted_count,
         )
+        if len(remaining_messages) <= 2:
+            if not updated_summary.strip():
+                return no_change_payload
+            proposed_summary = self._tighten_thread_summary(
+                model=runtime.context.chat_model,
+                existing_summary=updated_summary,
+                target_words=_summary_target_words(
+                    existing_summary=updated_summary,
+                    messages=[],
+                    replacement_tokens=current_representation_tokens,
+                    effective_context_window=effective_context_window,
+                ),
+            )
+            proposed_representation_tokens = self._count_thread_representation_tokens(
+                model=runtime.context.chat_model,
+                messages=all_messages,
+                thread_summary=proposed_summary,
+                compacted_message_count=compacted_count,
+            )
+            if proposed_representation_tokens < current_representation_tokens:
+                return {
+                    "thread_summary": proposed_summary,
+                    "compacted_message_count": compacted_count,
+                    "detected_context_window": effective_context_window,
+                    "manual_compaction_status": "tightened_summary",
+                }
+            return {
+                **no_change_payload,
+                "manual_compaction_status": "summary_too_large",
+            }
+
+        target_after_compaction = _compaction_target_tokens(effective_context_window)
         attempted_summary = False
         attempted_consumed_counts: set[int] = set()
+        best_payload: dict[str, Any] | None = None
+        best_representation_tokens = current_representation_tokens
         max_chars = max(6000, int(max(effective_context_window, 1024) * 3))
         for recent_window in _manual_compaction_recent_windows(
             total_message_count=len(all_messages),
@@ -1577,14 +1657,19 @@ class AtlasBackendService:
                 thread_summary=proposed_summary,
                 compacted_message_count=proposed_compacted_count,
             )
-            if proposed_representation_tokens < current_representation_tokens:
-                return {
+            if proposed_representation_tokens < best_representation_tokens:
+                best_representation_tokens = proposed_representation_tokens
+                best_payload = {
                     "thread_summary": proposed_summary,
                     "compacted_message_count": proposed_compacted_count,
                     "detected_context_window": effective_context_window,
                     "manual_compaction_status": "compacted",
                 }
+                if target_after_compaction <= 0 or proposed_representation_tokens <= target_after_compaction:
+                    return best_payload
 
+        if best_payload is not None:
+            return best_payload
         if attempted_summary:
             return {
                 **no_change_payload,
@@ -1628,6 +1713,35 @@ class AtlasBackendService:
         except Exception:
             fallback = _fallback_summary(existing_summary=existing_summary, transcript=transcript)
             return fallback or existing_summary
+
+    def _tighten_thread_summary(
+        self,
+        *,
+        model: str,
+        existing_summary: str,
+        target_words: int | None = None,
+    ) -> str:
+        summary = existing_summary.strip()
+        if not summary:
+            return existing_summary
+        word_limit = _normalized_summary_word_limit(target_words)
+        prompt = "\n".join(
+            [
+                "Rewrite this existing conversation summary into a much tighter working summary.",
+                "Preserve exact active goals, durable user facts, decisions, constraints, code paths, commands, errors, names, and unresolved tasks.",
+                "Remove repetition, explanations, completed tangents, and generic background detail.",
+                f"Stay under {word_limit} words. Use compact bullets when useful.",
+                "\nExisting summary:\n" + summary,
+            ]
+        )
+        try:
+            response = self.app.llm_provider.chat(model, temperature=0.0, reasoning=False).invoke(
+                [HumanMessage(content=prompt)]
+            )
+            tightened = str(response.content).strip()
+            return tightened or existing_summary
+        except Exception:
+            return existing_summary
 
     def _resolve_thread_model(
         self,
@@ -1838,6 +1952,19 @@ def _manual_compaction_recent_windows(
     return list(range(initial_window, 1, -1))
 
 
+def _auto_compact_threshold(effective_context_window: int) -> int:
+    if effective_context_window <= 0:
+        return 0
+    return max(1024, int(effective_context_window * 0.72))
+
+
+def _compaction_target_tokens(effective_context_window: int) -> int:
+    threshold = _auto_compact_threshold(effective_context_window)
+    if threshold <= 0:
+        return 0
+    return max(512, int(threshold * 0.55))
+
+
 def _summary_target_words(
     *,
     existing_summary: str,
@@ -1847,8 +1974,8 @@ def _summary_target_words(
 ) -> int:
     replacement_word_count = len(_render_messages_for_summary(messages).split()) + len(existing_summary.split())
     replacement_word_cap = max(40, replacement_word_count - 1) if replacement_word_count > 1 else 160
-    token_budget_words = max(40, int(max(1, replacement_tokens) * 0.55))
-    context_budget_words = max(80, int(max(effective_context_window, 1024) * 0.08))
+    token_budget_words = max(40, int(max(1, replacement_tokens) * 0.35))
+    context_budget_words = max(64, int(max(effective_context_window, 1024) * 0.03))
     return _normalized_summary_word_limit(
         min(replacement_word_cap, token_budget_words, context_budget_words)
     )
@@ -1874,6 +2001,9 @@ def _select_messages_for_compaction(
             consumed += 1
             continue
         if selected and used_chars + len(rendered) > max_chars:
+            if isinstance(selected[-1], HumanMessage) and isinstance(message, AIMessage):
+                selected.append(message)
+                consumed += 1
             break
         selected.append(message)
         consumed += 1

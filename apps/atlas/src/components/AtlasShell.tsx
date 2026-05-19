@@ -1,11 +1,14 @@
 import * as ScrollArea from "@radix-ui/react-scroll-area";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   Activity,
   ChevronLeft,
   ChevronRight,
   Compass,
   Copy,
+  Maximize2,
+  Minus,
   Pin,
   Plus,
   RotateCcw,
@@ -48,6 +51,7 @@ const navigation = [
 const NAV_WIDTH_MIN = 200;
 const NAV_WIDTH_MAX = 420;
 const NAV_WIDTH_STEP = 16;
+type WindowAction = "close" | "minimize" | "toggle-maximize";
 
 export function AtlasShell() {
   const location = useLocation();
@@ -386,11 +390,36 @@ export function AtlasShell() {
     usersFetched &&
     users.length === 0 &&
     backendPhase !== "starting";
+  const activeNavigationLabel = navigation.find((item) => item.to === location.pathname)?.label ?? "Atlas";
+  const titlebarLocation = isWorkspaceRoute
+    ? `Workspace / ${displayThreadTitle(currentThreadTitle, currentThreadId, "Main")}`
+    : activeNavigationLabel;
 
   return (
-    <div className={`app-shell ${navCollapsed ? "nav-collapsed" : ""}${isNavResizing ? " nav-resizing" : ""}`} style={shellStyle}>
-      <RunStreamCoordinator />
-      <aside className={`global-nav ${navCollapsed ? "collapsed" : ""}`}>
+    <div className="app-frame">
+      <header className="atlas-titlebar" data-tauri-drag-region>
+        <div className="atlas-titlebar-left" data-tauri-drag-region>
+          <img alt="" aria-hidden="true" className="atlas-titlebar-logo" src="/AtlasLogo.png" />
+          <span className="atlas-titlebar-app-name">Atlas</span>
+        </div>
+        <div className="atlas-titlebar-center" data-tauri-drag-region>
+          <span className="atlas-titlebar-location" data-tauri-drag-region>{titlebarLocation}</span>
+        </div>
+        <div className="atlas-titlebar-controls">
+          <button aria-label="Minimize window" className="atlas-window-button" onClick={() => runWindowAction("minimize")} title="Minimize" type="button">
+            <Minus size={14} strokeWidth={1.8} />
+          </button>
+          <button aria-label="Maximize window" className="atlas-window-button" onClick={() => runWindowAction("toggle-maximize")} title="Maximize" type="button">
+            <Maximize2 size={13} strokeWidth={1.8} />
+          </button>
+          <button aria-label="Close window" className="atlas-window-button atlas-window-button-close" onClick={() => runWindowAction("close")} title="Close" type="button">
+            <X size={15} strokeWidth={1.8} />
+          </button>
+        </div>
+      </header>
+      <div className={`app-shell ${navCollapsed ? "nav-collapsed" : ""}${isNavResizing ? " nav-resizing" : ""}`} style={shellStyle}>
+        <RunStreamCoordinator />
+        <aside className={`global-nav ${navCollapsed ? "collapsed" : ""}`}>
         <div className="brand-lockup">
           <div className="brand-lockup-main">
             {navCollapsed ? <img alt="Atlas Chat" className="brand-logo" src="/AtlasLogo.png" /> : null}
@@ -663,8 +692,24 @@ export function AtlasShell() {
         }}
         open={isSearchOpen}
       />
+      </div>
     </div>
   );
+}
+
+function runWindowAction(action: WindowAction) {
+  try {
+    const appWindow = getCurrentWindow();
+    const command =
+      action === "minimize"
+        ? appWindow.minimize()
+        : action === "toggle-maximize"
+          ? appWindow.toggleMaximize()
+          : appWindow.close();
+    void command.catch(() => undefined);
+  } catch {
+    // The desktop frame is also rendered during browser-based Vite tests.
+  }
 }
 
 function formatDate(value?: string) {

@@ -19,6 +19,7 @@ def format_runtime_error(config: AppConfig, exc: Exception, *, chat_model: str |
         if resolved_chat_model
         else "No chat model was selected. "
     )
+    original_error = str(exc).strip()
     message = (
         "Ollama request failed. "
         f"{model_detail}"
@@ -26,6 +27,13 @@ def format_runtime_error(config: AppConfig, exc: Exception, *, chat_model: str |
         f"base_url={config.ollama_url!r}. "
         "Make sure Ollama is running and the required models are pulled."
     )
+    if original_error:
+        message = f"{message} Original error: {original_error}"
+    if "cuda" in original_error.lower():
+        message = (
+            f"{message} This looks like an Ollama GPU/CUDA runtime failure; restart Ollama, "
+            "then retry or switch to a smaller/local model if it keeps happening."
+        )
     return RuntimeError(message)
 
 

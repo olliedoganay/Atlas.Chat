@@ -1437,7 +1437,7 @@ export function WorkspacePage() {
             <span className="composer-context-meter-label">
               {startManualCompact.isPending || (isStreaming && currentRunMode === "compact")
                 ? "Compacting..."
-                : `${contextMeter.remainingPercent}% of context remaining until auto-compact`}
+                : `${contextMeter.remainingPercent}% until auto-compact`}
             </span>
           </button>
           <div className="composer-send-cluster">
