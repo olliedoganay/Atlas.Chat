@@ -1,6 +1,6 @@
 # Atlas Repo Note
 
-- Repo: `olliedoganay/Atlas.Chat`
+- Repo: `olliedoganay/AtlasChat`
 - Current version: `1.1.1`
 - Stack: Tauri 2 + React/Vite frontend, Rust desktop shell, Python FastAPI backend, Ollama, Docker-backed code runner.
 - Runtime shape: local-first desktop app; Tauri launches a loopback backend protected by a per-launch instance token.

@@ -1,9 +1,9 @@
 # Atlas Chat
 
-[![CI](https://github.com/olliedoganay/Atlas.Chat/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/olliedoganay/Atlas.Chat/actions/workflows/ci.yml)
-[![Windows release](https://github.com/olliedoganay/Atlas.Chat/actions/workflows/release-windows.yml/badge.svg)](https://github.com/olliedoganay/Atlas.Chat/actions/workflows/release-windows.yml)
-[![Linux release](https://github.com/olliedoganay/Atlas.Chat/actions/workflows/release-linux.yml/badge.svg)](https://github.com/olliedoganay/Atlas.Chat/actions/workflows/release-linux.yml)
-[![Latest release](https://img.shields.io/github/v/release/olliedoganay/Atlas.Chat?label=latest%20release)](https://github.com/olliedoganay/Atlas.Chat/releases/latest)
+[![CI](https://github.com/olliedoganay/AtlasChat/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/olliedoganay/AtlasChat/actions/workflows/ci.yml)
+[![Windows release](https://github.com/olliedoganay/AtlasChat/actions/workflows/release-windows.yml/badge.svg)](https://github.com/olliedoganay/AtlasChat/actions/workflows/release-windows.yml)
+[![Linux release](https://github.com/olliedoganay/AtlasChat/actions/workflows/release-linux.yml/badge.svg)](https://github.com/olliedoganay/AtlasChat/actions/workflows/release-linux.yml)
+[![Latest release](https://img.shields.io/github/v/release/olliedoganay/AtlasChat?label=latest%20release)](https://github.com/olliedoganay/AtlasChat/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Atlas Chat is a local-first desktop app for working with local Ollama models. It provides a multi-thread chat workspace, profile-scoped memory, hardware-aware model discovery, run inspection, and a built-in code runner while keeping Atlas-managed state on the local machine.
@@ -18,7 +18,7 @@ Current version: `1.1.1`
 
 For normal desktop usage, install the packaged desktop release instead of running from source.
 
-[Download the latest release](https://github.com/olliedoganay/Atlas.Chat/releases/latest)
+[Download the latest release](https://github.com/olliedoganay/AtlasChat/releases/latest)
 
 ## Highlights
 
@@ -37,7 +37,7 @@ Atlas requires a local Ollama runtime. Docker is optional for chat, but required
 
 ## Install
 
-1. Open `https://github.com/olliedoganay/Atlas.Chat/releases/latest`.
+1. Open `https://github.com/olliedoganay/AtlasChat/releases/latest`.
 2. Download the installer for your platform:
    - Windows: current x64 MSI installer.
    - Linux: current x64 `.deb`, `.rpm`, or AppImage package.

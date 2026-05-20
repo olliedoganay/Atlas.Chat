@@ -98,7 +98,7 @@ fn open_app_location(app: AppHandle, location: String) -> Result<(), String> {
 fn is_allowed_external_url(url: &str) -> bool {
     matches!(
         url,
-        "https://ollama.com/download" | "https://github.com/olliedoganay/Atlas.Chat"
+        "https://ollama.com/download" | "https://github.com/olliedoganay/AtlasChat"
     )
 }
 

@@ -1062,7 +1062,7 @@ export function SettingsPage() {
                 <SettingsRow label="Project" description="Open the public repository for source, issues, and release notes.">
                   <button
                     className="ghost-button compact-button"
-                    onClick={() => void openExternalUrl("https://github.com/olliedoganay/Atlas.Chat")}
+                    onClick={() => void openExternalUrl("https://github.com/olliedoganay/AtlasChat")}
                     type="button"
                   >
                     <ExternalLink size={14} />

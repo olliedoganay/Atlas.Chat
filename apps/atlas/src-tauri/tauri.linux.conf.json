@@ -1,4 +1,5 @@
 {
+  "identifier": "io.github.olliedoganay.AtlasChat",
   "bundle": {
     "targets": ["deb", "rpm", "appimage"],
     "linux": {
