@@ -1,5 +1,6 @@
 import { useQueries, useQuery } from "@tanstack/react-query";
-import { Activity } from "lucide-react";
+import { Activity, Clock, Database, Gauge, Server, ShieldCheck } from "lucide-react";
+import { type ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
 
 import { EmptyState } from "../components/ui/EmptyState";
@@ -45,75 +46,75 @@ export function AdvancedPage() {
     .filter((item): item is NonNullable<(typeof recentRunQueries)[number]["data"]> => Boolean(item));
   const currentThread = threads.find((thread) => thread.thread_id === currentThreadId) ?? null;
   const currentRun = recentRuns.find((run) => run.thread_id === currentThreadId) ?? recentRuns[0] ?? null;
+  const storageHardened =
+    Boolean(status?.security.sqlite_encrypted_at_rest) &&
+    Boolean(status?.security.vector_store_encrypted_at_rest);
 
   return (
     <section className="advanced-page">
-      <div className="workspace-header">
+      <div className="workspace-header advanced-page-header">
         <div className="workspace-header-copy">
           <h1>Diagnostics</h1>
-          <p className="workspace-header-summary">Runtime health and recent run metrics.</p>
+          <p className="workspace-header-summary">Runtime health, storage posture, and recent model timing.</p>
         </div>
       </div>
 
-      <div className="advanced-grid">
-        <article className="stack-card advanced-card">
-          <div className="advanced-card-head">
-            <div>
-              <p className="workspace-section-label">Runtime</p>
-              <h3>Local status</h3>
-            </div>
-          </div>
-          <dl className="advanced-stat-list">
-            <div>
-              <dt>Backend</dt>
-              <dd>{status ? "Online" : "Offline"}</dd>
-            </div>
-            <div>
-              <dt>Ollama</dt>
-              <dd>{models?.ollama_online ? "Connected" : "Unavailable"}</dd>
-            </div>
-            <div>
-              <dt>Models</dt>
-              <dd>{models?.models.length ?? 0}</dd>
-            </div>
-            <div>
-              <dt>Security</dt>
-              <dd>
-                {status?.security.sqlite_encrypted_at_rest && status?.security.vector_store_encrypted_at_rest
-                  ? "Encrypted at rest"
-                  : "Partial hardening"}
-              </dd>
-            </div>
-          </dl>
-        </article>
+      <section className="advanced-health-grid" aria-label="Runtime health">
+        <AdvancedHealthCard
+          detail={status?.backend || "Backend has not reported yet"}
+          icon={<Server size={16} />}
+          label="Backend"
+          tone={status ? "online" : "offline"}
+          value={status ? "Online" : "Offline"}
+        />
+        <AdvancedHealthCard
+          detail={models?.ollama_online ? "Local model server reachable" : "Start Ollama to chat locally"}
+          icon={<Gauge size={16} />}
+          label="Ollama"
+          tone={models?.ollama_online ? "online" : "offline"}
+          value={models?.ollama_online ? "Connected" : "Unavailable"}
+        />
+        <AdvancedHealthCard
+          detail={models?.catalog_source === "ollama" ? "Live Ollama inventory" : "Fallback catalog"}
+          icon={<Database size={16} />}
+          label="Models"
+          tone={models?.has_local_models ? "online" : "warning"}
+          value={`${models?.models.length ?? 0} installed`}
+        />
+        <AdvancedHealthCard
+          detail={status?.security.profile_key_protection || "Profile key status unknown"}
+          icon={<ShieldCheck size={16} />}
+          label="Storage"
+          tone={storageHardened ? "online" : "warning"}
+          value={storageHardened ? "Encrypted" : "Partial"}
+        />
+      </section>
 
-        <article className="stack-card advanced-card">
-          <div className="advanced-card-head">
-            <div>
-              <p className="workspace-section-label">Current thread</p>
-              <h3>{displayThreadTitle(currentThread, currentThreadId, "No active thread")}</h3>
-            </div>
+      <section className="advanced-thread-panel" aria-label="Current thread diagnostics">
+        <div className="advanced-thread-copy">
+          <p className="workspace-section-label">Current thread</p>
+          <h2>{displayThreadTitle(currentThread, currentThreadId, "No active thread")}</h2>
+          <p>{currentThread?.last_prompt ? truncateText(currentThread.last_prompt, 160) : "Open a thread to bind live run metrics here."}</p>
+        </div>
+        <dl className="advanced-thread-metrics">
+          <div>
+            <dt>Model</dt>
+            <dd>{currentThread?.chat_model || "Not set"}</dd>
           </div>
-          <dl className="advanced-stat-list">
-            <div>
-              <dt>Model</dt>
-              <dd>{currentThread?.chat_model || "Not set"}</dd>
-            </div>
-            <div>
-              <dt>Temperature</dt>
-              <dd>{formatTemperature(currentThread?.temperature)}</dd>
-            </div>
-            <div>
-              <dt>Last run</dt>
-              <dd>{currentThread?.last_run_id || "None"}</dd>
-            </div>
-            <div>
-              <dt>Updated</dt>
-              <dd>{formatDate(currentThread?.updated_at)}</dd>
-            </div>
-          </dl>
-        </article>
-      </div>
+          <div>
+            <dt>Temperature</dt>
+            <dd>{formatTemperature(currentThread?.temperature)}</dd>
+          </div>
+          <div>
+            <dt>Last run</dt>
+            <dd>{currentThread?.last_run_id ? shortRunId(currentThread.last_run_id) : "None"}</dd>
+          </div>
+          <div>
+            <dt>Updated</dt>
+            <dd>{formatDate(currentThread?.updated_at)}</dd>
+          </div>
+        </dl>
+      </section>
 
       <div className="advanced-runs">
         <div className="advanced-runs-head">
@@ -121,17 +122,21 @@ export function AdvancedPage() {
             <p className="workspace-section-label">Runs</p>
             <h2>Recent run metrics</h2>
           </div>
-          {currentRun ? <span className="muted-text">Showing the latest local runs for this profile.</span> : null}
+          {currentRun ? (
+            <span className="muted-text">
+              Latest: {displayThreadTitle(currentRun.thread_title, currentRun.thread_id)}
+            </span>
+          ) : null}
         </div>
 
         {recentRuns.length > 0 ? (
           <div className="advanced-run-list">
             {recentRuns.map((run) => (
-              <article className="stack-card advanced-run-card" key={run.run_id}>
+              <article className="advanced-run-card" key={run.run_id}>
                 <div className="advanced-run-head">
                   <div>
                     <strong>{displayThreadTitle(run.thread_title, run.thread_id)}</strong>
-                    <p>{run.chat_model || "Local model"} - {run.mode}</p>
+                    <p>{run.chat_model || "Local model"} · {run.mode}</p>
                   </div>
                   <span
                     className={`status-pill subtle ${run.status === "completed" ? "online" : run.status === "failed" ? "offline" : "muted"}`}
@@ -166,8 +171,11 @@ export function AdvancedPage() {
                   </div>
                 </dl>
                 <div className="advanced-run-foot">
-                  <span>{formatDate(run.started_at)}</span>
-                  <span>{truncateText(run.prompt || "No prompt", 96)}</span>
+                  <span>
+                    <Clock size={13} />
+                    {formatDate(run.started_at)}
+                  </span>
+                  <span>{truncateText(run.prompt || "No prompt", 112)}</span>
                 </div>
               </article>
             ))}
@@ -190,6 +198,31 @@ export function AdvancedPage() {
         )}
       </div>
     </section>
+  );
+}
+
+function AdvancedHealthCard({
+  detail,
+  icon,
+  label,
+  tone,
+  value,
+}: {
+  detail: string;
+  icon: ReactNode;
+  label: string;
+  tone: "online" | "warning" | "offline";
+  value: string;
+}) {
+  return (
+    <article className={`advanced-health-card advanced-health-card-${tone}`}>
+      <span className="advanced-health-icon">{icon}</span>
+      <div>
+        <span>{label}</span>
+        <strong>{value}</strong>
+        <p>{detail}</p>
+      </div>
+    </article>
   );
 }
 
@@ -247,4 +280,8 @@ function truncateText(value: string, maxLength: number) {
     return normalized;
   }
   return `${normalized.slice(0, maxLength).trimEnd()}...`;
+}
+
+function shortRunId(value: string) {
+  return value.length > 8 ? value.slice(0, 8) : value;
 }

@@ -11,6 +11,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from atlas_local.api_service import AtlasBackendService, _estimate_thread_representation_tokens
 from atlas_local.config import load_config
 from atlas_local.graph.builder import execution_node_sequence, post_synthesis_node_sequence, pre_synthesis_node_sequence
+from atlas_local.graph.context import GraphContext
 from atlas_local.llm import OllamaCatalogSnapshot, OllamaModelInfo
 from atlas_local.run_contract import RunHub
 from atlas_local.run_store import RunStore
@@ -187,6 +188,26 @@ class ModelCatalogCachingTests(unittest.TestCase):
         self.assertEqual(payload["catalog_source"], "ollama")
         self.assertTrue(supports_images)
         self.assertEqual(model_info_mock.call_count, 1)
+
+    @patch("atlas_local.api_service.inspect_local_ollama_models")
+    def test_model_catalog_reports_reasoning_support_from_catalog(self, model_info_mock) -> None:
+        model_info_mock.return_value = OllamaCatalogSnapshot(
+            models=(
+                OllamaModelInfo(name="plain-code:latest", supports_reasoning=False, reasoning_mode_strategy="none"),
+                OllamaModelInfo(name="thinker:latest", supports_reasoning=True, reasoning_mode_strategy="boolean"),
+            ),
+            ollama_online=True,
+            has_local_models=True,
+            source="ollama",
+        )
+
+        service = AtlasBackendService.__new__(AtlasBackendService)
+        service.config = SimpleNamespace(chat_model="thinker:latest", chat_temperature=0.2)
+        service._model_catalog_cache = None
+
+        self.assertFalse(AtlasBackendService._model_supports_reasoning(service, "plain-code:latest"))
+        self.assertTrue(AtlasBackendService._model_supports_reasoning(service, "thinker:latest"))
+        self.assertFalse(AtlasBackendService._model_supports_reasoning(service, "missing:latest"))
 
     @patch("atlas_local.api_service.inspect_local_ollama_models")
     def test_model_catalog_reports_ollama_context_window_override(self, model_info_mock) -> None:
@@ -558,11 +579,17 @@ class ContextCompactionTests(unittest.TestCase):
 
     def test_auto_compaction_rejects_non_reducing_summary(self) -> None:
         service = AtlasBackendService.__new__(AtlasBackendService)
+
+        def count_tokens(_model: str, messages: list[HumanMessage | AIMessage]) -> int:
+            total = 0
+            for message in messages:
+                content = str(message.content)
+                total += 10000 if content.startswith("Conversation summary") else len(content) // 4 + 8
+            return total
+
         service.app = SimpleNamespace(
             llm_provider=SimpleNamespace(
-                count_message_tokens=lambda _model, messages: sum(
-                    len(str(message.content)) // 4 + 8 for message in messages
-                ),
+                count_message_tokens=count_tokens,
             )
         )
         service._summarize_message_batch = lambda **_: "bloated summary " * 1000
@@ -588,6 +615,82 @@ class ContextCompactionTests(unittest.TestCase):
 
         self.assertEqual(result["thread_summary"], "")
         self.assertEqual(result["compacted_message_count"], 0)
+
+    def test_auto_compaction_accepts_shallow_reduction_when_context_budget_is_exhausted(self) -> None:
+        service = AtlasBackendService.__new__(AtlasBackendService)
+
+        def count_tokens(_model: str, messages: list[HumanMessage | AIMessage]) -> int:
+            total = 0
+            for message in messages:
+                content = str(message.content)
+                total += 4970 if content.startswith("Conversation summary") else 1000
+            return total
+
+        service.app = SimpleNamespace(llm_provider=SimpleNamespace(count_message_tokens=count_tokens))
+        service._summarize_message_batch = lambda **_: "small saving summary"  # type: ignore[method-assign]
+        state = {
+            "messages": [
+                HumanMessage(content="u1"),
+                AIMessage(content="a1"),
+                HumanMessage(content="u2"),
+                AIMessage(content="a2"),
+                HumanMessage(content="u3"),
+                AIMessage(content="a3"),
+            ],
+            "thread_summary": "",
+            "compacted_message_count": 0,
+        }
+        runtime = SimpleNamespace(
+            context=SimpleNamespace(
+                auto_compact_long_chats=True,
+                effective_context_window=8192,
+                chat_model="gemma4:e4b",
+            )
+        )
+
+        result = AtlasBackendService._maybe_compact_context(service, state=state, runtime=runtime)
+
+        self.assertEqual(result["thread_summary"], "small saving summary")
+        self.assertEqual(result["compacted_message_count"], 5)
+
+    def test_auto_compaction_tightens_summary_when_summary_pushes_context_over_budget(self) -> None:
+        service = AtlasBackendService.__new__(AtlasBackendService)
+
+        def count_tokens(_model: str, messages: list[HumanMessage | AIMessage]) -> int:
+            total = 0
+            for message in messages:
+                content = str(message.content)
+                if "long summary" in content:
+                    total += 6000
+                elif "tight summary" in content:
+                    total += 300
+                else:
+                    total += 100
+            return total
+
+        service.app = SimpleNamespace(llm_provider=SimpleNamespace(count_message_tokens=count_tokens))
+        service._tighten_thread_summary = lambda **_: "tight summary"  # type: ignore[method-assign]
+        state = {
+            "messages": [
+                HumanMessage(content="already compacted"),
+                AIMessage(content="already compacted answer"),
+                HumanMessage(content="latest"),
+            ],
+            "thread_summary": "long summary",
+            "compacted_message_count": 2,
+        }
+        runtime = SimpleNamespace(
+            context=SimpleNamespace(
+                auto_compact_long_chats=True,
+                effective_context_window=8192,
+                chat_model="gemma4:e4b",
+            )
+        )
+
+        result = AtlasBackendService._maybe_compact_context(service, state=state, runtime=runtime)
+
+        self.assertEqual(result["thread_summary"], "tight summary")
+        self.assertEqual(result["compacted_message_count"], 2)
 
     def test_auto_compaction_targets_headroom_and_keeps_current_prompt_raw(self) -> None:
         service = AtlasBackendService.__new__(AtlasBackendService)
@@ -715,6 +818,199 @@ class ContextCompactionTests(unittest.TestCase):
             self.assertEqual(graph_updates[0]["thread_summary"], "tight summary")
             self.assertEqual(graph_updates[0]["compacted_message_count"], 4)
             self.assertEqual(graph_updates[0]["timeline_events"][0]["compaction_reason"], "auto")
+
+    def test_execute_run_persists_auto_summary_tightening_before_synthesis_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = load_config(project_root=Path(temp_dir), env={})
+            store = RunStore(config)
+            graph_updates: list[dict[str, object]] = []
+
+            def count_tokens(_model: str, messages: list[HumanMessage | AIMessage]) -> int:
+                total = 0
+                for message in messages:
+                    content = str(message.content)
+                    if "long summary" in content:
+                        total += 6000
+                    elif "tight summary" in content:
+                        total += 300
+                    else:
+                        total += 100
+                return total
+
+            service = AtlasBackendService(
+                config=config,
+                app=SimpleNamespace(
+                    llm_provider=SimpleNamespace(
+                        abort_active_requests=lambda: None,
+                        effective_context_window=lambda _model: 8192,
+                        count_message_tokens=count_tokens,
+                    ),
+                    graph=SimpleNamespace(
+                        update_state=lambda _config, payload, as_node=None: graph_updates.append(payload)
+                    ),
+                    close=lambda: None,
+                ),
+                run_store=store,
+                run_hub=RunHub(),
+            )
+            service._run_graph_node = lambda **_: None  # type: ignore[method-assign]
+            service._tighten_thread_summary = lambda **_: "tight summary"  # type: ignore[method-assign]
+            service._stream_answer = lambda **_: (_ for _ in ()).throw(  # type: ignore[method-assign]
+                RuntimeError("synthesis failed")
+            )
+            service._get_snapshot = lambda **_: SimpleNamespace(
+                values={
+                    "messages": [
+                        HumanMessage(content="old"),
+                        AIMessage(content="old answer"),
+                    ],
+                    "thread_summary": "long summary",
+                    "compacted_message_count": 2,
+                    "timeline_events": [],
+                }
+            )
+            artifact = store.create_run(
+                mode="chat",
+                user_id="research_user",
+                thread_id="main",
+                chat_model="gpt-oss:20b",
+                temperature=0.2,
+                prompt="continue",
+                status="running",
+            )
+
+            service._execute_run(
+                run_id=artifact["run_id"],
+                prompt="continue",
+                user_id="research_user",
+                thread_id="main",
+                chat_model="gpt-oss:20b",
+                temperature=0.2,
+                reasoning_mode=None,
+                cross_chat_memory=False,
+                auto_compact_long_chats=True,
+                attachments=[],
+            )
+
+            self.assertTrue(graph_updates)
+            self.assertEqual(graph_updates[0]["thread_summary"], "tight summary")
+            self.assertEqual(graph_updates[0]["compacted_message_count"], 2)
+            self.assertEqual(graph_updates[0]["timeline_events"][0]["newly_compacted_message_count"], 0)
+            self.assertEqual(graph_updates[0]["timeline_events"][0]["compaction_reason"], "auto")
+
+    def test_execute_run_auto_compacts_after_large_answer_completes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = load_config(project_root=Path(temp_dir), env={})
+            store = RunStore(config)
+            graph_updates: list[dict[str, object]] = []
+            summarized_batches: list[list[str]] = []
+
+            service = AtlasBackendService(
+                config=config,
+                app=SimpleNamespace(
+                    llm_provider=SimpleNamespace(
+                        abort_active_requests=lambda: None,
+                        effective_context_window=lambda _model: 4096,
+                        count_message_tokens=lambda _model, messages: sum(
+                            len(str(message.content)) // 4 + 8 for message in messages
+                        ),
+                    ),
+                    graph=SimpleNamespace(
+                        update_state=lambda _config, payload, as_node=None: graph_updates.append(payload)
+                    ),
+                    close=lambda: None,
+                ),
+                run_store=store,
+                run_hub=RunHub(),
+            )
+            service._run_graph_node = lambda **_: None  # type: ignore[method-assign]
+
+            def summarize_message_batch(**kwargs) -> str:
+                summarized_batches.append([str(message.content) for message in kwargs["messages"]])
+                return "post answer summary"
+
+            service._summarize_message_batch = summarize_message_batch  # type: ignore[method-assign]
+            service._stream_answer = lambda **_: "final answer\n" + ("code line\n" * 1000)  # type: ignore[method-assign]
+            service._get_snapshot = lambda **_: SimpleNamespace(
+                values={
+                    "messages": [
+                        HumanMessage(content="u1" * 1000),
+                        AIMessage(content="a1" * 1000),
+                        HumanMessage(content="u2" * 1000),
+                        AIMessage(content="a2" * 1000),
+                    ],
+                    "thread_summary": "",
+                    "compacted_message_count": 0,
+                    "timeline_events": [],
+                }
+            )
+            artifact = store.create_run(
+                mode="chat",
+                user_id="research_user",
+                thread_id="main",
+                chat_model="gpt-oss:20b",
+                temperature=0.2,
+                prompt="continue",
+                status="running",
+            )
+
+            service._execute_run(
+                run_id=artifact["run_id"],
+                prompt="continue",
+                user_id="research_user",
+                thread_id="main",
+                chat_model="gpt-oss:20b",
+                temperature=0.2,
+                reasoning_mode=None,
+                cross_chat_memory=False,
+                auto_compact_long_chats=True,
+                attachments=[],
+            )
+
+            stored = store.get_run(artifact["run_id"])
+            self.assertEqual(stored["status"], "completed")
+            self.assertEqual(summarized_batches, [["u1" * 1000, "a1" * 1000, "u2" * 1000, "a2" * 1000]])
+            self.assertEqual(graph_updates[-1]["thread_summary"], "post answer summary")
+            self.assertEqual(graph_updates[-1]["compacted_message_count"], 4)
+            context_event = next(event for event in stored["events"] if event["type"] == "context_compacted")
+            self.assertEqual(context_event["payload"]["compaction_reason"], "auto")
+            self.assertEqual(context_event["payload"]["newly_compacted_message_count"], 4)
+            self.assertEqual(graph_updates[-1]["timeline_events"][0]["after_message_count"], 6)
+
+    def test_stream_answer_reports_empty_model_response(self) -> None:
+        service = AtlasBackendService.__new__(AtlasBackendService)
+
+        class _EmptyChat:
+            def stream(self, messages):
+                return iter(())
+
+        emitted: list[tuple[str, dict[str, object]]] = []
+        service.config = SimpleNamespace()
+        service.app = SimpleNamespace(
+            llm_provider=SimpleNamespace(chat=lambda *_args, **_kwargs: _EmptyChat()),
+            nodes=SimpleNamespace(answer_prompt_template=""),
+        )
+        service._raise_if_cancelled = lambda _run_id: None  # type: ignore[method-assign]
+        service._emit_event = lambda _run_id, event_type, payload: emitted.append((event_type, payload))  # type: ignore[method-assign]
+        runtime = SimpleNamespace(
+            context=GraphContext(
+                user_id="research_user",
+                thread_id="main",
+                session_id="research_user__main",
+                chat_model="gpt-oss:20b",
+                chat_temperature=0.2,
+                cross_chat_memory=False,
+                effective_context_window=8192,
+            )
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "empty response"):
+            AtlasBackendService._stream_answer(
+                service,
+                run_id="run-empty",
+                state={"messages": [HumanMessage(content="continue")]},
+                runtime=runtime,
+            )
 
     def test_get_thread_context_usage_reports_summary_and_raw_breakdown(self) -> None:
         service = AtlasBackendService.__new__(AtlasBackendService)
@@ -1276,7 +1572,7 @@ class ManualCompactionTests(unittest.TestCase):
         self.assertEqual(result["thread_summary"], "manual summary")
         self.assertGreater(result["compacted_message_count"], 0)
         self.assertEqual(result["manual_compaction_status"], "compacted")
-        self.assertEqual(len(summarized_batches), 1)
+        self.assertGreaterEqual(len(summarized_batches), 1)
 
         before_tokens = _estimate_thread_representation_tokens(
             messages=state["messages"],
@@ -1426,11 +1722,17 @@ class ManualCompactionTests(unittest.TestCase):
 
     def test_manual_compact_context_rejects_non_reducing_summary(self) -> None:
         service = AtlasBackendService.__new__(AtlasBackendService)
+
+        def count_tokens(_model: str, messages: list[HumanMessage | AIMessage]) -> int:
+            total = 0
+            for message in messages:
+                content = str(message.content)
+                total += 10000 if content.startswith("Conversation summary") else len(content) // 4 + 8
+            return total
+
         service.app = SimpleNamespace(
             llm_provider=SimpleNamespace(
-                count_message_tokens=lambda _model, messages: sum(
-                    len(str(message.content)) // 4 + 8 for message in messages
-                ),
+                count_message_tokens=count_tokens,
             )
         )
         service._summarize_message_batch = lambda **_: "oversized manual summary " * 1000
@@ -1459,14 +1761,14 @@ class ManualCompactionTests(unittest.TestCase):
         self.assertEqual(result["compacted_message_count"], 0)
         self.assertEqual(result["manual_compaction_status"], "summary_too_large")
 
-    def test_manual_compact_context_rejects_tiny_reduction(self) -> None:
+    def test_manual_compact_context_accepts_tiny_reduction(self) -> None:
         service = AtlasBackendService.__new__(AtlasBackendService)
 
         def count_tokens(_model: str, messages: list[HumanMessage | AIMessage]) -> int:
             total = 0
             for message in messages:
                 content = str(message.content)
-                total += 3900 if "small saving summary" in content else 1000
+                total += 3900 if content.startswith("Conversation summary") else 1000
             return total
 
         service.app = SimpleNamespace(llm_provider=SimpleNamespace(count_message_tokens=count_tokens))
@@ -1492,9 +1794,9 @@ class ManualCompactionTests(unittest.TestCase):
 
         result = AtlasBackendService._manual_compact_context(service, state=state, runtime=runtime)
 
-        self.assertEqual(result["thread_summary"], "")
-        self.assertEqual(result["compacted_message_count"], 0)
-        self.assertEqual(result["manual_compaction_status"], "summary_not_useful")
+        self.assertEqual(result["thread_summary"], "small saving summary")
+        self.assertEqual(result["compacted_message_count"], 4)
+        self.assertEqual(result["manual_compaction_status"], "compacted")
 
     def test_execute_compact_run_persists_manual_timeline_event(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1507,6 +1809,9 @@ class ManualCompactionTests(unittest.TestCase):
                     llm_provider=SimpleNamespace(
                         abort_active_requests=lambda: None,
                         effective_context_window=lambda _model: 4096,
+                        count_message_tokens=lambda _model, messages: sum(
+                            len(str(message.content)) // 4 + 8 for message in messages
+                        ),
                     ),
                     graph=SimpleNamespace(update_state=lambda _config, payload, as_node=None: graph_updates.append(payload)),
                     close=lambda: None,
@@ -1623,6 +1928,12 @@ class ManualCompactionTests(unittest.TestCase):
                     llm_provider=SimpleNamespace(
                         abort_active_requests=lambda: None,
                         effective_context_window=lambda _model: 4096,
+                        count_message_tokens=lambda _model, messages: sum(
+                            10000
+                            if str(message.content).startswith("Conversation summary")
+                            else len(str(message.content)) // 4 + 8
+                            for message in messages
+                        ),
                     ),
                     graph=SimpleNamespace(update_state=lambda *_args, **_kwargs: None),
                     close=lambda: None,
@@ -1673,6 +1984,12 @@ class ManualCompactionTests(unittest.TestCase):
                     llm_provider=SimpleNamespace(
                         abort_active_requests=lambda: None,
                         effective_context_window=lambda _model: 4096,
+                        count_message_tokens=lambda _model, messages: sum(
+                            10000
+                            if str(message.content).startswith("Conversation summary")
+                            else len(str(message.content)) // 4 + 8
+                            for message in messages
+                        ),
                     ),
                     graph=SimpleNamespace(update_state=lambda *_args, **_kwargs: None),
                     close=lambda: None,

@@ -25,6 +25,8 @@ import { EmptyState } from "../components/ui/EmptyState";
 import { SettingsRow } from "../components/ui/SettingsRow";
 import { StatusPill } from "../components/ui/StatusPill";
 import packageInfo from "../../package.json";
+import tauriConfig from "../../src-tauri/tauri.conf.json";
+import tauriLinuxConfig from "../../src-tauri/tauri.linux.conf.json";
 import {
   createMemory,
   createUser,
@@ -76,7 +78,6 @@ export function SettingsPage() {
   const [pendingDeleteUserId, setPendingDeleteUserId] = useState<string | null>(null);
   const [unlockTargetUserId, setUnlockTargetUserId] = useState<string | null>(null);
   const [unlockPassword, setUnlockPassword] = useState("");
-  const [appVersion, setAppVersion] = useState(packageInfo.version);
   const [appDiagnostics, setAppDiagnostics] = useState<Awaited<ReturnType<typeof getAppDiagnostics>> | null>(null);
   const [contextWindowIndex, setContextWindowIndex] = useState(0);
   const { data: status } = useQuery({
@@ -157,6 +158,17 @@ export function SettingsPage() {
       security?.sqlite_encrypted_at_rest &&
       security?.vector_store_encrypted_at_rest,
   );
+  const frontendVersion = packageInfo.version;
+  const desktopVersion = String(tauriConfig.version || frontendVersion);
+  const appVersion = desktopVersion || frontendVersion;
+  const backendRuntimeVersion = status?.version?.trim() || "";
+  const manifestsInSync = frontendVersion === desktopVersion;
+  const backendVersionMatchesApp = !backendRuntimeVersion || backendRuntimeVersion === appVersion;
+  const versionAlignmentDescription = backendVersionMatchesApp
+    ? "The running backend reports the same version as the desktop bundle."
+    : `The desktop bundle is v${appVersion}, but the running backend reports v${backendRuntimeVersion}. Restart Atlas or rebuild the backend if this is a dev session.`;
+  const releaseTargets = releaseTargetLabels();
+  const desktopIdentifiers = appIdentifierLabels();
 
   useEffect(() => {
     setSection(requestedSection);
@@ -180,13 +192,6 @@ export function SettingsPage() {
     currentUser,
     usersFetched,
   ]);
-
-  useEffect(() => {
-    const backendVersion = status?.version?.trim();
-    if (backendVersion) {
-      setAppVersion(backendVersion);
-    }
-  }, [status?.version]);
 
   useEffect(() => {
     const index = configuredContextWindow ? contextWindowChoices.indexOf(configuredContextWindow) : 0;
@@ -969,8 +974,8 @@ export function SettingsPage() {
                     <p className="eyebrow">Desktop application</p>
                     <h3 id="about-product-title">{status?.product_name || "Atlas Chat"}</h3>
                     <p>
-                      Workspace for local Ollama models with profile-scoped chats, local memory, model discovery,
-                      diagnostics, and code execution support.
+                      Local-first workspace for Ollama chat, image and file attachments, context compaction,
+                      model discovery, diagnostics, and the multi-language code runner.
                     </p>
                   </div>
                 </div>
@@ -979,12 +984,12 @@ export function SettingsPage() {
                   <div className="settings-about-status-item">
                     <span>Version</span>
                     <strong>{`v${appVersion}`}</strong>
-                    <p>Application</p>
+                    <p>{manifestsInSync ? "Desktop bundle" : "Manifest mismatch"}</p>
                   </div>
                   <div className="settings-about-status-item">
                     <span>Backend</span>
                     <strong>{status ? "Online" : "Unavailable"}</strong>
-                    <p>{status?.runtime_mode || "Waiting for runtime"}</p>
+                    <p>{backendRuntimeVersion ? `Runtime v${backendRuntimeVersion}` : status?.runtime_mode || "Waiting for runtime"}</p>
                   </div>
                   <div className="settings-about-status-item">
                     <span>Ollama</span>
@@ -1004,6 +1009,39 @@ export function SettingsPage() {
               </section>
 
               <div className="settings-rows settings-about-rows">
+                <SettingsRow
+                  label="Version alignment"
+                  description={versionAlignmentDescription}
+                >
+                  <StatusPill intent={manifestsInSync && backendVersionMatchesApp ? "ok" : "warn"}>
+                    {manifestsInSync && backendVersionMatchesApp ? "Aligned" : "Review"}
+                  </StatusPill>
+                </SettingsRow>
+
+                <SettingsRow
+                  label="Release manifests"
+                  description="About reads these from the checked-in frontend and Tauri manifests."
+                >
+                  <ChipList>
+                    <Chip intent="accent">{`Frontend v${frontendVersion}`}</Chip>
+                    <Chip intent={desktopVersion === frontendVersion ? "accent" : "muted"}>{`Desktop v${desktopVersion}`}</Chip>
+                  </ChipList>
+                </SettingsRow>
+
+                <SettingsRow
+                  label="Capabilities"
+                  description="This list is maintained in the app surface so the About page reflects what Atlas actually exposes."
+                >
+                  <ChipList>
+                    <Chip>Local Ollama chat</Chip>
+                    <Chip>Attachments</Chip>
+                    <Chip>Context compaction</Chip>
+                    <Chip>Discovery</Chip>
+                    <Chip>Diagnostics</Chip>
+                    <Chip>Code runner</Chip>
+                  </ChipList>
+                </SettingsRow>
+
                 <SettingsRow
                   label="Data boundary"
                   description="Profiles, chats, saved runs, and memory are stored under Atlas-managed local data folders."
@@ -1054,9 +1092,25 @@ export function SettingsPage() {
 
                 <SettingsRow
                   label="Release"
-                  description="Version tags build Windows and Linux release assets through GitHub Actions."
+                  description="Version tags build the desktop bundle targets declared by the checked-in Tauri manifests."
                 >
-                  <Chip intent="accent">{`v${appVersion}`}</Chip>
+                  <ChipList>
+                    <Chip intent="accent">{`v${appVersion}`}</Chip>
+                    {releaseTargets.map((target) => (
+                      <Chip intent="muted" key={target}>{target}</Chip>
+                    ))}
+                  </ChipList>
+                </SettingsRow>
+
+                <SettingsRow
+                  label="Application IDs"
+                  description="Installer and Linux identity are read from the same desktop manifests used for release builds."
+                >
+                  <ChipList>
+                    {desktopIdentifiers.map((identifier) => (
+                      <Chip intent="muted" key={identifier}>{identifier}</Chip>
+                    ))}
+                  </ChipList>
                 </SettingsRow>
 
                 <SettingsRow label="Project" description="Open the public repository for source, issues, and release notes.">
@@ -1182,6 +1236,55 @@ function formatPlatformLabel(value?: string) {
     return "macOS";
   }
   return value;
+}
+
+function releaseTargetLabels() {
+  const targets = new Set<string>();
+  for (const target of readBundleTargets(tauriConfig.bundle?.targets)) {
+    targets.add(formatBundleTarget(target));
+  }
+  for (const target of readBundleTargets(tauriLinuxConfig.bundle?.targets)) {
+    targets.add(formatBundleTarget(target));
+  }
+  return Array.from(targets);
+}
+
+function readBundleTargets(value: unknown) {
+  if (Array.isArray(value)) {
+    return value.filter((item): item is string => typeof item === "string" && Boolean(item.trim()));
+  }
+  if (typeof value === "string" && value.trim()) {
+    return [value];
+  }
+  return [];
+}
+
+function formatBundleTarget(value: string) {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "msi") {
+    return "MSI";
+  }
+  if (normalized === "deb") {
+    return "DEB";
+  }
+  if (normalized === "rpm") {
+    return "RPM";
+  }
+  if (normalized === "appimage") {
+    return "AppImage";
+  }
+  return value;
+}
+
+function appIdentifierLabels() {
+  const labels = new Set<string>();
+  if (tauriConfig.identifier) {
+    labels.add(`Windows ${tauriConfig.identifier}`);
+  }
+  if (tauriLinuxConfig.identifier) {
+    labels.add(`Linux ${tauriLinuxConfig.identifier}`);
+  }
+  return Array.from(labels);
 }
 
 function getMutationErrorMessage(error: unknown) {

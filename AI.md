@@ -1,7 +1,7 @@
 # Atlas Repo Note
 
 - Repo: `olliedoganay/AtlasChat`
-- Current version: `1.1.1`
+- Current version: `1.1.2`
 - Stack: Tauri 2 + React/Vite frontend, Rust desktop shell, Python FastAPI backend, Ollama, Docker-backed code runner.
 - Runtime shape: local-first desktop app; Tauri launches a loopback backend protected by a per-launch instance token.
 
@@ -112,7 +112,7 @@ When changing language specs, run focused `tests.test_code_runner` coverage and 
 
 ## Releases
 
-- Current release tag: `v1.1.1`
+- Current release tag: `v1.1.2`
 - `scripts/bump_atlas_version.py` updates this file and `README.md` together with the release manifests.
 - `scripts/check_atlas_version.py` validates this file and `README.md` together with the release manifests.
 - Windows release workflow publishes MSI artifacts.

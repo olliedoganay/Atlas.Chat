@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "atlas-local"
-version = "1.1.1"
+version = "1.1.2"
 description = "Local desktop chat runtime with persistent memory for Atlas."
 readme = "README.md"
 license = { text = "MIT" }

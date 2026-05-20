@@ -111,6 +111,7 @@ export type ModelCatalog = {
     name: string;
     family?: string;
     families?: string[];
+    capabilities?: string[];
     supports_images?: boolean;
     supports_reasoning?: boolean;
     reasoning_mode_strategy?: "none" | "boolean" | "levels";

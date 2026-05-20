@@ -1089,6 +1089,8 @@ class AtlasBackendService:
         image_attachments = [item for item in validated_attachments if item.get("kind") == "image"]
         if image_attachments and not self._model_supports_images(chat_model):
             raise RuntimeError(f"Model '{chat_model}' does not appear to support image input.")
+        if _reasoning_mode_requested(reasoning_mode) and not self._model_supports_reasoning(chat_model):
+            reasoning_mode = "off"
         effective_context_window = self.app.llm_provider.effective_context_window(chat_model)
         new_user_message = HumanMessage(
             content=_build_user_message_content(prompt, validated_attachments),
@@ -1140,44 +1142,15 @@ class AtlasBackendService:
             )
 
             self._raise_if_cancelled(run_id)
-            prior_compacted_count = int(state.get("compacted_message_count", 0) or 0)
-            representation_tokens_before = self._count_thread_representation_tokens(
-                model=chat_model,
-                messages=state.get("messages", []),
-                thread_summary=str(state.get("thread_summary", "") or ""),
-                compacted_message_count=prior_compacted_count,
+            self._apply_auto_compaction(
+                run_id=run_id,
+                config=config,
+                state=state,
+                runtime=runtime,
+                after_message_count=len(prior_messages) + 1,
+                protected_recent_count=1,
+                checkpoint_when_compacted_count_at_most=len(prior_messages),
             )
-            effective_context_window = int(runtime.context.effective_context_window or 0)
-            if effective_context_window > 0:
-                threshold = _auto_compact_threshold(effective_context_window)
-                uncompacted_messages = list(state.get("messages", []))[prior_compacted_count:]
-                if self._count_messages_tokens(model=chat_model, messages=uncompacted_messages) > threshold:
-                    self._emit_stage(run_id, "compaction")
-            compaction = self._maybe_compact_context(state=state, runtime=runtime)
-            if compaction:
-                state.update(compaction)
-                updated_compacted_count = int(state.get("compacted_message_count", 0) or 0)
-                representation_tokens_after = self._count_thread_representation_tokens(
-                    model=chat_model,
-                    messages=state.get("messages", []),
-                    thread_summary=str(state.get("thread_summary", "") or ""),
-                    compacted_message_count=updated_compacted_count,
-                )
-                if (
-                    updated_compacted_count > prior_compacted_count
-                    and representation_tokens_after < representation_tokens_before
-                ):
-                    self._persist_compaction_event(
-                        run_id=run_id,
-                        state=state,
-                        prior_compacted_count=prior_compacted_count,
-                        representation_tokens_before=representation_tokens_before,
-                        representation_tokens_after=representation_tokens_after,
-                        after_message_count=len(prior_messages) + 1,
-                        reason="auto",
-                    )
-                    if updated_compacted_count <= len(prior_messages):
-                        self._checkpoint_compaction_state(config=config, state=state)
 
             self._raise_if_cancelled(run_id)
             self._emit_stage(run_id, "synthesis")
@@ -1192,6 +1165,16 @@ class AtlasBackendService:
                 rationale="Synthesized the final answer from the current thread and retrieved memory context.",
                 inputs={"memory_items": len(state.get("retrieved_memories", []))},
                 outputs={"answer_chars": len(answer)},
+            )
+
+            self._apply_auto_compaction(
+                run_id=run_id,
+                config=config,
+                state=state,
+                runtime=runtime,
+                after_message_count=len(state.get("messages", [])),
+                protected_recent_count=2,
+                checkpoint_when_compacted_count_at_most=None,
             )
 
             self._emit_stage(run_id, "memory_persistence")
@@ -1411,6 +1394,11 @@ class AtlasBackendService:
         suffix = answer[len(answer_body):]
         if suffix:
             self._emit_event(run_id, "token", {"text": suffix})
+        if not answer:
+            raise RuntimeError(
+                "Model returned an empty response. If this thread is near the context limit, compact it "
+                "and retry so Atlas can send a smaller prompt."
+            )
         return answer
 
     def _run_graph_node(
@@ -1500,7 +1488,83 @@ class AtlasBackendService:
             as_node="persist",
         )
 
-    def _maybe_compact_context(self, *, state: dict[str, Any], runtime: SimpleNamespace) -> dict[str, Any]:
+    def _apply_auto_compaction(
+        self,
+        *,
+        run_id: str,
+        config: dict[str, Any],
+        state: dict[str, Any],
+        runtime: SimpleNamespace,
+        after_message_count: int,
+        protected_recent_count: int,
+        checkpoint_when_compacted_count_at_most: int | None,
+    ) -> bool:
+        if not getattr(runtime.context, "auto_compact_long_chats", True):
+            return False
+
+        chat_model = str(getattr(runtime.context, "chat_model", "") or "")
+        effective_context_window = int(getattr(runtime.context, "effective_context_window", 0) or 0)
+        prior_compacted_count = int(state.get("compacted_message_count", 0) or 0)
+        prior_thread_summary = str(state.get("thread_summary", "") or "")
+        representation_tokens_before = self._count_thread_representation_tokens(
+            model=chat_model,
+            messages=state.get("messages", []),
+            thread_summary=prior_thread_summary,
+            compacted_message_count=prior_compacted_count,
+        )
+        if effective_context_window > 0:
+            threshold = _auto_compact_threshold(effective_context_window)
+            if threshold > 0 and representation_tokens_before >= threshold:
+                self._emit_stage(run_id, "compaction")
+
+        compaction = self._maybe_compact_context(
+            state=state,
+            runtime=runtime,
+            protected_recent_count=protected_recent_count,
+        )
+        if not compaction:
+            return False
+
+        state.update(compaction)
+        updated_compacted_count = int(state.get("compacted_message_count", 0) or 0)
+        representation_tokens_after = self._count_thread_representation_tokens(
+            model=chat_model,
+            messages=state.get("messages", []),
+            thread_summary=str(state.get("thread_summary", "") or ""),
+            compacted_message_count=updated_compacted_count,
+        )
+        if not (
+            (
+                updated_compacted_count > prior_compacted_count
+                or str(state.get("thread_summary", "") or "") != prior_thread_summary
+            )
+            and representation_tokens_after < representation_tokens_before
+        ):
+            return False
+
+        self._persist_compaction_event(
+            run_id=run_id,
+            state=state,
+            prior_compacted_count=prior_compacted_count,
+            representation_tokens_before=representation_tokens_before,
+            representation_tokens_after=representation_tokens_after,
+            after_message_count=after_message_count,
+            reason="auto",
+        )
+        if (
+            checkpoint_when_compacted_count_at_most is not None
+            and updated_compacted_count <= checkpoint_when_compacted_count_at_most
+        ):
+            self._checkpoint_compaction_state(config=config, state=state)
+        return True
+
+    def _maybe_compact_context(
+        self,
+        *,
+        state: dict[str, Any],
+        runtime: SimpleNamespace,
+        protected_recent_count: int = 1,
+    ) -> dict[str, Any]:
         if not getattr(runtime.context, "auto_compact_long_chats", True):
             return {"detected_context_window": int(runtime.context.effective_context_window or 0)}
 
@@ -1513,24 +1577,50 @@ class AtlasBackendService:
         target_after_compaction = _compaction_target_tokens(effective_context_window)
         updated_summary = str(state.get("thread_summary", "") or "")
         compacted_count = max(0, min(int(state.get("compacted_message_count", 0) or 0), len(all_messages)))
-        if self._count_messages_tokens(model=runtime.context.chat_model, messages=all_messages[compacted_count:]) <= threshold:
+        current_representation_tokens = self._count_thread_representation_tokens(
+            model=runtime.context.chat_model,
+            messages=all_messages,
+            thread_summary=updated_summary,
+            compacted_message_count=compacted_count,
+        )
+        if threshold > 0 and current_representation_tokens < threshold:
             return {"detected_context_window": effective_context_window}
 
-        protected_recent_count = 1 if all_messages else 0
+        protected_recent_count = max(0, min(int(protected_recent_count or 0), len(all_messages)))
         max_iterations = 3
 
         while (
             max_iterations > 0
-            and self._count_thread_representation_tokens(
-                model=runtime.context.chat_model,
-                messages=all_messages,
-                thread_summary=updated_summary,
-                compacted_message_count=compacted_count,
-            )
-            > target_after_compaction
+            and (target_after_compaction <= 0 or current_representation_tokens > target_after_compaction)
         ):
             cutoff = len(all_messages) - protected_recent_count
             if cutoff <= compacted_count:
+                if updated_summary.strip():
+                    proposed_summary = self._tighten_thread_summary(
+                        model=runtime.context.chat_model,
+                        existing_summary=updated_summary,
+                        target_words=_summary_target_words(
+                            existing_summary=updated_summary,
+                            messages=[],
+                            replacement_tokens=current_representation_tokens,
+                            effective_context_window=effective_context_window,
+                        ),
+                    )
+                    proposed_representation_tokens = self._count_thread_representation_tokens(
+                        model=runtime.context.chat_model,
+                        messages=all_messages,
+                        thread_summary=proposed_summary,
+                        compacted_message_count=compacted_count,
+                    )
+                    if _compaction_gain_is_acceptable(
+                        before_tokens=current_representation_tokens,
+                        after_tokens=proposed_representation_tokens,
+                        effective_context_window=effective_context_window,
+                        allow_shallow=current_representation_tokens >= threshold,
+                    ):
+                        updated_summary = proposed_summary
+                        current_representation_tokens = proposed_representation_tokens
+                        state["thread_summary"] = updated_summary
                 break
             batch_messages, consumed = _select_messages_for_compaction(
                 all_messages[compacted_count:cutoff],
@@ -1539,12 +1629,6 @@ class AtlasBackendService:
             if not batch_messages or consumed <= 0:
                 break
 
-            current_representation_tokens = self._count_thread_representation_tokens(
-                model=runtime.context.chat_model,
-                messages=all_messages,
-                thread_summary=updated_summary,
-                compacted_message_count=compacted_count,
-            )
             proposed_summary = self._summarize_message_batch(
                 model=runtime.context.chat_model,
                 existing_summary=updated_summary,
@@ -1557,21 +1641,33 @@ class AtlasBackendService:
                 ),
             )
             proposed_compacted_count = compacted_count + consumed
-            proposed_representation_tokens = self._count_thread_representation_tokens(
-                model=runtime.context.chat_model,
-                messages=all_messages,
-                thread_summary=proposed_summary,
-                compacted_message_count=proposed_compacted_count,
-            )
-            if not _compaction_gain_is_worthwhile(
-                before_tokens=current_representation_tokens,
-                after_tokens=proposed_representation_tokens,
-                effective_context_window=effective_context_window,
+            best_summary: str | None = None
+            best_representation_tokens = current_representation_tokens
+            for candidate_summary in _compaction_summary_candidates(
+                existing_summary=updated_summary,
+                messages=batch_messages,
+                primary_summary=proposed_summary,
             ):
+                candidate_representation_tokens = self._count_thread_representation_tokens(
+                    model=runtime.context.chat_model,
+                    messages=all_messages,
+                    thread_summary=candidate_summary,
+                    compacted_message_count=proposed_compacted_count,
+                )
+                if _compaction_gain_is_acceptable(
+                    before_tokens=current_representation_tokens,
+                    after_tokens=candidate_representation_tokens,
+                    effective_context_window=effective_context_window,
+                    allow_shallow=current_representation_tokens >= threshold,
+                ) and candidate_representation_tokens < best_representation_tokens:
+                    best_summary = candidate_summary
+                    best_representation_tokens = candidate_representation_tokens
+            if best_summary is None:
                 break
 
-            updated_summary = proposed_summary
+            updated_summary = best_summary
             compacted_count = proposed_compacted_count
+            current_representation_tokens = best_representation_tokens
             state["thread_summary"] = updated_summary
             state["compacted_message_count"] = compacted_count
             max_iterations -= 1
@@ -1665,18 +1761,14 @@ class AtlasBackendService:
                 thread_summary=proposed_summary,
                 compacted_message_count=compacted_count,
             )
-            if _compaction_gain_is_worthwhile(
-                before_tokens=current_representation_tokens,
-                after_tokens=proposed_representation_tokens,
-                effective_context_window=effective_context_window,
-            ):
+            if proposed_representation_tokens < current_representation_tokens:
                 return {
                     "thread_summary": proposed_summary,
                     "compacted_message_count": compacted_count,
                     "detected_context_window": effective_context_window,
                     "manual_compaction_status": "tightened_summary",
                 }
-            if proposed_representation_tokens < current_representation_tokens:
+            if proposed_representation_tokens == current_representation_tokens:
                 return {
                     **no_change_payload,
                     "manual_compaction_status": "summary_not_useful",
@@ -1686,12 +1778,10 @@ class AtlasBackendService:
                 "manual_compaction_status": "summary_too_large",
             }
 
-        target_after_compaction = _compaction_target_tokens(effective_context_window)
         attempted_summary = False
         attempted_consumed_counts: set[int] = set()
         best_payload: dict[str, Any] | None = None
         best_representation_tokens = current_representation_tokens
-        found_shallow_reduction = False
         max_chars = max(6000, int(max(effective_context_window, 1024) * 3))
         for recent_window in _manual_compaction_recent_windows(
             total_message_count=len(all_messages),
@@ -1724,36 +1814,36 @@ class AtlasBackendService:
                 ),
             )
             proposed_compacted_count = compacted_count + consumed
-            proposed_representation_tokens = self._count_thread_representation_tokens(
-                model=runtime.context.chat_model,
-                messages=all_messages,
-                thread_summary=proposed_summary,
-                compacted_message_count=proposed_compacted_count,
-            )
-            if proposed_representation_tokens < current_representation_tokens:
-                found_shallow_reduction = True
-            if _compaction_gain_is_worthwhile(
-                before_tokens=current_representation_tokens,
-                after_tokens=proposed_representation_tokens,
-                effective_context_window=effective_context_window,
-            ) and proposed_representation_tokens < best_representation_tokens:
-                best_representation_tokens = proposed_representation_tokens
-                best_payload = {
-                    "thread_summary": proposed_summary,
-                    "compacted_message_count": proposed_compacted_count,
-                    "detected_context_window": effective_context_window,
-                    "manual_compaction_status": "compacted",
-                }
-                if target_after_compaction <= 0 or proposed_representation_tokens <= target_after_compaction:
-                    return best_payload
+            for candidate_summary in _compaction_summary_candidates(
+                existing_summary=updated_summary,
+                messages=batch_messages,
+                primary_summary=proposed_summary,
+            ):
+                proposed_representation_tokens = self._count_thread_representation_tokens(
+                    model=runtime.context.chat_model,
+                    messages=all_messages,
+                    thread_summary=candidate_summary,
+                    compacted_message_count=proposed_compacted_count,
+                )
+                if (
+                    _compaction_gain_is_acceptable(
+                        before_tokens=current_representation_tokens,
+                        after_tokens=proposed_representation_tokens,
+                        effective_context_window=effective_context_window,
+                        allow_shallow=True,
+                    )
+                    and proposed_representation_tokens < best_representation_tokens
+                ):
+                    best_representation_tokens = proposed_representation_tokens
+                    best_payload = {
+                        "thread_summary": candidate_summary,
+                        "compacted_message_count": proposed_compacted_count,
+                        "detected_context_window": effective_context_window,
+                        "manual_compaction_status": "compacted",
+                    }
 
         if best_payload is not None:
             return best_payload
-        if found_shallow_reduction:
-            return {
-                **no_change_payload,
-                "manual_compaction_status": "summary_not_useful",
-            }
         if attempted_summary:
             return {
                 **no_change_payload,
@@ -1991,6 +2081,12 @@ class AtlasBackendService:
                 return item.supports_images
         return False
 
+    def _model_supports_reasoning(self, model_name: str) -> bool:
+        for item in self._get_model_catalog().models:
+            if item.name == model_name:
+                return bool(item.supports_reasoning and item.reasoning_mode_strategy != "none")
+        return False
+
     def _get_model_catalog(self, *, ttl_seconds: float = 10.0) -> OllamaCatalogSnapshot:
         cached = self._model_catalog_cache
         now = monotonic()
@@ -2083,6 +2179,22 @@ def _compaction_gain_is_worthwhile(
     return gain >= minimum_gain
 
 
+def _compaction_gain_is_acceptable(
+    *,
+    before_tokens: int,
+    after_tokens: int,
+    effective_context_window: int,
+    allow_shallow: bool = False,
+) -> bool:
+    if _compaction_gain_is_worthwhile(
+        before_tokens=before_tokens,
+        after_tokens=after_tokens,
+        effective_context_window=effective_context_window,
+    ):
+        return True
+    return allow_shallow and after_tokens < before_tokens
+
+
 def _summary_target_words(
     *,
     existing_summary: str,
@@ -2096,6 +2208,38 @@ def _summary_target_words(
     context_budget_words = max(64, int(max(effective_context_window, 1024) * 0.03))
     return _normalized_summary_word_limit(
         min(replacement_word_cap, token_budget_words, context_budget_words)
+    )
+
+
+def _compaction_summary_candidates(
+    *,
+    existing_summary: str,
+    messages: list[HumanMessage | AIMessage],
+    primary_summary: str,
+) -> list[str]:
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for candidate in (
+        primary_summary,
+        _fallback_compaction_summary(existing_summary=existing_summary, messages=messages),
+    ):
+        cleaned = str(candidate or "").strip()
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(cleaned)
+    return candidates
+
+
+def _fallback_compaction_summary(*, existing_summary: str, messages: list[HumanMessage | AIMessage]) -> str:
+    transcript = _render_messages_for_summary(messages)
+    pins = _compaction_exact_pins(existing_summary=existing_summary, transcript=transcript)
+    return _apply_compaction_pins(
+        _fallback_summary(existing_summary=existing_summary, transcript=transcript, pins=pins),
+        pins,
     )
 
 
@@ -2346,6 +2490,11 @@ def _safe_stream_boundary(data: str, marker: str) -> int:
         if data.endswith(marker[:overlap]):
             return len(data) - overlap
     return len(data)
+
+
+def _reasoning_mode_requested(value: str | None) -> bool:
+    normalized = str(value or "").strip().lower()
+    return normalized not in {"", "off", "false", "none", "default"}
 
 
 def _validated_attachments(attachments: list[dict[str, Any]]) -> list[dict[str, Any]]:

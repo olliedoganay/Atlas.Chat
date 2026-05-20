@@ -17,7 +17,15 @@ import {
   Workflow,
   X,
 } from "lucide-react";
-import { type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, useEffect, useMemo, useState } from "react";
+import {
+  type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 
 import {
@@ -52,6 +60,17 @@ const NAV_WIDTH_MIN = 200;
 const NAV_WIDTH_MAX = 420;
 const NAV_WIDTH_STEP = 16;
 type WindowAction = "close" | "minimize" | "toggle-maximize";
+type WindowResizeDirection = Parameters<ReturnType<typeof getCurrentWindow>["startResizeDragging"]>[0];
+const WINDOW_RESIZE_HANDLES: Array<{ className: string; direction: WindowResizeDirection }> = [
+  { className: "north", direction: "North" },
+  { className: "east", direction: "East" },
+  { className: "south", direction: "South" },
+  { className: "west", direction: "West" },
+  { className: "north-east", direction: "NorthEast" },
+  { className: "north-west", direction: "NorthWest" },
+  { className: "south-east", direction: "SouthEast" },
+  { className: "south-west", direction: "SouthWest" },
+];
 
 export function AtlasShell() {
   const location = useLocation();
@@ -82,6 +101,7 @@ export function AtlasShell() {
   const [threadToDelete, setThreadToDelete] = useState<ThreadSummary | null>(null);
   const [isSearchOpen, setIsSearchOpen] = useState(false);
   const [isNavResizing, setIsNavResizing] = useState(false);
+  const [isWindowMaximized, setIsWindowMaximized] = useState(true);
 
   const {
     data: status,
@@ -267,6 +287,60 @@ export function AtlasShell() {
   }, [currentUserLocked]);
 
   useEffect(() => {
+    let mounted = true;
+    let unlistenResize: (() => void) | undefined;
+    let unlistenMove: (() => void) | undefined;
+
+    const syncMaximizedState = () => {
+      try {
+        void getCurrentWindow()
+          .isMaximized()
+          .then((maximized) => {
+            if (mounted) {
+              setIsWindowMaximized(maximized);
+            }
+          })
+          .catch(() => undefined);
+      } catch {
+        setIsWindowMaximized(false);
+      }
+    };
+
+    try {
+      const appWindow = getCurrentWindow();
+      syncMaximizedState();
+      void appWindow
+        .onResized(() => syncMaximizedState())
+        .then((unlisten) => {
+          if (mounted) {
+            unlistenResize = unlisten;
+          } else {
+            unlisten();
+          }
+        })
+        .catch(() => undefined);
+      void appWindow
+        .onMoved(() => syncMaximizedState())
+        .then((unlisten) => {
+          if (mounted) {
+            unlistenMove = unlisten;
+          } else {
+            unlisten();
+          }
+        })
+        .catch(() => undefined);
+    } catch {
+      setIsWindowMaximized(false);
+    }
+
+    return () => {
+      mounted = false;
+      unlistenResize?.();
+      unlistenMove?.();
+    };
+  }, []);
+
+  useEffect(() => {
     if (isWorkspaceRoute && !currentThreadId && threadItems.length) {
       setCurrentThreadId(threadItems[0].thread_id);
       setCurrentThreadTitle(editableThreadTitle(threadItems[0].title, threadItems[0].thread_id));
@@ -397,13 +471,27 @@ export function AtlasShell() {
 
   return (
     <div className="app-frame">
-      <header className="atlas-titlebar" data-tauri-drag-region>
-        <div className="atlas-titlebar-left" data-tauri-drag-region>
-          <img alt="" aria-hidden="true" className="atlas-titlebar-logo" src="/AtlasLogo.png" />
-          <span className="atlas-titlebar-app-name">Atlas</span>
+      {isWindowMaximized ? null : (
+        <div aria-hidden="true" className="atlas-window-resize-shell">
+          {WINDOW_RESIZE_HANDLES.map(({ className, direction }) => (
+            <div
+              className={`atlas-window-resize-handle ${className}`}
+              key={direction}
+              onPointerDown={(event) => startWindowResize(event, direction)}
+            />
+          ))}
         </div>
-        <div className="atlas-titlebar-center" data-tauri-drag-region>
-          <span className="atlas-titlebar-location" data-tauri-drag-region>{titlebarLocation}</span>
+      )}
+      <header
+        className="atlas-titlebar"
+        onDoubleClick={handleTitlebarDoubleClick}
+        onPointerDown={startWindowDrag}
+      >
+        <div className="atlas-titlebar-left">
+          <img alt="" aria-hidden="true" className="atlas-titlebar-logo" src="/AtlasLogo.png" />
+        </div>
+        <div className="atlas-titlebar-center">
+          <span className="atlas-titlebar-location">{titlebarLocation}</span>
         </div>
         <div className="atlas-titlebar-controls">
           <button aria-label="Minimize window" className="atlas-window-button" onClick={() => runWindowAction("minimize")} title="Minimize" type="button">
@@ -710,6 +798,47 @@ function runWindowAction(action: WindowAction) {
   } catch {
     // The desktop frame is also rendered during browser-based Vite tests.
   }
+}
+
+function startWindowDrag(event: ReactPointerEvent<HTMLElement>) {
+  if (event.button !== 0 || event.detail > 1 || isWindowControlTarget(event.target)) {
+    return;
+  }
+  event.preventDefault();
+  try {
+    void getCurrentWindow().startDragging().catch(() => undefined);
+  } catch {
+    // The desktop frame is also rendered during browser-based Vite tests.
+  }
+}
+
+function startWindowResize(event: ReactPointerEvent<HTMLDivElement>, direction: WindowResizeDirection) {
+  if (event.button !== 0) {
+    return;
+  }
+  event.preventDefault();
+  event.stopPropagation();
+  try {
+    const appWindow = getCurrentWindow();
+    void appWindow
+      .isMaximized()
+      .then((maximized) => (maximized ? undefined : appWindow.startResizeDragging(direction)))
+      .catch(() => undefined);
+  } catch {
+    // The desktop frame is also rendered during browser-based Vite tests.
+  }
+}
+
+function handleTitlebarDoubleClick(event: ReactMouseEvent<HTMLElement>) {
+  if (isWindowControlTarget(event.target)) {
+    return;
+  }
+  event.preventDefault();
+  runWindowAction("toggle-maximize");
+}
+
+function isWindowControlTarget(target: EventTarget | null) {
+  return target instanceof HTMLElement && Boolean(target.closest("button, a, input, select, textarea, [role='button']"));
 }
 
 function formatDate(value?: string) {

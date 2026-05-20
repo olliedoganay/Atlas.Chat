@@ -34,10 +34,21 @@ def format_runtime_error(config: AppConfig, exc: Exception, *, chat_model: str |
     )
     if original_error:
         message = f"{message} Original error: {original_error}"
-    if "cuda" in original_error.lower():
+    normalized_error = original_error.lower()
+    if "cuda" in normalized_error:
         message = (
             f"{message} This looks like an Ollama GPU/CUDA runtime failure; restart Ollama, "
             "then retry or switch to a smaller/local model if it keeps happening."
+        )
+    if "out of memory" in normalized_error:
+        message = (
+            f"{message} Ollama also reported GPU memory exhaustion. Lower the Ollama context window "
+            "in Settings > Models or switch to a smaller model before retrying."
+        )
+    if any(marker in normalized_error for marker in ("context length", "maximum context", "num_ctx", "prompt too long", "too many tokens")):
+        message = (
+            f"{message} The prompt appears too large for this model context. Compact the thread, lower the "
+            "requested context window, or switch to a model with a larger stable context."
         )
     return RuntimeError(message)
 
@@ -217,6 +228,7 @@ class OllamaModelInfo:
     name: str
     family: str = ""
     families: tuple[str, ...] = ()
+    capabilities: tuple[str, ...] = ()
     supports_images: bool = False
     supports_reasoning: bool = False
     reasoning_mode_strategy: str = "none"
@@ -224,6 +236,7 @@ class OllamaModelInfo:
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["families"] = list(self.families)
+        payload["capabilities"] = list(self.capabilities)
         return payload
 
 
@@ -258,20 +271,31 @@ def inspect_local_ollama_models(config: AppConfig, *, timeout_seconds: float = 3
         if not isinstance(item, dict):
             continue
         name = str(item.get("name", "")).strip()
-        if not name or name in seen or not _is_chat_capable_model(item):
+        if not name or name in seen:
+            continue
+        show_payload = _ollama_json_request(
+            config,
+            "api/show",
+            timeout_seconds=min(timeout_seconds, 1.5),
+            body={"model": name},
+        )
+        model_payload = _merge_ollama_model_payload(item, show_payload)
+        if not _is_chat_capable_model(model_payload):
             continue
         seen.add(name)
-        details = item.get("details", {}) if isinstance(item.get("details"), dict) else {}
+        details = model_payload.get("details", {}) if isinstance(model_payload.get("details"), dict) else {}
         family = str(details.get("family", "")).strip()
         families = tuple(str(entry).strip() for entry in details.get("families", []) if str(entry).strip())
+        capabilities = _payload_capabilities(model_payload)
         entries.append(
             OllamaModelInfo(
                 name=name,
                 family=family,
                 families=families,
-                supports_images=_is_vision_capable_model(item),
-                supports_reasoning=_is_reasoning_capable_model(item),
-                reasoning_mode_strategy=_reasoning_mode_strategy(item),
+                capabilities=capabilities,
+                supports_images=_is_vision_capable_model(model_payload),
+                supports_reasoning=_is_reasoning_capable_model(model_payload),
+                reasoning_mode_strategy=_reasoning_mode_strategy(model_payload),
             )
         )
 
@@ -389,7 +413,21 @@ def _parse_positive_int(value: Any) -> int | None:
     return parsed if parsed > 0 else None
 
 
+def _merge_ollama_model_payload(tag_payload: dict[str, Any], show_payload: dict[str, Any]) -> dict[str, Any]:
+    if not show_payload:
+        return dict(tag_payload)
+    payload = dict(tag_payload)
+    for key in ("capabilities", "details", "model_info", "model", "parameters"):
+        if key in show_payload:
+            payload[key] = show_payload[key]
+    return payload
+
+
 def _is_chat_capable_model(payload: dict[str, Any]) -> bool:
+    if _payload_declares_capabilities(payload):
+        capabilities = set(_payload_capabilities(payload))
+        return bool(capabilities.intersection({"chat", "completion"}))
+
     name = str(payload.get("name", "")).lower()
     model = str(payload.get("model", "")).lower()
     details = payload.get("details", {}) if isinstance(payload.get("details"), dict) else {}
@@ -401,12 +439,20 @@ def _is_chat_capable_model(payload: dict[str, Any]) -> bool:
 
 
 def _is_vision_capable_model(payload: dict[str, Any]) -> bool:
+    if _payload_declares_capabilities(payload):
+        return _payload_has_capability(payload, "vision")
+
+    if _payload_has_capability(payload, "vision") or _model_info_indicates_vision(payload):
+        return True
+
     name = str(payload.get("name", "")).lower()
     model = str(payload.get("model", "")).lower()
     details = payload.get("details", {}) if isinstance(payload.get("details"), dict) else {}
     family = str(details.get("family", "")).lower()
     families = [str(item).lower() for item in details.get("families", []) if str(item).strip()]
     combined = " ".join([name, model, family, " ".join(families)])
+    if _is_qwen36_multimodal_fallback(combined):
+        return True
     vision_markers = (
         "vision",
         "llava",
@@ -423,8 +469,50 @@ def _is_vision_capable_model(payload: dict[str, Any]) -> bool:
     return any(marker in combined for marker in vision_markers)
 
 
+def _payload_capabilities(payload: dict[str, Any]) -> tuple[str, ...]:
+    capabilities = payload.get("capabilities", [])
+    if not isinstance(capabilities, list):
+        return ()
+    return tuple(str(item).strip().lower() for item in capabilities if str(item).strip())
+
+
+def _payload_declares_capabilities(payload: dict[str, Any]) -> bool:
+    return isinstance(payload.get("capabilities"), list)
+
+
+def _payload_has_capability(payload: dict[str, Any], capability: str) -> bool:
+    normalized = capability.strip().lower()
+    return any(item == normalized for item in _payload_capabilities(payload))
+
+
+def _model_info_indicates_vision(payload: dict[str, Any]) -> bool:
+    model_info = payload.get("model_info", {})
+    if not isinstance(model_info, dict):
+        return False
+    descriptor = " ".join(str(key).lower() for key in model_info)
+    markers = (".vision.", ".vision_", ".mm.", ".image_", ".image.")
+    return any(marker in descriptor for marker in markers)
+
+
+def _is_qwen36_multimodal_fallback(descriptor: str) -> bool:
+    qwen36_markers = ("qwen3.6", "qwen 3.6", "qwen-3.6")
+    text_only_markers = ("coding", "coder", "mlx")
+    return any(marker in descriptor for marker in qwen36_markers) and not any(
+        marker in descriptor for marker in text_only_markers
+    )
+
+
 def _reasoning_mode_strategy(payload: dict[str, Any]) -> str:
-    return _reasoning_mode_strategy_from_descriptor(_normalized_model_descriptor(payload))
+    descriptor = _normalized_model_descriptor(payload)
+    if _descriptor_explicitly_disables_reasoning(descriptor):
+        return "none"
+    if _payload_declares_capabilities(payload):
+        if not _payload_has_reasoning_capability(payload):
+            return "none"
+        return "levels" if "gpt-oss" in descriptor else "boolean"
+    if _payload_has_reasoning_capability(payload):
+        return "levels" if "gpt-oss" in descriptor else "boolean"
+    return _reasoning_mode_strategy_from_descriptor(descriptor)
 
 
 def _is_reasoning_capable_model(payload: dict[str, Any]) -> bool:
@@ -472,12 +560,13 @@ def _resolve_reasoning_for_model(model: str, value: bool | str | None) -> bool |
 
 
 def _reasoning_mode_strategy_from_descriptor(descriptor: str) -> str:
+    if _descriptor_explicitly_disables_reasoning(descriptor):
+        return "none"
     reasoning_markers = (
         "qwen3",
         "qwen 3",
         "qwen-3",
         "qwen3.5",
-        "qwen3-coder",
         "gpt-oss",
         "deepseek-r1",
         "deepseek r1",
@@ -491,6 +580,21 @@ def _reasoning_mode_strategy_from_descriptor(descriptor: str) -> str:
     if any(marker in descriptor for marker in reasoning_markers):
         return "boolean"
     return "none"
+
+
+def _payload_has_reasoning_capability(payload: dict[str, Any]) -> bool:
+    reasoning_capabilities = {"thinking", "reasoning"}
+    return any(capability in reasoning_capabilities for capability in _payload_capabilities(payload))
+
+
+def _descriptor_explicitly_disables_reasoning(descriptor: str) -> bool:
+    if any(marker in descriptor for marker in ("qwen3-coder", "qwen3 coder", "qwen3coder")):
+        return True
+    qwen36_markers = ("qwen3.6", "qwen 3.6", "qwen-3.6")
+    qwen36_text_only_markers = ("coding", "coder", "mlx")
+    return any(marker in descriptor for marker in qwen36_markers) and any(
+        marker in descriptor for marker in qwen36_text_only_markers
+    )
 
 
 def _close_chat_client(chat_model: ChatOllama) -> None:

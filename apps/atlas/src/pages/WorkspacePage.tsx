@@ -1,7 +1,21 @@
 import * as ScrollArea from "@radix-ui/react-scroll-area";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, ChevronDown, ChevronLeft, ChevronRight, Copy, CornerUpLeft, Download, Edit3, ExternalLink, FileText, GitBranch, ImagePlus, Lightbulb, Lock, Plus, RotateCcw, Search, Send, Square, Terminal, X } from "lucide-react";
-import { ChangeEvent, FormEvent, KeyboardEvent, UIEvent, useEffect, useMemo, useRef, useState } from "react";
+import {
+  ChangeEvent,
+  FormEvent,
+  KeyboardEvent,
+  UIEvent,
+  forwardRef,
+  memo,
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useNavigate } from "react-router-dom";
 
 import { MessageContent } from "../components/MessageContent";
@@ -24,6 +38,7 @@ import {
   type ReasoningMode,
   type RunStatusEvent,
   type RunSummary,
+  type ThreadContextUsage,
   type ThreadMessage,
 } from "../lib/api";
 import { useBackendPhase } from "../lib/backendPhase";
@@ -54,6 +69,27 @@ type ConversationMessage = {
   historyIndex?: number;
 };
 
+type RetryContext = {
+  afterMessageCount: number;
+  prompt: string;
+  attachments: ImageAttachment[];
+};
+
+type StartPromptPayload = {
+  prompt: string;
+  attachments: ImageAttachment[];
+};
+
+type WorkspaceComposerHandle = {
+  quoteMessage: (content: string) => void;
+};
+
+type ConversationPresentationItem = {
+  message: ConversationMessage;
+  branchAfterMessageCount: number;
+  retryContext: RetryContext | null;
+};
+
 type ThinkingEntry = {
   runId: string;
   text: string;
@@ -64,18 +100,17 @@ type ThinkingEntry = {
   isLive?: boolean;
 };
 
+type ReasoningOption = {
+  value: ReasoningMode;
+  label: string;
+};
+
 export function WorkspacePage() {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   const conversationViewportRef = useRef<HTMLDivElement | null>(null);
   const autoScrollToLatestRef = useRef(true);
-  const imageInputRef = useRef<HTMLInputElement | null>(null);
-  const attachmentInputRef = useRef<HTMLInputElement | null>(null);
-  const attachmentMenuRef = useRef<HTMLDivElement | null>(null);
-  const reasoningMenuRef = useRef<HTMLDivElement | null>(null);
-  const promptInputRef = useRef<HTMLTextAreaElement | null>(null);
-  const [prompt, setPrompt] = useState("");
-  const [attachments, setAttachments] = useState<ImageAttachment[]>([]);
+  const composerRef = useRef<WorkspaceComposerHandle | null>(null);
 
   const currentUserId = useAtlasStore((state) => state.currentUserId);
   const currentThreadId = useAtlasStore((state) => state.currentThreadId);
@@ -114,8 +149,6 @@ export function WorkspacePage() {
   const [draftTitle, setDraftTitle] = useState("");
   const [expandedCompactionKeys, setExpandedCompactionKeys] = useState<Record<string, boolean>>({});
   const [isThinkingPanelOpen, setIsThinkingPanelOpen] = useState(false);
-  const [isAttachmentMenuOpen, setIsAttachmentMenuOpen] = useState(false);
-  const [isReasoningMenuOpen, setIsReasoningMenuOpen] = useState(false);
   const [highlightedHistoryIndex, setHighlightedHistoryIndex] = useState<number | null>(null);
   const [copiedMessageKey, setCopiedMessageKey] = useState<string | null>(null);
 
@@ -444,34 +477,8 @@ export function WorkspacePage() {
     setIsThinkingPanelOpen(false);
   }, [currentThreadId, currentUserId]);
 
-  useEffect(() => {
-    if (!isAttachmentMenuOpen) {
-      return undefined;
-    }
-    const handlePointerDown = (event: PointerEvent) => {
-      if (!attachmentMenuRef.current?.contains(event.target as Node | null)) {
-        setIsAttachmentMenuOpen(false);
-      }
-    };
-    window.addEventListener("pointerdown", handlePointerDown);
-    return () => window.removeEventListener("pointerdown", handlePointerDown);
-  }, [isAttachmentMenuOpen]);
-
-  useEffect(() => {
-    if (!isReasoningMenuOpen) {
-      return undefined;
-    }
-    const handlePointerDown = (event: PointerEvent) => {
-      if (!reasoningMenuRef.current?.contains(event.target as Node | null)) {
-        setIsReasoningMenuOpen(false);
-      }
-    };
-    window.addEventListener("pointerdown", handlePointerDown);
-    return () => window.removeEventListener("pointerdown", handlePointerDown);
-  }, [isReasoningMenuOpen]);
-
   const startRun = useMutation({
-    mutationFn: async (value: string) => {
+    mutationFn: async (payload: StartPromptPayload) => {
       if (!currentUserId) {
         throw new Error("Choose a profile before starting the first chat.");
       }
@@ -487,7 +494,7 @@ export function WorkspacePage() {
       }
       const temperatureForRun = lockedThreadTemperature !== undefined ? lockedThreadTemperature : (selectedTemperature ?? null);
       return startChat(
-        value,
+        payload.prompt,
         currentUserId,
         currentThreadId,
         modelForRun,
@@ -496,20 +503,12 @@ export function WorkspacePage() {
         requestThreadTitle(currentThreadEditableTitle, currentThreadId),
         crossChatMemoryEnabled,
         autoCompactLongChats,
-        attachments,
+        payload.attachments,
       );
     },
-    onSuccess: ({ run_id }, value) => {
+    onSuccess: ({ run_id }, payload) => {
       autoScrollToLatestRef.current = true;
-      beginRun(run_id, "chat", value, currentUserId, currentThreadId, attachments);
-      setPrompt("");
-      setAttachments([]);
-      if (imageInputRef.current) {
-        imageInputRef.current.value = "";
-      }
-      if (attachmentInputRef.current) {
-        attachmentInputRef.current.value = "";
-      }
+      beginRun(run_id, "chat", payload.prompt, currentUserId, currentThreadId, payload.attachments);
     },
     onError: (error) => {
       failRun(error instanceof Error ? error.message : "Atlas run failed.", currentUserId, currentThreadId);
@@ -664,31 +663,7 @@ export function WorkspacePage() {
     }
     return items;
   }, [currentRunId, currentThreadCompactionNotice, currentThreadHasActiveRun, liveAnswer, pendingAttachments, pendingPrompt, visibleHistory]);
-  const contextMeter = useMemo(() => {
-    return buildContextMeter({
-      contextUsage,
-      compactionNotice: currentThreadCompactionNotice,
-      runDetectedContextWindow: runDetails?.detected_context_window,
-      visibleHistory,
-      hasActiveRun: currentThreadHasActiveRun,
-      pendingPrompt,
-      pendingAttachments,
-      liveAnswer,
-      draftPrompt: prompt,
-    });
-  }, [
-    contextUsage,
-    currentThreadCompactionNotice?.detectedContextWindow,
-    currentThreadCompactionNotice?.historyRepresentationTokensAfterCompaction,
-    currentThreadHasActiveRun,
-    visibleHistory,
-    liveAnswer,
-    pendingAttachments,
-    pendingPrompt,
-    prompt,
-    runDetails?.detected_context_window,
-  ]);
-  const contextMeterTitle = formatContextMeterTitle(contextMeter, currentThreadHasActiveRun);
+  const transcriptPresentation = useMemo(() => buildConversationPresentation(transcript), [transcript]);
   const isCompactingContext =
     startManualCompact.isPending || (isStreaming && (currentRunMode === "compact" || currentStage === "compaction"));
   const showOllamaWarning = startupState.key === "ollama-offline" && transcript.length > 0;
@@ -775,7 +750,7 @@ export function WorkspacePage() {
     autoScrollToLatestRef.current = isNearBottom(event.currentTarget);
   };
 
-  const handleCopyMessage = async (message: ConversationMessage, index: number) => {
+  const handleCopyMessage = useCallback(async (message: ConversationMessage, index: number) => {
     const key = messageActionKey(message, index, "copy");
     try {
       if (navigator.clipboard?.writeText) {
@@ -785,7 +760,7 @@ export function WorkspacePage() {
     } catch {
       // Ignore clipboard failures silently. The action should stay non-blocking.
     }
-  };
+  }, []);
 
   const handleExportMarkdown = () => {
     const markdown = buildChatMarkdownExport(
@@ -805,29 +780,9 @@ export function WorkspacePage() {
     downloadMarkdownFile(chatExportFilename(currentThreadDisplayTitle, currentThreadId), markdown);
   };
 
-  const handleQuoteMessage = (message: ConversationMessage) => {
-    const quoted = buildQuotedPrompt(message.content);
-    setPrompt((current) => (current.trim() ? `${current.trim()}\n\n${quoted}` : quoted));
-    promptInputRef.current?.focus();
-  };
-
-  const submitPrompt = (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    if ((!prompt.trim() && attachments.length === 0) || isStreaming || !canStartChat) {
-      return;
-    }
-    startRun.mutate(prompt.trim());
-  };
-
-  const handlePromptKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (event.key === "Enter" && !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey) {
-      event.preventDefault();
-      if ((!prompt.trim() && attachments.length === 0) || isStreaming || !canStartChat) {
-        return;
-      }
-      startRun.mutate(prompt.trim());
-    }
-  };
+  const handleQuoteMessage = useCallback((message: ConversationMessage) => {
+    composerRef.current?.quoteMessage(message.content);
+  }, []);
 
   const commitTitle = useMutation({
     mutationFn: async (title: string) => renameThread(currentThreadId, currentUserId, title),
@@ -849,35 +804,42 @@ export function WorkspacePage() {
     await commitTitle.mutateAsync(normalized || currentThreadDisplayTitle);
   };
 
-  const appendAttachmentsFromFiles = async (files: File[]) => {
-    if (!files.length) {
-      return;
-    }
-    const nextAttachments = await Promise.all(files.map((file) => fileToAttachment(file)));
-    setAttachments((current) => [...current, ...nextAttachments]);
-  };
-
-  const handleImageSelection = async (event: ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(event.currentTarget.files ?? []);
-    await appendAttachmentsFromFiles(files);
-    event.currentTarget.value = "";
-    setIsAttachmentMenuOpen(false);
-  };
-
-  const handleAttachmentSelection = async (event: ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(event.currentTarget.files ?? []);
-    await appendAttachmentsFromFiles(files);
-    event.currentTarget.value = "";
-    setIsAttachmentMenuOpen(false);
-  };
-
-  const toggleCompactionSummary = (key: string) => {
+  const toggleCompactionSummary = useCallback((key: string) => {
     setExpandedCompactionKeys((current) => ({ ...current, [key]: !current[key] }));
-  };
+  }, []);
 
-  const openThinkingPanel = () => {
+  const openThinkingPanel = useCallback(() => {
     setIsThinkingPanelOpen(true);
-  };
+  }, []);
+
+  const branchMessageMutate = branchMessage.mutate;
+  const handleBranchMessage = useCallback((afterMessageCount: number) => {
+    branchMessageMutate({ afterMessageCount });
+  }, [branchMessageMutate]);
+
+  const retryAssistantTurnMutate = retryAssistantTurn.mutate;
+  const handleRetryAssistantTurn = useCallback((retryContext: RetryContext) => {
+    retryAssistantTurnMutate({
+      afterMessageCount: retryContext.afterMessageCount,
+      prompt: retryContext.prompt,
+      attachments: retryContext.attachments,
+    });
+  }, [retryAssistantTurnMutate]);
+
+  const startRunMutate = startRun.mutate;
+  const handleSubmitPrompt = useCallback((payload: StartPromptPayload, clearDraft: () => void) => {
+    startRunMutate(payload, { onSuccess: clearDraft });
+  }, [startRunMutate]);
+
+  const startManualCompactMutate = startManualCompact.mutate;
+  const handleManualCompact = useCallback(() => {
+    startManualCompactMutate();
+  }, [startManualCompactMutate]);
+
+  const stopRunMutate = stopRun.mutate;
+  const handleStopRun = useCallback(() => {
+    stopRunMutate();
+  }, [stopRunMutate]);
 
   const toggleThinkingPanel = () => {
     if (!canToggleThinkingPanel) {
@@ -1203,149 +1165,22 @@ export function WorkspacePage() {
                   </div>
                 </div>
               ) : null}
-              {transcript.map((message, index) => {
-                const branchAfterMessageCount = countConversationMessagesThroughIndex(transcript, index);
-                const canBranchMessage = isBranchableMessage(message) && branchAfterMessageCount > 0 && Boolean(currentUserId);
-                const retryContext = getRetryContext(transcript, index);
-
-                return isContextCompactionMessage(message) ? (
-                  <article
-                    className={`message-card system compact-context-message${message.ephemeral ? " active" : ""}`}
-                    key={compactionMessageKey(message, index)}
-                    role={message.ephemeral ? "status" : undefined}
-                  >
-                    <div className="message-meta compact-context-meta">
-                      <span>{formatMessageRoleLabel("system")}</span>
-                      <span className={`status-pill subtle ${timelineSystemBadgeClass(message)}`}>
-                        <span className="status-dot" />
-                        {timelineSystemBadgeLabel(message)}
-                      </span>
-                      {message.ephemeral ? <span className="ephemeral-tag">{timelineEphemeralLabel(message)}</span> : null}
-                    </div>
-                    <div className="message-content compact-context-copy">
-                      <p>{formatTimelineSystemMessageText(message)}</p>
-                    </div>
-                    <div className="compact-context-actions">
-                      {isContextCompactionMessage(message) && message.threadSummary ? (
-                        <button
-                          className="ghost-button compact-summary-toggle"
-                          onClick={() => toggleCompactionSummary(compactionMessageKey(message, index))}
-                          type="button"
-                        >
-                          {expandedCompactionKeys[compactionMessageKey(message, index)] ? "Hide summary" : "Preview summary"}
-                        </button>
-                      ) : null}
-                      {message.dismissible ? (
-                        <button
-                          aria-label="Dismiss compaction notice"
-                          className="ghost-button icon-button"
-                          onClick={() => clearCompactionNotice()}
-                          type="button"
-                        >
-                          <X size={14} />
-                        </button>
-                      ) : null}
-                    </div>
-                    {isContextCompactionMessage(message) && message.threadSummary && expandedCompactionKeys[compactionMessageKey(message, index)] ? (
-                      <div className="stack-card compaction-summary-preview compact-context-summary">
-                        <span className="compaction-summary-preview-label">Summary snapshot at this point</span>
-                        <pre className="compaction-summary-preview-text">{message.threadSummary}</pre>
-                      </div>
-                    ) : null}
-                  </article>
-                ) : isTimelineSystemMessage(message) ? (
-                  <article
-                    className={`message-card system timeline-system-message${message.ephemeral ? " active" : ""}`}
-                    key={compactionMessageKey(message, index)}
-                    role={message.ephemeral ? "status" : undefined}
-                  >
-                    <div className="timeline-system-meta">
-                      <span className={`status-pill subtle ${timelineSystemBadgeClass(message)}`}>
-                        <span className="status-dot" />
-                        {timelineSystemBadgeLabel(message)}
-                      </span>
-                      {message.ephemeral ? <span className="ephemeral-tag">{timelineEphemeralLabel(message)}</span> : null}
-                    </div>
-                    <p className="timeline-system-text">{formatTimelineSystemMessageText(message)}</p>
-                  </article>
-                ) : (
-                  <article
-                    className={`message-card ${message.role}${message.historyIndex === highlightedHistoryIndex ? " search-hit-active" : ""}`}
-                    data-history-index={message.historyIndex}
-                    key={messageRenderKey(message, index)}
-                  >
-                    <div className="message-meta message-meta-row">
-                      <span>{formatMessageRoleLabel(message.role)}</span>
-                      <div className="message-actions" aria-label="Message actions">
-                        <button
-                          className="ghost-button compact-button message-action-button"
-                          onClick={() => void handleCopyMessage(message, index)}
-                          type="button"
-                        >
-                          <Copy size={14} />
-                          <span>{copiedMessageKey === messageActionKey(message, index, "copy") ? "Copied" : "Copy"}</span>
-                        </button>
-                        <button
-                          className="ghost-button compact-button message-action-button"
-                          onClick={() => handleQuoteMessage(message)}
-                          type="button"
-                        >
-                          <CornerUpLeft size={14} />
-                          <span>Quote</span>
-                        </button>
-                        {canBranchMessage ? (
-                          <button
-                            className="ghost-button compact-button message-action-button"
-                            disabled={branchMessage.isPending || retryAssistantTurn.isPending}
-                            onClick={() => branchMessage.mutate({ afterMessageCount: branchAfterMessageCount })}
-                            type="button"
-                          >
-                            <GitBranch size={14} />
-                            <span>{branchMessage.isPending ? "Branching..." : "Branch"}</span>
-                          </button>
-                        ) : null}
-                        {retryContext ? (
-                          <button
-                            className="ghost-button compact-button message-action-button"
-                            disabled={retryAssistantTurn.isPending || branchMessage.isPending || isStreaming}
-                            onClick={() =>
-                              retryAssistantTurn.mutate({
-                                afterMessageCount: retryContext.afterMessageCount,
-                                prompt: retryContext.prompt,
-                                attachments: retryContext.attachments,
-                              })
-                            }
-                            type="button"
-                          >
-                            <RotateCcw size={14} />
-                            <span>{retryAssistantTurn.isPending ? "Retrying..." : "Retry"}</span>
-                          </button>
-                        ) : null}
-                      </div>
-                    </div>
-                    {message.attachments?.length ? (
-                      <div className="message-attachments">
-                        {message.attachments.map((item, attachmentIndex) => (
-                          attachmentIsImage(item) ? (
-                            <img
-                              alt={item.name || `attachment-${attachmentIndex + 1}`}
-                              className="message-attachment-image"
-                              key={`${item.data_url}-${attachmentIndex}`}
-                              src={item.data_url}
-                            />
-                          ) : (
-                            <div className="message-attachment-file" key={`${item.name}-${attachmentIndex}`}>
-                              <FileText size={16} />
-                              <span>{item.name || `file-${attachmentIndex + 1}`}</span>
-                            </div>
-                          )
-                        ))}
-                      </div>
-                    ) : null}
-                    <MessageContent content={message.content} streaming={Boolean(message.ephemeral && message.role === "assistant")} />
-                  </article>
-                );
-              })}
+              <ConversationTranscript
+                branchPending={branchMessage.isPending}
+                canBranch={Boolean(currentUserId)}
+                copiedMessageKey={copiedMessageKey}
+                expandedCompactionKeys={expandedCompactionKeys}
+                highlightedHistoryIndex={highlightedHistoryIndex}
+                isStreaming={isStreaming}
+                items={transcriptPresentation}
+                onBranchMessage={handleBranchMessage}
+                onClearCompactionNotice={clearCompactionNotice}
+                onCopyMessage={handleCopyMessage}
+                onQuoteMessage={handleQuoteMessage}
+                onRetryAssistantTurn={handleRetryAssistantTurn}
+                onToggleCompactionSummary={toggleCompactionSummary}
+                retryPending={retryAssistantTurn.isPending}
+              />
               {currentThreadHasActiveRun && isStreaming && !liveAnswer ? (
                 <article className={`message-card ${currentRunMode === "compact" ? "system" : "assistant"} message-card-waiting`}>
                   <div className="message-meta">
@@ -1385,178 +1220,37 @@ export function WorkspacePage() {
         </ScrollArea.Root>
       </div>
 
-      <form className="composer composer-shell" onSubmit={submitPrompt}>
-        {attachments.length ? (
-          <div className="composer-attachments">
-            {attachments.map((item, index) => {
-              const isImage = attachmentIsImage(item);
-              return (
-                <div className={`composer-attachment-card${isImage ? " image" : " file"}`} key={`${item.name}-${item.data_url || index}`}>
-                  {isImage ? (
-                    <img alt={item.name || `attachment-${index + 1}`} className="composer-attachment-image" src={item.data_url} />
-                  ) : (
-                    <div className="composer-attachment-file-icon" aria-hidden="true">
-                      <FileText size={16} />
-                    </div>
-                  )}
-                  <div className="composer-attachment-copy">
-                    <div className="composer-attachment-title" title={item.name || `attachment-${index + 1}`}>
-                      {item.name || `attachment-${index + 1}`}
-                    </div>
-                    <div className="composer-attachment-meta">{formatAttachmentMeta(item)}</div>
-                  </div>
-                  <button
-                    aria-label={`Remove ${item.name || "attachment"}`}
-                    className="ghost-button icon-button composer-attachment-remove"
-                    onClick={() => setAttachments((current) => current.filter((_, currentIndex) => currentIndex !== index))}
-                    type="button"
-                  >
-                    <X size={14} />
-                  </button>
-                </div>
-              );
-            })}
-          </div>
-        ) : null}
-
-        <textarea
-          className="prompt-input"
-          onChange={(event) => setPrompt(event.currentTarget.value)}
-          onKeyDown={handlePromptKeyDown}
-          placeholder={composerPlaceholder}
-          ref={promptInputRef}
-          rows={3}
-          value={prompt}
-        />
-
-        <div className="composer-actions">
-          <input
-            accept="image/*"
-            className="hidden-file-input"
-            onChange={handleImageSelection}
-            multiple
-            ref={imageInputRef}
-            type="file"
-          />
-          <input
-            accept={DOCUMENT_FILE_ACCEPT}
-            className="hidden-file-input"
-            onChange={handleAttachmentSelection}
-            multiple
-            ref={attachmentInputRef}
-            type="file"
-          />
-
-          <button
-            aria-label={contextMeterTitle}
-            className={`composer-context-meter composer-context-meter-${contextMeter.tone}${isCompactingContext ? " composer-context-meter-compacting" : ""}`}
-            disabled={isStreaming || !currentUserId || !threadHasHistory || startManualCompact.isPending}
-            onClick={() => startManualCompact.mutate()}
-            title={contextMeterTitle}
-            type="button"
-          >
-            <span
-              aria-hidden="true"
-              className="composer-context-meter-fill"
-              style={{ width: `${contextMeter.remainingPercent}%` }}
-            />
-            <span className={`composer-context-meter-label${isCompactingContext ? " deciding-sweep" : ""}`}>
-              {isCompactingContext
-                ? "Compacting..."
-                : `${contextMeter.remainingPercent}% until auto-compact`}
-            </span>
-          </button>
-          <div className="composer-send-cluster">
-            <div className="composer-menu-shell" ref={attachmentMenuRef}>
-              <button
-                aria-expanded={isAttachmentMenuOpen}
-                aria-haspopup="menu"
-                className="ghost-button icon-button"
-                disabled={!canStartChat || isStreaming}
-                onClick={() => {
-                  setIsReasoningMenuOpen(false);
-                  setIsAttachmentMenuOpen((current) => !current);
-                }}
-                type="button"
-              >
-                <Plus size={16} />
-              </button>
-              {isAttachmentMenuOpen ? (
-                <div className="composer-menu" role="menu">
-                  <button
-                    className="composer-menu-item"
-                    disabled={!selectedModelSupportsImages}
-                    onClick={() => imageInputRef.current?.click()}
-                    type="button"
-                  >
-                    <ImagePlus size={15} />
-                    <span>Add image</span>
-                  </button>
-                  <button className="composer-menu-item" onClick={() => attachmentInputRef.current?.click()} type="button">
-                    <FileText size={15} />
-                    <span>Add file</span>
-                  </button>
-                </div>
-              ) : null}
-            </div>
-            {selectedModelSupportsReasoning ? (
-              <div className="composer-select-shell" ref={reasoningMenuRef}>
-                <button
-                  aria-expanded={isReasoningMenuOpen}
-                  aria-haspopup="menu"
-                  className="composer-control-pill composer-control-trigger"
-                  onClick={() => {
-                    setIsAttachmentMenuOpen(false);
-                    setIsReasoningMenuOpen((current) => !current);
-                  }}
-                  title="Reasoning mode"
-                  type="button"
-                >
-                  <span className="composer-control-trigger-main">
-                    <Lightbulb size={14} />
-                    <span className="composer-control-trigger-label">{activeReasoningOption?.label ?? "Reasoning"}</span>
-                  </span>
-                  <ChevronDown className={`composer-control-trigger-chevron${isReasoningMenuOpen ? " open" : ""}`} size={14} />
-                </button>
-                {isReasoningMenuOpen ? (
-                  <div className="composer-select-menu" role="menu">
-                    {reasoningOptions.map((option) => (
-                      <button
-                        className={`composer-select-option${option.value === effectiveReasoningMode ? " active" : ""}`}
-                        key={option.value}
-                        onClick={() => {
-                          setReasoningMode(option.value as ReasoningMode);
-                          setIsReasoningMenuOpen(false);
-                        }}
-                        role="menuitemradio"
-                        type="button"
-                      >
-                        <span>{option.label}</span>
-                        {option.value === effectiveReasoningMode ? <Check size={14} /> : null}
-                      </button>
-                    ))}
-                  </div>
-                ) : null}
-              </div>
-            ) : null}
-            <button className="primary-button" disabled={isStreaming || (!prompt.trim() && attachments.length === 0) || !canStartChat} type="submit">
-              <Send size={16} />
-              {isStreaming ? (currentRunMode === "compact" ? "Compacting..." : "Running...") : "Send"}
-            </button>
-          </div>
-          {isStreaming ? (
-            <button
-              className="ghost-button stop-button"
-              disabled={stopRun.isPending || !currentRunId}
-              onClick={() => stopRun.mutate()}
-              type="button"
-            >
-              <Square size={14} fill="currentColor" />
-              {stopRun.isPending ? "Stopping..." : "Stop"}
-            </button>
-          ) : null}
-        </div>
-      </form>
+      <WorkspaceComposer
+        activeReasoningOption={activeReasoningOption}
+        canStartChat={canStartChat}
+        contextUsage={contextUsage}
+        currentRunId={currentRunId}
+        currentRunMode={currentRunMode}
+        currentThreadCompactionNotice={currentThreadCompactionNotice}
+        currentThreadHasActiveRun={currentThreadHasActiveRun}
+        currentUserId={currentUserId}
+        effectiveReasoningMode={effectiveReasoningMode}
+        isCompactingContext={isCompactingContext}
+        isStreaming={isStreaming}
+        liveAnswer={liveAnswer}
+        onManualCompact={handleManualCompact}
+        onStopRun={handleStopRun}
+        onSubmitPrompt={handleSubmitPrompt}
+        pendingAttachments={pendingAttachments}
+        pendingPrompt={pendingPrompt}
+        placeholder={composerPlaceholder}
+        reasoningOptions={reasoningOptions}
+        ref={composerRef}
+        runDetectedContextWindow={runDetails?.detected_context_window}
+        selectedModelSupportsImages={selectedModelSupportsImages}
+        selectedModelSupportsReasoning={selectedModelSupportsReasoning}
+        setReasoningMode={setReasoningMode}
+        startManualCompactPending={startManualCompact.isPending}
+        startRunPending={startRun.isPending}
+        stopRunPending={stopRun.isPending}
+        threadHasHistory={threadHasHistory}
+        visibleHistory={visibleHistory}
+      />
       </div>
       {isThinkingPanelOpen ? (
         <aside className="workspace-thinking-inspector" aria-label="Thinking panel">
@@ -1635,6 +1329,544 @@ export function WorkspacePage() {
     </section>
   );
 }
+
+type WorkspaceComposerProps = {
+  placeholder: string;
+  canStartChat: boolean;
+  currentUserId: string;
+  currentRunId: string | null;
+  currentRunMode: string | null;
+  currentThreadHasActiveRun: boolean;
+  currentThreadCompactionNotice: {
+    detectedContextWindow?: number | null;
+    historyRepresentationTokensAfterCompaction?: number | null;
+  } | null;
+  contextUsage?: ThreadContextUsage;
+  runDetectedContextWindow?: number | null;
+  visibleHistory: ThreadMessage[];
+  pendingPrompt: string;
+  pendingAttachments: ImageAttachment[];
+  liveAnswer: string;
+  isStreaming: boolean;
+  isCompactingContext: boolean;
+  threadHasHistory: boolean;
+  startRunPending: boolean;
+  startManualCompactPending: boolean;
+  stopRunPending: boolean;
+  selectedModelSupportsImages: boolean;
+  selectedModelSupportsReasoning: boolean;
+  activeReasoningOption: ReasoningOption | null;
+  reasoningOptions: ReasoningOption[];
+  effectiveReasoningMode: ReasoningMode;
+  setReasoningMode: (mode: ReasoningMode) => void;
+  onSubmitPrompt: (payload: StartPromptPayload, clearDraft: () => void) => void;
+  onManualCompact: () => void;
+  onStopRun: () => void;
+};
+
+const WorkspaceComposer = memo(forwardRef<WorkspaceComposerHandle, WorkspaceComposerProps>(function WorkspaceComposer({
+  placeholder,
+  canStartChat,
+  currentUserId,
+  currentRunId,
+  currentRunMode,
+  currentThreadHasActiveRun,
+  currentThreadCompactionNotice,
+  contextUsage,
+  runDetectedContextWindow,
+  visibleHistory,
+  pendingPrompt,
+  pendingAttachments,
+  liveAnswer,
+  isStreaming,
+  isCompactingContext,
+  threadHasHistory,
+  startRunPending,
+  startManualCompactPending,
+  stopRunPending,
+  selectedModelSupportsImages,
+  selectedModelSupportsReasoning,
+  activeReasoningOption,
+  reasoningOptions,
+  effectiveReasoningMode,
+  setReasoningMode,
+  onSubmitPrompt,
+  onManualCompact,
+  onStopRun,
+}, ref) {
+  const imageInputRef = useRef<HTMLInputElement | null>(null);
+  const attachmentInputRef = useRef<HTMLInputElement | null>(null);
+  const attachmentMenuRef = useRef<HTMLDivElement | null>(null);
+  const reasoningMenuRef = useRef<HTMLDivElement | null>(null);
+  const promptInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const [prompt, setPrompt] = useState("");
+  const [attachments, setAttachments] = useState<ImageAttachment[]>([]);
+  const [isAttachmentMenuOpen, setIsAttachmentMenuOpen] = useState(false);
+  const [isReasoningMenuOpen, setIsReasoningMenuOpen] = useState(false);
+  const deferredPrompt = useDeferredValue(prompt);
+
+  useImperativeHandle(ref, () => ({
+    quoteMessage(content: string) {
+      const quoted = buildQuotedPrompt(content);
+      setPrompt((current) => (current.trim() ? `${current.trim()}\n\n${quoted}` : quoted));
+      window.requestAnimationFrame(() => promptInputRef.current?.focus());
+    },
+  }), []);
+
+  useEffect(() => {
+    if (!isAttachmentMenuOpen) {
+      return undefined;
+    }
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!attachmentMenuRef.current?.contains(event.target as Node | null)) {
+        setIsAttachmentMenuOpen(false);
+      }
+    };
+    window.addEventListener("pointerdown", handlePointerDown);
+    return () => window.removeEventListener("pointerdown", handlePointerDown);
+  }, [isAttachmentMenuOpen]);
+
+  useEffect(() => {
+    if (!isReasoningMenuOpen) {
+      return undefined;
+    }
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!reasoningMenuRef.current?.contains(event.target as Node | null)) {
+        setIsReasoningMenuOpen(false);
+      }
+    };
+    window.addEventListener("pointerdown", handlePointerDown);
+    return () => window.removeEventListener("pointerdown", handlePointerDown);
+  }, [isReasoningMenuOpen]);
+
+  const contextMeter = useMemo(() => {
+    return buildContextMeter({
+      contextUsage,
+      compactionNotice: currentThreadCompactionNotice,
+      runDetectedContextWindow,
+      visibleHistory,
+      hasActiveRun: currentThreadHasActiveRun,
+      pendingPrompt,
+      pendingAttachments,
+      liveAnswer,
+      draftPrompt: deferredPrompt,
+    });
+  }, [
+    contextUsage,
+    currentThreadCompactionNotice?.detectedContextWindow,
+    currentThreadCompactionNotice?.historyRepresentationTokensAfterCompaction,
+    currentThreadHasActiveRun,
+    deferredPrompt,
+    liveAnswer,
+    pendingAttachments,
+    pendingPrompt,
+    runDetectedContextWindow,
+    visibleHistory,
+  ]);
+  const contextMeterTitle = formatContextMeterTitle(contextMeter, currentThreadHasActiveRun);
+
+  const appendAttachmentsFromFiles = async (files: File[]) => {
+    if (!files.length) {
+      return;
+    }
+    const nextAttachments = await Promise.all(files.map((file) => fileToAttachment(file)));
+    setAttachments((current) => [...current, ...nextAttachments]);
+  };
+
+  const handleImageSelection = async (event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.currentTarget.files ?? []);
+    await appendAttachmentsFromFiles(files);
+    event.currentTarget.value = "";
+    setIsAttachmentMenuOpen(false);
+  };
+
+  const handleAttachmentSelection = async (event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.currentTarget.files ?? []);
+    await appendAttachmentsFromFiles(files);
+    event.currentTarget.value = "";
+    setIsAttachmentMenuOpen(false);
+  };
+
+  const clearDraft = useCallback(() => {
+    setPrompt("");
+    setAttachments([]);
+    if (imageInputRef.current) {
+      imageInputRef.current.value = "";
+    }
+    if (attachmentInputRef.current) {
+      attachmentInputRef.current.value = "";
+    }
+  }, []);
+
+  const submitCurrentPrompt = useCallback(() => {
+    const trimmedPrompt = prompt.trim();
+    if ((!trimmedPrompt && attachments.length === 0) || isStreaming || startRunPending || !canStartChat) {
+      return;
+    }
+    onSubmitPrompt({ prompt: trimmedPrompt, attachments }, clearDraft);
+  }, [attachments, canStartChat, clearDraft, isStreaming, onSubmitPrompt, prompt, startRunPending]);
+
+  const submitPrompt = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    submitCurrentPrompt();
+  };
+
+  const handlePromptKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key === "Enter" && !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey) {
+      event.preventDefault();
+      submitCurrentPrompt();
+    }
+  };
+
+  return (
+    <form className="composer composer-shell" onSubmit={submitPrompt}>
+      {attachments.length ? (
+        <div className="composer-attachments">
+          {attachments.map((item, index) => {
+            const isImage = attachmentIsImage(item);
+            return (
+              <div className={`composer-attachment-card${isImage ? " image" : " file"}`} key={`${item.name}-${item.data_url || index}`}>
+                {isImage ? (
+                  <img alt={item.name || `attachment-${index + 1}`} className="composer-attachment-image" src={item.data_url} />
+                ) : (
+                  <div className="composer-attachment-file-icon" aria-hidden="true">
+                    <FileText size={16} />
+                  </div>
+                )}
+                <div className="composer-attachment-copy">
+                  <div className="composer-attachment-title" title={item.name || `attachment-${index + 1}`}>
+                    {item.name || `attachment-${index + 1}`}
+                  </div>
+                  <div className="composer-attachment-meta">{formatAttachmentMeta(item)}</div>
+                </div>
+                <button
+                  aria-label={`Remove ${item.name || "attachment"}`}
+                  className="ghost-button icon-button composer-attachment-remove"
+                  onClick={() => setAttachments((current) => current.filter((_, currentIndex) => currentIndex !== index))}
+                  type="button"
+                >
+                  <X size={14} />
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      ) : null}
+
+      <textarea
+        className="prompt-input"
+        onChange={(event) => setPrompt(event.currentTarget.value)}
+        onKeyDown={handlePromptKeyDown}
+        placeholder={placeholder}
+        ref={promptInputRef}
+        rows={3}
+        value={prompt}
+      />
+
+      <div className="composer-actions">
+        <input
+          accept="image/*"
+          className="hidden-file-input"
+          onChange={handleImageSelection}
+          multiple
+          ref={imageInputRef}
+          type="file"
+        />
+        <input
+          accept={DOCUMENT_FILE_ACCEPT}
+          className="hidden-file-input"
+          onChange={handleAttachmentSelection}
+          multiple
+          ref={attachmentInputRef}
+          type="file"
+        />
+
+        <button
+          aria-label={contextMeterTitle}
+          className={`composer-context-meter composer-context-meter-${contextMeter.tone}${isCompactingContext ? " composer-context-meter-compacting" : ""}`}
+          disabled={isStreaming || !currentUserId || !threadHasHistory || startManualCompactPending}
+          onClick={onManualCompact}
+          title={contextMeterTitle}
+          type="button"
+        >
+          <span
+            aria-hidden="true"
+            className="composer-context-meter-fill"
+            style={{ width: `${contextMeter.remainingPercent}%` }}
+          />
+          <span className={`composer-context-meter-label${isCompactingContext ? " deciding-sweep" : ""}`}>
+            {isCompactingContext
+              ? "Compacting..."
+              : `${contextMeter.remainingPercent}% until auto-compact`}
+          </span>
+        </button>
+        <div className="composer-send-cluster">
+          <div className="composer-menu-shell" ref={attachmentMenuRef}>
+            <button
+              aria-expanded={isAttachmentMenuOpen}
+              aria-haspopup="menu"
+              className="ghost-button icon-button"
+              disabled={!canStartChat || isStreaming}
+              onClick={() => {
+                setIsReasoningMenuOpen(false);
+                setIsAttachmentMenuOpen((current) => !current);
+              }}
+              type="button"
+            >
+              <Plus size={16} />
+            </button>
+            {isAttachmentMenuOpen ? (
+              <div className="composer-menu" role="menu">
+                <button
+                  className="composer-menu-item"
+                  disabled={!selectedModelSupportsImages}
+                  onClick={() => imageInputRef.current?.click()}
+                  type="button"
+                >
+                  <ImagePlus size={15} />
+                  <span>Add image</span>
+                </button>
+                <button className="composer-menu-item" onClick={() => attachmentInputRef.current?.click()} type="button">
+                  <FileText size={15} />
+                  <span>Add file</span>
+                </button>
+              </div>
+            ) : null}
+          </div>
+          {selectedModelSupportsReasoning ? (
+            <div className="composer-select-shell" ref={reasoningMenuRef}>
+              <button
+                aria-expanded={isReasoningMenuOpen}
+                aria-haspopup="menu"
+                className="composer-control-pill composer-control-trigger"
+                onClick={() => {
+                  setIsAttachmentMenuOpen(false);
+                  setIsReasoningMenuOpen((current) => !current);
+                }}
+                title="Reasoning mode"
+                type="button"
+              >
+                <span className="composer-control-trigger-main">
+                  <Lightbulb size={14} />
+                  <span className="composer-control-trigger-label">{activeReasoningOption?.label ?? "Reasoning"}</span>
+                </span>
+                <ChevronDown className={`composer-control-trigger-chevron${isReasoningMenuOpen ? " open" : ""}`} size={14} />
+              </button>
+              {isReasoningMenuOpen ? (
+                <div className="composer-select-menu" role="menu">
+                  {reasoningOptions.map((option) => (
+                    <button
+                      className={`composer-select-option${option.value === effectiveReasoningMode ? " active" : ""}`}
+                      key={option.value}
+                      onClick={() => {
+                        setReasoningMode(option.value);
+                        setIsReasoningMenuOpen(false);
+                      }}
+                      role="menuitemradio"
+                      type="button"
+                    >
+                      <span>{option.label}</span>
+                      {option.value === effectiveReasoningMode ? <Check size={14} /> : null}
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+          <button className="primary-button" disabled={isStreaming || startRunPending || (!prompt.trim() && attachments.length === 0) || !canStartChat} type="submit">
+            <Send size={16} />
+            {isStreaming ? (currentRunMode === "compact" ? "Compacting..." : "Running...") : "Send"}
+          </button>
+        </div>
+        {isStreaming ? (
+          <button
+            className="ghost-button stop-button"
+            disabled={stopRunPending || !currentRunId}
+            onClick={onStopRun}
+            type="button"
+          >
+            <Square size={14} fill="currentColor" />
+            {stopRunPending ? "Stopping..." : "Stop"}
+          </button>
+        ) : null}
+      </div>
+    </form>
+  );
+}));
+
+type ConversationTranscriptProps = {
+  items: ConversationPresentationItem[];
+  canBranch: boolean;
+  branchPending: boolean;
+  retryPending: boolean;
+  isStreaming: boolean;
+  copiedMessageKey: string | null;
+  expandedCompactionKeys: Record<string, boolean>;
+  highlightedHistoryIndex: number | null;
+  onCopyMessage: (message: ConversationMessage, index: number) => Promise<void>;
+  onQuoteMessage: (message: ConversationMessage) => void;
+  onBranchMessage: (afterMessageCount: number) => void;
+  onRetryAssistantTurn: (retryContext: RetryContext) => void;
+  onToggleCompactionSummary: (key: string) => void;
+  onClearCompactionNotice: () => void;
+};
+
+const ConversationTranscript = memo(function ConversationTranscript({
+  items,
+  canBranch,
+  branchPending,
+  retryPending,
+  isStreaming,
+  copiedMessageKey,
+  expandedCompactionKeys,
+  highlightedHistoryIndex,
+  onCopyMessage,
+  onQuoteMessage,
+  onBranchMessage,
+  onRetryAssistantTurn,
+  onToggleCompactionSummary,
+  onClearCompactionNotice,
+}: ConversationTranscriptProps) {
+  return (
+    <>
+      {items.map(({ message, branchAfterMessageCount, retryContext }, index) => {
+        const canBranchMessage = isBranchableMessage(message) && branchAfterMessageCount > 0 && canBranch;
+
+        return isContextCompactionMessage(message) ? (
+          <article
+            className={`message-card system compact-context-message${message.ephemeral ? " active" : ""}`}
+            key={compactionMessageKey(message, index)}
+            role={message.ephemeral ? "status" : undefined}
+          >
+            <div className="message-meta compact-context-meta">
+              <span>{formatMessageRoleLabel("system")}</span>
+              <span className={`status-pill subtle ${timelineSystemBadgeClass(message)}`}>
+                <span className="status-dot" />
+                {timelineSystemBadgeLabel(message)}
+              </span>
+              {message.ephemeral ? <span className="ephemeral-tag">{timelineEphemeralLabel(message)}</span> : null}
+            </div>
+            <div className="message-content compact-context-copy">
+              <p>{formatTimelineSystemMessageText(message)}</p>
+            </div>
+            <div className="compact-context-actions">
+              {message.threadSummary ? (
+                <button
+                  className="ghost-button compact-summary-toggle"
+                  onClick={() => onToggleCompactionSummary(compactionMessageKey(message, index))}
+                  type="button"
+                >
+                  {expandedCompactionKeys[compactionMessageKey(message, index)] ? "Hide summary" : "Preview summary"}
+                </button>
+              ) : null}
+              {message.dismissible ? (
+                <button
+                  aria-label="Dismiss compaction notice"
+                  className="ghost-button icon-button"
+                  onClick={onClearCompactionNotice}
+                  type="button"
+                >
+                  <X size={14} />
+                </button>
+              ) : null}
+            </div>
+            {message.threadSummary && expandedCompactionKeys[compactionMessageKey(message, index)] ? (
+              <div className="stack-card compaction-summary-preview compact-context-summary">
+                <span className="compaction-summary-preview-label">Summary snapshot at this point</span>
+                <pre className="compaction-summary-preview-text">{message.threadSummary}</pre>
+              </div>
+            ) : null}
+          </article>
+        ) : isTimelineSystemMessage(message) ? (
+          <article
+            className={`message-card system timeline-system-message${message.ephemeral ? " active" : ""}`}
+            key={compactionMessageKey(message, index)}
+            role={message.ephemeral ? "status" : undefined}
+          >
+            <div className="timeline-system-meta">
+              <span className={`status-pill subtle ${timelineSystemBadgeClass(message)}`}>
+                <span className="status-dot" />
+                {timelineSystemBadgeLabel(message)}
+              </span>
+              {message.ephemeral ? <span className="ephemeral-tag">{timelineEphemeralLabel(message)}</span> : null}
+            </div>
+            <p className="timeline-system-text">{formatTimelineSystemMessageText(message)}</p>
+          </article>
+        ) : (
+          <article
+            className={`message-card ${message.role}${message.historyIndex === highlightedHistoryIndex ? " search-hit-active" : ""}`}
+            data-history-index={message.historyIndex}
+            key={messageRenderKey(message, index)}
+          >
+            <div className="message-meta message-meta-row">
+              <span>{formatMessageRoleLabel(message.role)}</span>
+              <div className="message-actions" aria-label="Message actions">
+                <button
+                  className="ghost-button compact-button message-action-button"
+                  onClick={() => void onCopyMessage(message, index)}
+                  type="button"
+                >
+                  <Copy size={14} />
+                  <span>{copiedMessageKey === messageActionKey(message, index, "copy") ? "Copied" : "Copy"}</span>
+                </button>
+                <button
+                  className="ghost-button compact-button message-action-button"
+                  onClick={() => onQuoteMessage(message)}
+                  type="button"
+                >
+                  <CornerUpLeft size={14} />
+                  <span>Quote</span>
+                </button>
+                {canBranchMessage ? (
+                  <button
+                    className="ghost-button compact-button message-action-button"
+                    disabled={branchPending || retryPending}
+                    onClick={() => onBranchMessage(branchAfterMessageCount)}
+                    type="button"
+                  >
+                    <GitBranch size={14} />
+                    <span>{branchPending ? "Branching..." : "Branch"}</span>
+                  </button>
+                ) : null}
+                {retryContext ? (
+                  <button
+                    className="ghost-button compact-button message-action-button"
+                    disabled={retryPending || branchPending || isStreaming}
+                    onClick={() => onRetryAssistantTurn(retryContext)}
+                    type="button"
+                  >
+                    <RotateCcw size={14} />
+                    <span>{retryPending ? "Retrying..." : "Retry"}</span>
+                  </button>
+                ) : null}
+              </div>
+            </div>
+            {message.attachments?.length ? (
+              <div className="message-attachments">
+                {message.attachments.map((item, attachmentIndex) => (
+                  attachmentIsImage(item) ? (
+                    <img
+                      alt={item.name || `attachment-${attachmentIndex + 1}`}
+                      className="message-attachment-image"
+                      key={`${item.data_url}-${attachmentIndex}`}
+                      src={item.data_url}
+                    />
+                  ) : (
+                    <div className="message-attachment-file" key={`${item.name}-${attachmentIndex}`}>
+                      <FileText size={16} />
+                      <span>{item.name || `file-${attachmentIndex + 1}`}</span>
+                    </div>
+                  )
+                ))}
+              </div>
+            ) : null}
+            <MessageContent content={message.content} streaming={Boolean(message.ephemeral && message.role === "assistant")} />
+          </article>
+        );
+      })}
+    </>
+  );
+});
 
 const MODEL_DEFAULT_TEMPERATURE_VALUE = "model-default";
 const TEMPERATURE_OPTIONS = Array.from({ length: 21 }, (_, index) => Number((index / 10).toFixed(1)));
@@ -1863,33 +2095,42 @@ function isBranchableMessage(message: ConversationMessage) {
   return (message.role === "user" || message.role === "assistant") && !message.ephemeral && !message.kind;
 }
 
-function countConversationMessagesThroughIndex(transcript: ConversationMessage[], index: number) {
-  return transcript.slice(0, index + 1).filter((item) => isBranchableMessage(item)).length;
-}
-
-function getRetryContext(transcript: ConversationMessage[], index: number) {
-  const message = transcript[index];
-  if (message.role !== "assistant" || message.ephemeral || message.kind) {
-    return null;
-  }
-  const laterAssistant = transcript
-    .slice(index + 1)
-    .some((item) => item.role === "assistant" && !item.ephemeral && !item.kind);
-  if (laterAssistant) {
-    return null;
-  }
-  for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
-    const candidate = transcript[cursor];
-    if (candidate.role !== "user" || candidate.ephemeral || candidate.kind) {
-      continue;
+function buildConversationPresentation(transcript: ConversationMessage[]): ConversationPresentationItem[] {
+  const branchCounts: number[] = [];
+  let branchCount = 0;
+  let latestAssistantIndex = -1;
+  for (let index = 0; index < transcript.length; index += 1) {
+    const message = transcript[index];
+    if (isBranchableMessage(message)) {
+      branchCount += 1;
+      if (message.role === "assistant") {
+        latestAssistantIndex = index;
+      }
     }
-    return {
-      afterMessageCount: countConversationMessagesThroughIndex(transcript, cursor),
-      prompt: candidate.content,
-      attachments: candidate.attachments ?? [],
-    };
+    branchCounts[index] = branchCount;
   }
-  return null;
+
+  const retryContexts = new Map<number, RetryContext>();
+  if (latestAssistantIndex >= 0) {
+    for (let cursor = latestAssistantIndex - 1; cursor >= 0; cursor -= 1) {
+      const candidate = transcript[cursor];
+      if (candidate.role !== "user" || candidate.ephemeral || candidate.kind) {
+        continue;
+      }
+      retryContexts.set(latestAssistantIndex, {
+        afterMessageCount: branchCounts[cursor] ?? 0,
+        prompt: candidate.content,
+        attachments: candidate.attachments ?? [],
+      });
+      break;
+    }
+  }
+
+  return transcript.map((message, index) => ({
+    message,
+    branchAfterMessageCount: branchCounts[index] ?? 0,
+    retryContext: retryContexts.get(index) ?? null,
+  }));
 }
 
 function buildQuotedPrompt(content: string) {
