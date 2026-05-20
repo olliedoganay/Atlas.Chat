@@ -4,6 +4,7 @@ import base64
 import io
 import os
 import queue
+import re
 import shutil
 import threading
 from contextlib import closing
@@ -23,7 +24,13 @@ from .graph.builder import AgentApplication, build_chat_application
 from .graph.builder import post_synthesis_node_sequence, pre_synthesis_node_sequence
 from .graph.context import GraphContext
 from .graph.nodes import _build_answer_messages, _finalize_answer_text, _latest_user_text
-from .llm import OllamaCatalogSnapshot, OllamaModelInfo, format_runtime_error, inspect_local_ollama_models
+from .llm import (
+    OLLAMA_CONTEXT_WINDOW_PRESETS,
+    OllamaCatalogSnapshot,
+    OllamaModelInfo,
+    format_runtime_error,
+    inspect_local_ollama_models,
+)
 from .memory.models import MemoryRecord
 from .run_contract import RunEvent, RunHub, TERMINAL_EVENT_TYPES
 from .run_store import PASSWORD_PROTECTED, RunStore
@@ -36,6 +43,10 @@ from .security import (
 from .session import scoped_thread_id
 from .text_normalization import MojibakeRepairStream
 from .version import atlas_version
+
+
+DEFAULT_COMPACTION_TIMEOUT_SECONDS = 25.0
+COMPACTION_PIN_LIMIT = 36
 
 
 @dataclass
@@ -124,6 +135,7 @@ class AtlasBackendService:
             "embed_model": self.config.embed_model,
             "ollama_url": self.config.ollama_url,
             "runtime_mode": "chat-only",
+            "compaction_timeout_seconds": self._compaction_timeout_seconds(),
             "busy": busy,
             "security": {
                 "profile_key_protection": local_secret_storage_label(),
@@ -236,17 +248,51 @@ class AtlasBackendService:
 
     def list_models(self) -> dict[str, Any]:
         catalog = self._get_model_catalog()
+        context_window = self._ollama_context_window_payload(catalog)
         return {
             "default_temperature": self.config.chat_temperature,
             "temperature_presets": [
                 {"label": f"{value:.1f}", "value": value}
                 for value in _temperature_dropdown_values()
             ],
+            "context_window_presets": list(OLLAMA_CONTEXT_WINDOW_PRESETS),
+            "ollama_context_window": context_window,
             "ollama_online": catalog.ollama_online,
             "has_local_models": catalog.has_local_models,
             "catalog_source": catalog.source,
             "models": [item.name for item in catalog.models],
             "model_details": [item.to_dict() for item in catalog.models],
+        }
+
+    def set_ollama_context_window(self, *, context_window: int | None) -> dict[str, Any]:
+        setter = getattr(self.app.llm_provider, "set_ollama_context_window", None)
+        if not callable(setter):
+            raise RuntimeError("This runtime cannot change Ollama context windows.")
+        saved_value = setter(context_window)
+        catalog = self._get_model_catalog(ttl_seconds=0.0)
+        return {
+            "configured_context_window": saved_value,
+            "ollama_context_window": self._ollama_context_window_payload(catalog),
+        }
+
+    def _ollama_context_window_payload(self, catalog: OllamaCatalogSnapshot) -> dict[str, Any]:
+        provider = getattr(getattr(self, "app", None), "llm_provider", None)
+        configured_getter = getattr(provider, "ollama_context_window", None)
+        configured_value = configured_getter() if callable(configured_getter) else None
+        configured_window = int(configured_value or 0) or None
+        detected_window = None
+        if provider is not None:
+            for item in catalog.models:
+                try:
+                    detected_window = int(provider.effective_context_window(item.name) or 0) or None
+                except Exception:
+                    detected_window = None
+                if detected_window:
+                    break
+        return {
+            "configured_context_window": configured_window,
+            "effective_context_window": configured_window or detected_window,
+            "source": "configured" if configured_window else "ollama",
         }
 
     def discovery(self) -> dict[str, Any]:
@@ -1255,6 +1301,11 @@ class AtlasBackendService:
                 manual_compaction_status == "tightened_summary"
                 and representation_tokens_after < representation_tokens_before
             ):
+                if manual_compaction_status == "summary_not_useful":
+                    raise RuntimeError(
+                        "Manual compact skipped: the generated summary only saved a few tokens, so Atlas kept "
+                        "the current context instead."
+                    )
                 if manual_compaction_status == "summary_too_large":
                     raise RuntimeError(
                         "Manual compact could not reduce this thread: the generated summary would be larger than "
@@ -1512,7 +1563,11 @@ class AtlasBackendService:
                 thread_summary=proposed_summary,
                 compacted_message_count=proposed_compacted_count,
             )
-            if proposed_representation_tokens >= current_representation_tokens:
+            if not _compaction_gain_is_worthwhile(
+                before_tokens=current_representation_tokens,
+                after_tokens=proposed_representation_tokens,
+                effective_context_window=effective_context_window,
+            ):
                 break
 
             updated_summary = proposed_summary
@@ -1565,6 +1620,14 @@ class AtlasBackendService:
             )
         return total
 
+    def _compaction_timeout_seconds(self) -> float:
+        raw_value = getattr(getattr(self, "config", None), "compaction_timeout_seconds", None)
+        try:
+            timeout = float(raw_value if raw_value is not None else DEFAULT_COMPACTION_TIMEOUT_SECONDS)
+        except (TypeError, ValueError):
+            timeout = DEFAULT_COMPACTION_TIMEOUT_SECONDS
+        return max(1.0, min(180.0, timeout))
+
     def _manual_compact_context(self, *, state: dict[str, Any], runtime: SimpleNamespace) -> dict[str, Any]:
         effective_context_window = int(runtime.context.effective_context_window or 0)
         all_messages = list(state.get("messages", []))
@@ -1602,12 +1665,21 @@ class AtlasBackendService:
                 thread_summary=proposed_summary,
                 compacted_message_count=compacted_count,
             )
-            if proposed_representation_tokens < current_representation_tokens:
+            if _compaction_gain_is_worthwhile(
+                before_tokens=current_representation_tokens,
+                after_tokens=proposed_representation_tokens,
+                effective_context_window=effective_context_window,
+            ):
                 return {
                     "thread_summary": proposed_summary,
                     "compacted_message_count": compacted_count,
                     "detected_context_window": effective_context_window,
                     "manual_compaction_status": "tightened_summary",
+                }
+            if proposed_representation_tokens < current_representation_tokens:
+                return {
+                    **no_change_payload,
+                    "manual_compaction_status": "summary_not_useful",
                 }
             return {
                 **no_change_payload,
@@ -1619,6 +1691,7 @@ class AtlasBackendService:
         attempted_consumed_counts: set[int] = set()
         best_payload: dict[str, Any] | None = None
         best_representation_tokens = current_representation_tokens
+        found_shallow_reduction = False
         max_chars = max(6000, int(max(effective_context_window, 1024) * 3))
         for recent_window in _manual_compaction_recent_windows(
             total_message_count=len(all_messages),
@@ -1657,7 +1730,13 @@ class AtlasBackendService:
                 thread_summary=proposed_summary,
                 compacted_message_count=proposed_compacted_count,
             )
-            if proposed_representation_tokens < best_representation_tokens:
+            if proposed_representation_tokens < current_representation_tokens:
+                found_shallow_reduction = True
+            if _compaction_gain_is_worthwhile(
+                before_tokens=current_representation_tokens,
+                after_tokens=proposed_representation_tokens,
+                effective_context_window=effective_context_window,
+            ) and proposed_representation_tokens < best_representation_tokens:
                 best_representation_tokens = proposed_representation_tokens
                 best_payload = {
                     "thread_summary": proposed_summary,
@@ -1670,12 +1749,43 @@ class AtlasBackendService:
 
         if best_payload is not None:
             return best_payload
+        if found_shallow_reduction:
+            return {
+                **no_change_payload,
+                "manual_compaction_status": "summary_not_useful",
+            }
         if attempted_summary:
             return {
                 **no_change_payload,
                 "manual_compaction_status": "summary_too_large",
             }
         return no_change_payload
+
+    def _invoke_compaction_model(self, *, model: str, prompt: str, fallback: str) -> str:
+        def invoke() -> str:
+            try:
+                response = self.app.llm_provider.chat(model, temperature=0.0, reasoning=False).invoke(
+                    [HumanMessage(content=prompt)]
+                )
+                result_queue.put(("ok", str(response.content).strip()), block=False)
+            except Exception:
+                result_queue.put(("error", ""), block=False)
+
+        result_queue: queue.Queue[tuple[str, str]] = queue.Queue(maxsize=1)
+        worker = threading.Thread(target=invoke, name="atlas-compaction", daemon=True)
+        worker.start()
+        try:
+            status, value = result_queue.get(timeout=self._compaction_timeout_seconds())
+            return value if status == "ok" and value else fallback
+        except queue.Empty:
+            abort = getattr(getattr(self, "app", None), "llm_provider", None)
+            abort_active_requests = getattr(abort, "abort_active_requests", None)
+            if callable(abort_active_requests):
+                try:
+                    abort_active_requests()
+                except Exception:
+                    pass
+            return fallback
 
     def _summarize_message_batch(
         self,
@@ -1689,6 +1799,7 @@ class AtlasBackendService:
         if not transcript:
             return existing_summary
         word_limit = _normalized_summary_word_limit(target_words)
+        pins = _compaction_exact_pins(existing_summary=existing_summary, transcript=transcript)
 
         prompt_parts = [
             "Merge the earlier part of this conversation into a compact working summary that preserves exact details needed to continue the thread correctly.",
@@ -1702,17 +1813,13 @@ class AtlasBackendService:
         ]
         if existing_summary.strip():
             prompt_parts.append("\nExisting summary:\n" + existing_summary.strip())
+        if pins:
+            prompt_parts.append("\nPinned exact details that must survive verbatim:\n" + "\n".join(f"- {pin}" for pin in pins))
         prompt_parts.append("\nNew conversation chunk:\n" + transcript)
 
-        try:
-            response = self.app.llm_provider.chat(model, temperature=0.0, reasoning=False).invoke(
-                [HumanMessage(content="\n".join(prompt_parts))]
-            )
-            summary = str(response.content).strip()
-            return summary or existing_summary
-        except Exception:
-            fallback = _fallback_summary(existing_summary=existing_summary, transcript=transcript)
-            return fallback or existing_summary
+        fallback = _fallback_summary(existing_summary=existing_summary, transcript=transcript, pins=pins)
+        summary = self._invoke_compaction_model(model=model, prompt="\n".join(prompt_parts), fallback=fallback)
+        return _apply_compaction_pins(summary or existing_summary, pins) or existing_summary
 
     def _tighten_thread_summary(
         self,
@@ -1725,23 +1832,20 @@ class AtlasBackendService:
         if not summary:
             return existing_summary
         word_limit = _normalized_summary_word_limit(target_words)
+        pins = _compaction_exact_pins(existing_summary=summary, transcript="")
         prompt = "\n".join(
             [
                 "Rewrite this existing conversation summary into a much tighter working summary.",
                 "Preserve exact active goals, durable user facts, decisions, constraints, code paths, commands, errors, names, and unresolved tasks.",
                 "Remove repetition, explanations, completed tangents, and generic background detail.",
+                "Do not drop pinned exact details such as file paths, commands, versions, URLs, errors, release tags, test results, or model names.",
                 f"Stay under {word_limit} words. Use compact bullets when useful.",
+                "\nPinned exact details:\n" + "\n".join(f"- {pin}" for pin in pins) if pins else "",
                 "\nExisting summary:\n" + summary,
             ]
         )
-        try:
-            response = self.app.llm_provider.chat(model, temperature=0.0, reasoning=False).invoke(
-                [HumanMessage(content=prompt)]
-            )
-            tightened = str(response.content).strip()
-            return tightened or existing_summary
-        except Exception:
-            return existing_summary
+        tightened = self._invoke_compaction_model(model=model, prompt=prompt, fallback=existing_summary)
+        return _apply_compaction_pins(tightened or existing_summary, pins) or existing_summary
 
     def _resolve_thread_model(
         self,
@@ -1965,6 +2069,20 @@ def _compaction_target_tokens(effective_context_window: int) -> int:
     return max(512, int(threshold * 0.55))
 
 
+def _compaction_gain_is_worthwhile(
+    *,
+    before_tokens: int,
+    after_tokens: int,
+    effective_context_window: int,
+) -> bool:
+    if after_tokens >= before_tokens:
+        return False
+    gain = before_tokens - after_tokens
+    budget_basis = min(max(before_tokens, 1), max(effective_context_window, 1024))
+    minimum_gain = max(64, int(budget_basis * 0.03))
+    return gain >= minimum_gain
+
+
 def _summary_target_words(
     *,
     existing_summary: str,
@@ -2042,12 +2160,74 @@ def _clean_transcript_text(text: str) -> str:
     return "\n".join(cleaned).strip()
 
 
-def _fallback_summary(*, existing_summary: str, transcript: str) -> str:
+def _compaction_exact_pins(*, existing_summary: str, transcript: str) -> list[str]:
+    source = "\n".join(part for part in (existing_summary, transcript) if part.strip())
+    if not source.strip():
+        return []
+    patterns = [
+        r"`([^`\n]{2,220})`",
+        r"https?://[^\s)>\]]+",
+        r"(?<!\w)(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.@+:-]+",
+        r"(?<!\w)[A-Za-z0-9_.-]+\.(?:py|ts|tsx|js|jsx|json|toml|yaml|yml|md|txt|css|html|sqlite|db|sh|ps1|bat|rs)\b",
+        r"\bv?\d+\.\d+(?:\.\d+)?(?:[-+][A-Za-z0-9_.-]+)?\b",
+        r"\b[A-Za-z][A-Za-z0-9_.-]*:[A-Za-z0-9_.-]+\b",
+        r"\b\d+\s+(?:passed|failed|errors?|subtests passed)\b",
+        r"\b(?:RuntimeError|ImportError|AssertionError|Traceback|CUDA error|Ollama request failed)[^\n]{0,180}",
+    ]
+    pins: list[str] = []
+    seen: set[str] = set()
+    for pattern in patterns:
+        for match in re.finditer(pattern, source):
+            value = match.group(1) if match.lastindex else match.group(0)
+            pin = _normalize_compaction_pin(value)
+            if not pin:
+                continue
+            key = pin.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            pins.append(pin)
+            if len(pins) >= COMPACTION_PIN_LIMIT:
+                return pins
+    return pins
+
+
+def _normalize_compaction_pin(value: str) -> str:
+    pin = " ".join(str(value).strip().split())
+    pin = pin.strip(".,;:!?()[]{}<>\"'")
+    if len(pin) < 2 or len(pin) > 220:
+        return ""
+    return pin
+
+
+def _apply_compaction_pins(summary: str, pins: list[str]) -> str:
+    cleaned_summary = summary.strip()
+    if not cleaned_summary or not pins:
+        return cleaned_summary
+    summary_lookup = cleaned_summary.lower()
+    missing = [pin for pin in pins if pin.lower() not in summary_lookup]
+    if not missing:
+        return cleaned_summary
+    lines = [f"- {_format_compaction_pin(pin)}" for pin in missing]
+    return f"{cleaned_summary}\n\nPinned exact details:\n" + "\n".join(lines)
+
+
+def _format_compaction_pin(pin: str) -> str:
+    if "`" in pin:
+        return pin
+    if re.search(r"[\s/.:_-]", pin):
+        return f"`{pin}`"
+    return pin
+
+
+def _fallback_summary(*, existing_summary: str, transcript: str, pins: list[str] | None = None) -> str:
     lines = [line.strip() for line in transcript.splitlines() if line.strip()]
     bullets = [f"- {line[:240]}" for line in lines[:16]]
     sections: list[str] = []
     if existing_summary.strip():
         sections.append(existing_summary.strip())
+    if pins:
+        sections.append("Pinned exact details:\n" + "\n".join(f"- {_format_compaction_pin(pin)}" for pin in pins))
     if bullets:
         sections.append("Recent exact details:\n" + "\n".join(bullets))
     merged = "\n".join(part for part in sections if part)

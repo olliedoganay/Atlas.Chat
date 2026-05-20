@@ -14,6 +14,7 @@ DEFAULT_EMBED_MODEL = "nomic-embed-text:latest"
 DEFAULT_MEM0_COLLECTION = "atlas_local_memory"
 DEFAULT_EMBED_DIM = 768
 DEFAULT_MEMORY_TOP_K = 5
+DEFAULT_COMPACTION_TIMEOUT_SECONDS = 25.0
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,7 @@ class AppConfig:
     mem0_collection: str
     embed_dim: int
     memory_top_k: int
+    compaction_timeout_seconds: float
 
 
 def _repo_root() -> Path:
@@ -59,6 +61,13 @@ def _optional_float_value(env: Mapping[str, str], key: str, default: float | Non
     if not text:
         return None
     return float(text)
+
+
+def _positive_float_value(env: Mapping[str, str], key: str, default: float) -> float:
+    value = _optional_float_value(env, key, default)
+    if value is None:
+        return default
+    return max(1.0, float(value))
 
 
 def load_config(
@@ -108,4 +117,9 @@ def load_config(
         mem0_collection=_value(source, "MEM0_COLLECTION", DEFAULT_MEM0_COLLECTION),
         embed_dim=int(_value(source, "EMBED_DIM", str(DEFAULT_EMBED_DIM))),
         memory_top_k=int(_value(source, "MEMORY_TOP_K", str(DEFAULT_MEMORY_TOP_K))),
+        compaction_timeout_seconds=_positive_float_value(
+            source,
+            "ATLAS_COMPACTION_TIMEOUT_SECONDS",
+            DEFAULT_COMPACTION_TIMEOUT_SECONDS,
+        ),
     )

@@ -56,6 +56,10 @@ class MemoryCreateRequest(BaseModel):
     text: str = Field(..., min_length=1)
 
 
+class ModelContextWindowRequest(BaseModel):
+    context_window: int | None = Field(default=None, ge=1024, le=262144)
+
+
 class ThreadTitleRequest(BaseModel):
     user_id: str = Field(..., min_length=1)
     title: str = Field(..., min_length=1)
@@ -152,6 +156,12 @@ def create_api_app(service: AtlasBackendService | None = None) -> FastAPI:
     @app.get("/models")
     def models() -> dict[str, Any]:
         return backend().list_models()
+
+    @app.patch("/models/context-window")
+    def set_ollama_context_window(request: ModelContextWindowRequest) -> dict[str, Any]:
+        return _handle_runtime(
+            lambda: backend().set_ollama_context_window(context_window=request.context_window)
+        )
 
     @app.get("/discovery")
     def discovery() -> dict[str, Any]:

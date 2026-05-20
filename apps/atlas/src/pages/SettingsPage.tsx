@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
+import type { CSSProperties } from "react";
 import { useSearchParams } from "react-router-dom";
 import {
   Database,
@@ -38,12 +39,15 @@ import {
   openExternalUrl,
   openAppLocation,
   resetAll,
+  setOllamaContextWindow,
   unlockUser,
 } from "../lib/api";
 import { normalizeSettingsSection, type SettingsSection } from "../lib/settingsSections";
 import { useAtlasStore } from "../store/useAtlasStore";
 
 type UserProtectionMode = "passwordless" | "password";
+
+const DEFAULT_CONTEXT_WINDOW_PRESETS = [4096, 8192, 16384, 32768, 65536, 131072, 262144];
 
 export function SettingsPage() {
   const queryClient = useQueryClient();
@@ -74,6 +78,7 @@ export function SettingsPage() {
   const [unlockPassword, setUnlockPassword] = useState("");
   const [appVersion, setAppVersion] = useState(packageInfo.version);
   const [appDiagnostics, setAppDiagnostics] = useState<Awaited<ReturnType<typeof getAppDiagnostics>> | null>(null);
+  const [contextWindowIndex, setContextWindowIndex] = useState(0);
   const { data: status } = useQuery({
     queryKey: ["status"],
     queryFn: getStatus,
@@ -119,6 +124,21 @@ export function SettingsPage() {
     () => visibleUsers.find((user) => user.user_id === currentUserId) ?? null,
     [currentUserId, visibleUsers],
   );
+  const contextWindowPresets = models?.context_window_presets?.length
+    ? models.context_window_presets
+    : DEFAULT_CONTEXT_WINDOW_PRESETS;
+  const contextWindowChoices = useMemo(
+    () => [null, ...contextWindowPresets] as Array<number | null>,
+    [contextWindowPresets],
+  );
+  const configuredContextWindow = models?.ollama_context_window?.configured_context_window ?? null;
+  const effectiveContextWindow =
+    models?.ollama_context_window?.effective_context_window ?? configuredContextWindow ?? null;
+  const selectedContextWindow = contextWindowChoices[contextWindowIndex] ?? null;
+  const effectiveContextWindowText = effectiveContextWindow
+    ? `Effective ${formatContextWindow(effectiveContextWindow)}`
+    : "Effective after Ollama reports a model";
+  const contextWindowProgress = formatSliderStopPosition(contextWindowIndex, contextWindowChoices.length);
   const manualMemories = useMemo(
     () =>
       currentUserLocked
@@ -167,6 +187,11 @@ export function SettingsPage() {
       setAppVersion(backendVersion);
     }
   }, [status?.version]);
+
+  useEffect(() => {
+    const index = configuredContextWindow ? contextWindowChoices.indexOf(configuredContextWindow) : 0;
+    setContextWindowIndex(index >= 0 ? index : 0);
+  }, [configuredContextWindow, contextWindowChoices]);
 
   useEffect(() => {
     let cancelled = false;
@@ -296,10 +321,36 @@ export function SettingsPage() {
       ]);
     },
   });
+  const setContextWindowMutation = useMutation({
+    mutationFn: (contextWindow: number | null) => setOllamaContextWindow(contextWindow),
+    onSuccess: async (payload) => {
+      queryClient.setQueryData(["models"], (existing: typeof models | undefined) =>
+        existing
+          ? {
+              ...existing,
+              ollama_context_window: payload.ollama_context_window,
+            }
+          : existing,
+      );
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["models"] }),
+        queryClient.invalidateQueries({ queryKey: ["thread-context"] }),
+      ]);
+    },
+  });
 
   const refreshModels = async () => {
     await queryClient.invalidateQueries({ queryKey: ["models"] });
     await queryClient.invalidateQueries({ queryKey: ["status"] });
+  };
+
+  const commitContextWindow = (index: number) => {
+    const clampedIndex = Math.max(0, Math.min(contextWindowChoices.length - 1, index));
+    const nextContextWindow = contextWindowChoices[clampedIndex] ?? null;
+    if (nextContextWindow === configuredContextWindow) {
+      return;
+    }
+    setContextWindowMutation.mutate(nextContextWindow);
   };
 
   const selectSection = (value: SettingsSection) => {
@@ -665,6 +716,83 @@ export function SettingsPage() {
               </SettingsRow>
 
               <SettingsRow
+                label="Ollama context window"
+                description="Set the global Ollama context length Atlas requests with num_ctx. Larger windows use more RAM or VRAM."
+                block
+              >
+                {models?.ollama_online && models.has_local_models ? (
+                  <div className="settings-column settings-context-window-panel">
+                    <div className="settings-context-window-toolbar">
+                      <div className="settings-context-window-value">
+                        <strong>
+                          {selectedContextWindow === null ? "Auto" : formatContextWindow(selectedContextWindow)}
+                        </strong>
+                        <span>{selectedContextWindow === null ? "Ollama default" : "Global num_ctx override"}</span>
+                      </div>
+                      <div className="settings-context-window-status">
+                        <span>{configuredContextWindow ? "Configured" : "Auto"}</span>
+                        <span>{effectiveContextWindowText}</span>
+                      </div>
+                    </div>
+
+                    <div className="settings-context-window-slider-shell">
+                      <input
+                        aria-label="Ollama context window"
+                        className="settings-context-window-slider"
+                        max={contextWindowChoices.length - 1}
+                        min={0}
+                        onBlur={(event) => commitContextWindow(Number(event.currentTarget.value))}
+                        onChange={(event) => setContextWindowIndex(Number(event.currentTarget.value))}
+                        onKeyUp={(event) => commitContextWindow(Number(event.currentTarget.value))}
+                        onPointerUp={(event) => commitContextWindow(Number(event.currentTarget.value))}
+                        step={1}
+                        style={{ "--context-window-progress": contextWindowProgress } as CSSProperties}
+                        type="range"
+                        value={contextWindowIndex}
+                      />
+                      <div className="settings-context-window-scale" aria-hidden="true">
+                        {contextWindowChoices.map((choice, index) => {
+                          const position = formatSliderStopPosition(index, contextWindowChoices.length);
+                          const className = index === contextWindowIndex ? "active" : "";
+                          return (
+                            <span
+                              className={className}
+                              key={choice ?? "auto"}
+                              style={{ "--context-window-label-position": position } as CSSProperties}
+                            >
+                              {choice === null ? "Auto" : formatCompactContextWindow(choice)}
+                            </span>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    <p className="settings-context-window-note">
+                      {selectedContextWindow === null
+                        ? "Atlas follows Ollama's configured default context length."
+                        : "Atlas sends this value as num_ctx for Ollama chat requests."}
+                    </p>
+                    {setContextWindowMutation.isPending ? (
+                      <div className="settings-context-window-saving">Saving context window...</div>
+                    ) : null}
+                    {setContextWindowMutation.isError ? (
+                      <div className="error-inline">{getMutationErrorMessage(setContextWindowMutation.error)}</div>
+                    ) : null}
+                  </div>
+                ) : (
+                  <EmptyState
+                    icon={<Monitor size={18} />}
+                    title={models?.ollama_online ? "No models installed" : "Ollama not reachable"}
+                    description={
+                      models?.ollama_online
+                        ? "Install a chat model before setting a context window."
+                        : "Start Ollama before changing model context windows."
+                    }
+                  />
+                )}
+              </SettingsRow>
+
+              <SettingsRow
                 label="Installed local models"
                 description="Local chat models Atlas Chat can bind to a thread. Pull more from Discovery."
                 block
@@ -1001,6 +1129,36 @@ function formatTemperature(value?: number | null) {
     return "Creative (0.9)";
   }
   return value.toFixed(2);
+}
+
+function formatContextWindow(value?: number | null) {
+  if (!value || !Number.isFinite(value)) {
+    return "unknown";
+  }
+  return `${value.toLocaleString()} tokens`;
+}
+
+function formatCompactContextWindow(value: number) {
+  if (value >= 1024) {
+    return `${Math.round(value / 1024)}K`;
+  }
+  return value.toLocaleString();
+}
+
+function formatSliderStopPosition(index: number, count: number) {
+  const thumbSize = 18;
+  if (count <= 1) {
+    return `${thumbSize / 2}px`;
+  }
+  const ratio = Math.max(0, Math.min(1, index / (count - 1)));
+  const percent = trimCssNumber(ratio * 100);
+  const offset = thumbSize / 2 - thumbSize * ratio;
+  const operator = offset >= 0 ? "+" : "-";
+  return `calc(${percent}% ${operator} ${trimCssNumber(Math.abs(offset))}px)`;
+}
+
+function trimCssNumber(value: number) {
+  return Number(value.toFixed(4)).toString();
 }
 
 function describeUserProtection(user: { protection?: string; locked?: boolean }) {

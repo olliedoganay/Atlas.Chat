@@ -56,11 +56,27 @@ class FakeService:
                 {"label": "0.1", "value": 0.1},
                 {"label": "0.2", "value": 0.2},
             ],
+            "context_window_presets": [4096, 8192, 16384],
+            "ollama_context_window": {
+                "configured_context_window": 8192,
+                "effective_context_window": 8192,
+                "source": "configured",
+            },
             "models": ["test-model", "model-b"],
             "model_details": [
                 {"name": "test-model", "supports_images": False},
                 {"name": "model-b", "supports_images": True},
             ],
+        }
+
+    def set_ollama_context_window(self, *, context_window):
+        return {
+            "configured_context_window": context_window,
+            "ollama_context_window": {
+                "configured_context_window": context_window,
+                "effective_context_window": context_window or 4096,
+                "source": "configured" if context_window else "ollama",
+            },
         }
 
     def discovery(self):
@@ -302,10 +318,23 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(models.json()["ollama_online"])
         self.assertTrue(models.json()["has_local_models"])
         self.assertTrue(models.json()["model_details"][1]["supports_images"])
+        self.assertEqual(models.json()["context_window_presets"], [4096, 8192, 16384])
+        self.assertEqual(models.json()["ollama_context_window"]["configured_context_window"], 8192)
+        self.assertEqual(models.json()["ollama_context_window"]["effective_context_window"], 8192)
         self.assertEqual(discovery.json()["atlas"]["status"], "memory-degraded")
         self.assertEqual(discovery.json()["recommended_models"][0]["pull_command"], "ollama pull test-model")
         self.assertEqual(users.json()[0]["user_id"], "research_user")
         self.assertEqual(memories.json()[0]["memory_id"], "mem-1")
+
+    def test_ollama_context_window_update(self) -> None:
+        response = self.client.patch(
+            "/models/context-window",
+            json={"context_window": 16384},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["configured_context_window"], 16384)
+        self.assertEqual(response.json()["ollama_context_window"]["configured_context_window"], 16384)
 
     def test_thread_listing_and_run_details(self) -> None:
         response = self.client.get("/threads", params={"user_id": "research_user"})

@@ -100,6 +100,12 @@ export type ModelCatalog = {
   has_local_models: boolean;
   catalog_source: "ollama" | "fallback";
   temperature_presets: TemperaturePreset[];
+  context_window_presets: number[];
+  ollama_context_window: {
+    configured_context_window?: number | null;
+    effective_context_window?: number | null;
+    source?: "configured" | "ollama";
+  };
   models: string[];
   model_details: Array<{
     name: string;
@@ -271,6 +277,16 @@ export function getStatus() {
 
 export function getModels() {
   return request<ModelCatalog>("/models");
+}
+
+export function setOllamaContextWindow(contextWindow: number | null) {
+  return request<{
+    configured_context_window?: number | null;
+    ollama_context_window: ModelCatalog["ollama_context_window"];
+  }>("/models/context-window", {
+    method: "PATCH",
+    body: JSON.stringify({ context_window: contextWindow }),
+  });
 }
 
 export function getDiscovery() {
@@ -482,6 +498,7 @@ export type RunnerStartResponse = {
   network?: string;
   timeout_seconds?: number;
   vnc_url?: string;
+  web_url?: string;
 };
 
 export type RunnerEvent =
@@ -534,7 +551,7 @@ export function streamRunnerRun(
               contentType.includes("application/json")
                 ? await response.json()
                 : { detail: await response.text() };
-            throw new Error(String(payload.detail ?? payload.error ?? response.statusText));
+            throw new Error(extractResponseErrorMessage(payload, response.statusText));
           }
 
           const body = response.body;
@@ -634,7 +651,7 @@ export function streamRun(
               contentType.includes("application/json")
                 ? await response.json()
                 : { detail: await response.text() };
-            throw new Error(String(payload.detail ?? payload.error ?? response.statusText));
+            throw new Error(extractResponseErrorMessage(payload, response.statusText));
           }
 
           const body = response.body;
@@ -834,10 +851,58 @@ async function requestWithRuntime<T>(runtime: BackendRuntime, path: string, init
     const contentType = response.headers.get("content-type") ?? "";
     const payload =
       contentType.includes("application/json") ? await response.json() : { detail: await response.text() };
-    throw new Error(String(payload.detail ?? payload.error ?? response.statusText));
+    throw new Error(extractResponseErrorMessage(payload, response.statusText));
   }
 
   return (await response.json()) as T;
+}
+
+function extractResponseErrorMessage(payload: unknown, fallback: string) {
+  if (!payload || typeof payload !== "object") {
+    return fallback || "The request did not complete.";
+  }
+  const record = payload as Record<string, unknown>;
+  return formatErrorDetail(record.detail ?? record.error, fallback || "The request did not complete.");
+}
+
+function formatErrorDetail(detail: unknown, fallback: string): string {
+  if (typeof detail === "string") {
+    return detail.trim() || fallback;
+  }
+  if (Array.isArray(detail)) {
+    const parts = detail
+      .map((item) => formatValidationDetail(item))
+      .filter((item) => item.length > 0);
+    return parts.join("; ") || fallback;
+  }
+  if (detail && typeof detail === "object") {
+    const record = detail as Record<string, unknown>;
+    const nested = record.detail ?? record.error ?? record.message ?? record.msg;
+    if (nested !== undefined && nested !== detail) {
+      return formatErrorDetail(nested, fallback);
+    }
+    try {
+      return JSON.stringify(record);
+    } catch {
+      return fallback;
+    }
+  }
+  return fallback;
+}
+
+function formatValidationDetail(detail: unknown): string {
+  if (!detail || typeof detail !== "object") {
+    return formatErrorDetail(detail, "");
+  }
+  const record = detail as Record<string, unknown>;
+  const message = record.msg ?? record.message;
+  const location = Array.isArray(record.loc)
+    ? record.loc.filter((item) => item !== "body").join(".")
+    : "";
+  if (typeof message === "string" && message.trim()) {
+    return location ? `${location}: ${message}` : message;
+  }
+  return formatErrorDetail(record, "");
 }
 
 function sleep(delayMs: number) {

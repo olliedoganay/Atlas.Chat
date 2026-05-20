@@ -189,6 +189,34 @@ class ModelCatalogCachingTests(unittest.TestCase):
         self.assertEqual(model_info_mock.call_count, 1)
 
     @patch("atlas_local.api_service.inspect_local_ollama_models")
+    def test_model_catalog_reports_ollama_context_window_override(self, model_info_mock) -> None:
+        model_info_mock.return_value = OllamaCatalogSnapshot(
+            models=(
+                OllamaModelInfo(name="qwen"),
+                OllamaModelInfo(name="gemma"),
+            ),
+            ollama_online=True,
+            has_local_models=True,
+            source="ollama",
+        )
+
+        service = AtlasBackendService.__new__(AtlasBackendService)
+        service.config = SimpleNamespace(chat_model="qwen", chat_temperature=0.2)
+        service._model_catalog_cache = None
+        service.app = SimpleNamespace(
+            llm_provider=SimpleNamespace(
+                ollama_context_window=lambda: 16384,
+                effective_context_window=lambda model: 8192 if model == "gemma" else 16384,
+            )
+        )
+
+        payload = AtlasBackendService.list_models(service)
+
+        self.assertEqual(payload["ollama_context_window"]["source"], "configured")
+        self.assertEqual(payload["ollama_context_window"]["configured_context_window"], 16384)
+        self.assertEqual(payload["ollama_context_window"]["effective_context_window"], 16384)
+
+    @patch("atlas_local.api_service.inspect_local_ollama_models")
     def test_model_catalog_reports_ollama_offline_without_local_models(self, model_info_mock) -> None:
         model_info_mock.return_value = OllamaCatalogSnapshot()
 
@@ -474,6 +502,59 @@ class ContextCompactionTests(unittest.TestCase):
         self.assertIn("ImportError: libtk8.6.so", prompt)
         self.assertIn("src/atlas_local/code_runner.py", prompt)
         self.assertIn("v1.0.25", prompt)
+
+    def test_summarize_message_batch_appends_missing_pinned_exact_details(self) -> None:
+        service = AtlasBackendService.__new__(AtlasBackendService)
+
+        class _FakeChat:
+            def invoke(self, messages: list[HumanMessage]) -> SimpleNamespace:
+                return SimpleNamespace(content="Current objective: keep working.")
+
+        service.app = SimpleNamespace(llm_provider=SimpleNamespace(chat=lambda *_args, **_kwargs: _FakeChat()))
+
+        summary = AtlasBackendService._summarize_message_batch(
+            service,
+            model="gpt-oss:20b",
+            existing_summary="",
+            messages=[
+                HumanMessage(content="Patch apps/atlas/src/pages/WorkspacePage.tsx for gpt-oss:20b."),
+                AIMessage(content="Release tag v1.0.33 passed with 147 passed, 19 subtests passed."),
+            ],
+        )
+
+        self.assertIn("Pinned exact details", summary)
+        self.assertIn("apps/atlas/src/pages/WorkspacePage.tsx", summary)
+        self.assertIn("gpt-oss:20b", summary)
+        self.assertIn("v1.0.33", summary)
+        self.assertIn("147 passed", summary)
+
+    def test_summarize_message_batch_times_out_to_fallback_and_aborts_request(self) -> None:
+        service = AtlasBackendService.__new__(AtlasBackendService)
+        aborted: list[str] = []
+
+        class _SlowChat:
+            def invoke(self, messages: list[HumanMessage]) -> SimpleNamespace:
+                time.sleep(0.05)
+                return SimpleNamespace(content="late summary")
+
+        service.app = SimpleNamespace(
+            llm_provider=SimpleNamespace(
+                chat=lambda *_args, **_kwargs: _SlowChat(),
+                abort_active_requests=lambda: aborted.append("abort"),
+            )
+        )
+        service._compaction_timeout_seconds = lambda: 0.01  # type: ignore[method-assign]
+
+        summary = AtlasBackendService._summarize_message_batch(
+            service,
+            model="gpt-oss:20b",
+            existing_summary="",
+            messages=[HumanMessage(content="Use src/atlas_local/api_service.py exactly.")],
+        )
+
+        self.assertEqual(aborted, ["abort"])
+        self.assertIn("Recent exact details", summary)
+        self.assertIn("src/atlas_local/api_service.py", summary)
 
     def test_auto_compaction_rejects_non_reducing_summary(self) -> None:
         service = AtlasBackendService.__new__(AtlasBackendService)
@@ -1377,6 +1458,43 @@ class ManualCompactionTests(unittest.TestCase):
         self.assertEqual(result["thread_summary"], "")
         self.assertEqual(result["compacted_message_count"], 0)
         self.assertEqual(result["manual_compaction_status"], "summary_too_large")
+
+    def test_manual_compact_context_rejects_tiny_reduction(self) -> None:
+        service = AtlasBackendService.__new__(AtlasBackendService)
+
+        def count_tokens(_model: str, messages: list[HumanMessage | AIMessage]) -> int:
+            total = 0
+            for message in messages:
+                content = str(message.content)
+                total += 3900 if "small saving summary" in content else 1000
+            return total
+
+        service.app = SimpleNamespace(llm_provider=SimpleNamespace(count_message_tokens=count_tokens))
+        service._summarize_message_batch = lambda **_: "small saving summary"  # type: ignore[method-assign]
+        state = {
+            "messages": [
+                HumanMessage(content="u1"),
+                AIMessage(content="a1"),
+                HumanMessage(content="u2"),
+                AIMessage(content="a2"),
+                HumanMessage(content="u3"),
+                AIMessage(content="a3"),
+            ],
+            "thread_summary": "",
+            "compacted_message_count": 0,
+        }
+        runtime = SimpleNamespace(
+            context=SimpleNamespace(
+                effective_context_window=8192,
+                chat_model="gemma4:e4b",
+            )
+        )
+
+        result = AtlasBackendService._manual_compact_context(service, state=state, runtime=runtime)
+
+        self.assertEqual(result["thread_summary"], "")
+        self.assertEqual(result["compacted_message_count"], 0)
+        self.assertEqual(result["manual_compaction_status"], "summary_not_useful")
 
     def test_execute_compact_run_persists_manual_timeline_event(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

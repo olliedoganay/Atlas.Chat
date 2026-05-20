@@ -12,6 +12,11 @@ from langchain_ollama import ChatOllama
 from .config import AppConfig
 
 
+OLLAMA_CONTEXT_WINDOW_PRESETS = (4096, 8192, 16384, 32768, 65536, 131072, 262144)
+MIN_OLLAMA_CONTEXT_WINDOW = 1024
+MAX_OLLAMA_CONTEXT_WINDOW = 262144
+
+
 def format_runtime_error(config: AppConfig, exc: Exception, *, chat_model: str | None = None) -> RuntimeError:
     resolved_chat_model = (chat_model or "").strip()
     model_detail = (
@@ -40,9 +45,11 @@ def format_runtime_error(config: AppConfig, exc: Exception, *, chat_model: str |
 @dataclass
 class LLMProvider:
     config: AppConfig
-    _chat_models: dict[tuple[str, float | None, str], ChatOllama] = field(default_factory=dict, init=False, repr=False)
-    _json_chat_models: dict[str, ChatOllama] = field(default_factory=dict, init=False, repr=False)
+    _chat_models: dict[tuple[str, float | None, str, int | None], ChatOllama] = field(default_factory=dict, init=False, repr=False)
+    _json_chat_models: dict[tuple[str, int | None], ChatOllama] = field(default_factory=dict, init=False, repr=False)
     _context_windows: dict[str, tuple[float, int]] = field(default_factory=dict, init=False, repr=False)
+    _ollama_context_window: int | None = field(default=None, init=False, repr=False)
+    _ollama_context_window_loaded: bool = field(default=False, init=False, repr=False)
 
     def chat(
         self,
@@ -56,7 +63,8 @@ class LLMProvider:
             raise RuntimeError("Select a local Ollama model before starting this chat.")
         resolved_temperature = None if temperature is None else float(temperature)
         resolved_reasoning = _resolve_reasoning_for_model(resolved_model, reasoning)
-        cache_key = (resolved_model, resolved_temperature, repr(resolved_reasoning))
+        context_window = self.ollama_context_window()
+        cache_key = (resolved_model, resolved_temperature, repr(resolved_reasoning), context_window)
         if cache_key not in self._chat_models:
             options: dict[str, Any] = {
                 "model": resolved_model,
@@ -67,6 +75,8 @@ class LLMProvider:
                 options["temperature"] = resolved_temperature
             if resolved_reasoning is not None:
                 options["reasoning"] = resolved_reasoning
+            if context_window is not None:
+                options["num_ctx"] = context_window
             self._chat_models[cache_key] = ChatOllama(**options)
         return self._chat_models[cache_key]
 
@@ -74,15 +84,20 @@ class LLMProvider:
         resolved_model = (model or "").strip()
         if not resolved_model:
             raise RuntimeError("Select a local Ollama model before starting this chat.")
-        if resolved_model not in self._json_chat_models:
-            self._json_chat_models[resolved_model] = ChatOllama(
-                model=resolved_model,
-                base_url=self.config.ollama_url,
-                temperature=0.0,
-                format="json",
-                validate_model_on_init=True,
-            )
-        return self._json_chat_models[resolved_model]
+        context_window = self.ollama_context_window()
+        cache_key = (resolved_model, context_window)
+        if cache_key not in self._json_chat_models:
+            options: dict[str, Any] = {
+                "model": resolved_model,
+                "base_url": self.config.ollama_url,
+                "temperature": 0.0,
+                "format": "json",
+                "validate_model_on_init": True,
+            }
+            if context_window is not None:
+                options["num_ctx"] = context_window
+            self._json_chat_models[cache_key] = ChatOllama(**options)
+        return self._json_chat_models[cache_key]
 
     def count_message_tokens(self, model: str | None, messages: list[Any]) -> int:
         resolved_model = (model or "").strip()
@@ -104,6 +119,9 @@ class LLMProvider:
         resolved_model = (model or "").strip()
         if not resolved_model:
             return 0
+        override = self.ollama_context_window()
+        if override is not None:
+            return override
         cached = self._context_windows.get(resolved_model)
         now = monotonic()
         if cached and now - cached[0] < ttl_seconds:
@@ -112,7 +130,80 @@ class LLMProvider:
         self._context_windows[resolved_model] = (now, value)
         return value
 
+    def ollama_context_window(self) -> int | None:
+        self._load_ollama_context_window()
+        return self._ollama_context_window
+
+    def set_ollama_context_window(self, context_window: int | None) -> int | None:
+        if context_window is None:
+            saved_value = None
+        else:
+            parsed = int(context_window)
+            if parsed < MIN_OLLAMA_CONTEXT_WINDOW or parsed > MAX_OLLAMA_CONTEXT_WINDOW:
+                raise RuntimeError(
+                    f"Context window must be between {MIN_OLLAMA_CONTEXT_WINDOW:,} and {MAX_OLLAMA_CONTEXT_WINDOW:,} tokens."
+                )
+            saved_value = parsed
+        self._write_ollama_context_window(saved_value)
+        self._ollama_context_window = saved_value
+        self._ollama_context_window_loaded = True
+        self._clear_model_caches()
+        return saved_value
+
     def abort_active_requests(self) -> None:
+        for chat_model in list(self._chat_models.values()):
+            _close_chat_client(chat_model)
+        for chat_model in list(self._json_chat_models.values()):
+            _close_chat_client(chat_model)
+        self._chat_models.clear()
+        self._json_chat_models.clear()
+
+    def _load_ollama_context_window(self) -> None:
+        if self._ollama_context_window_loaded:
+            return
+        data_dir = getattr(self.config, "data_dir", None)
+        if data_dir is None:
+            self._ollama_context_window = None
+            self._ollama_context_window_loaded = True
+            return
+        path = data_dir / "ollama_context_window.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            self._ollama_context_window = None
+            self._ollama_context_window_loaded = True
+            return
+        if not isinstance(payload, dict):
+            self._ollama_context_window = None
+            self._ollama_context_window_loaded = True
+            return
+        parsed = _parse_positive_int(payload.get("context_window"))
+        self._ollama_context_window = (
+            parsed
+            if parsed and MIN_OLLAMA_CONTEXT_WINDOW <= parsed <= MAX_OLLAMA_CONTEXT_WINDOW
+            else None
+        )
+        self._ollama_context_window_loaded = True
+
+    def _write_ollama_context_window(self, context_window: int | None) -> None:
+        data_dir = getattr(self.config, "data_dir", None)
+        if data_dir is None:
+            raise RuntimeError("Atlas cannot persist the Ollama context window without a data directory.")
+        path = data_dir / "ollama_context_window.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if context_window is None:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            return
+        path.write_text(
+            json.dumps({"context_window": context_window}, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    def _clear_model_caches(self) -> None:
+        self._context_windows.clear()
         for chat_model in list(self._chat_models.values()):
             _close_chat_client(chat_model)
         for chat_model in list(self._json_chat_models.values()):

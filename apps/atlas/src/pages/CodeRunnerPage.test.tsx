@@ -264,6 +264,7 @@ describe("CodeRunnerPage client preview", () => {
 
     await flushEffects();
 
+    expect(container.textContent).toContain("Installing GUI dependencies...");
     expect(container.querySelector(".runner-vnc-frame")).toBeNull();
     expect(container.querySelector(".runner-output")).not.toBeNull();
     expect(container.textContent).toContain("installing system dependencies");
@@ -272,6 +273,35 @@ describe("CodeRunnerPage client preview", () => {
       root.unmount();
     });
     container.remove();
+  });
+
+  it("shows a web preview for server runs with an exposed web URL", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("", { status: 200 }));
+    apiMocks.execCode.mockResolvedValue({ run_id: "run-1", web_url: "http://127.0.0.1:43210/" });
+    apiMocks.streamRunnerRun.mockImplementation((_runId, onEvent) => {
+      onEvent({ type: "output", stream: "stdout", chunk: "[atlas-runner] web preview will use container port 5000\n" });
+      return vi.fn();
+    });
+    window.localStorage.setItem(
+      "atlas-runner:token-1",
+      JSON.stringify({ language: "python", code: "from flask import Flask\napp = Flask(__name__)" }),
+    );
+    const { root, container } = renderRunnerPage();
+
+    await flushEffects();
+    await flushEffects();
+
+    expect(fetchSpy).toHaveBeenCalledWith("http://127.0.0.1:43210/", { method: "GET", mode: "no-cors" });
+    expect(container.textContent).toContain("Starting web preview...");
+    expect(container.querySelector('iframe[title="Atlas web preview"]')).not.toBeNull();
+    expect(container.querySelector(".runner-log-rail-button")).not.toBeNull();
+    expect(container.querySelector(".runner-output")).toBeNull();
+
+    act(() => {
+      root.unmount();
+    });
+    container.remove();
+    fetchSpy.mockRestore();
   });
 });
 

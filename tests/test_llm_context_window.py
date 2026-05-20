@@ -1,10 +1,12 @@
 import io
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from atlas_local.config import load_config
-from atlas_local.llm import resolve_effective_context_window
+from atlas_local.llm import LLMProvider, resolve_effective_context_window
 
 
 class _FakeResponse(io.BytesIO):
@@ -65,6 +67,44 @@ class LlmContextWindowTests(unittest.TestCase):
             value = resolve_effective_context_window(self.config, "gpt-oss:20b")
 
         self.assertEqual(value, 8192)
+
+    def test_provider_passes_configured_num_ctx_to_chat_models(self) -> None:
+        captured: list[dict[str, object]] = []
+
+        class _FakeChatOllama:
+            def __init__(self, **kwargs):
+                captured.append(kwargs)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = load_config(project_root=Path(temp_dir), env={})
+            provider = LLMProvider(config)
+            saved = provider.set_ollama_context_window(16384)
+
+            with patch("atlas_local.llm.ChatOllama", _FakeChatOllama):
+                provider.chat("gpt-oss:20b", temperature=0.2, reasoning=False)
+                provider.json_chat("gpt-oss:20b")
+
+        self.assertEqual(saved, 16384)
+        self.assertEqual(captured[0]["num_ctx"], 16384)
+        self.assertEqual(captured[0]["model"], "gpt-oss:20b")
+        self.assertEqual(captured[1]["num_ctx"], 16384)
+        self.assertEqual(captured[1]["format"], "json")
+
+    def test_provider_persists_and_clears_ollama_context_window(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = load_config(project_root=Path(temp_dir), env={})
+            provider = LLMProvider(config)
+
+            provider.set_ollama_context_window(32768)
+            reloaded = LLMProvider(config)
+            loaded_value = reloaded.ollama_context_window()
+            cleared = reloaded.set_ollama_context_window(None)
+
+            final = LLMProvider(config)
+
+        self.assertEqual(loaded_value, 32768)
+        self.assertIsNone(cleared)
+        self.assertIsNone(final.ollama_context_window())
 
 
 if __name__ == "__main__":

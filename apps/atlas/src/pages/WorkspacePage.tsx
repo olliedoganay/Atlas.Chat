@@ -689,7 +689,9 @@ export function WorkspacePage() {
     runDetails?.detected_context_window,
   ]);
   const contextMeterTitle = formatContextMeterTitle(contextMeter, currentThreadHasActiveRun);
-  const showOllamaWarning = startupState.key === "ollama-offline";
+  const isCompactingContext =
+    startManualCompact.isPending || (isStreaming && (currentRunMode === "compact" || currentStage === "compaction"));
+  const showOllamaWarning = startupState.key === "ollama-offline" && transcript.length > 0;
   const idleKicker =
     startupState.key === "ready" && selectedModel
       ? formatModelLabel(selectedModel)
@@ -1423,7 +1425,7 @@ export function WorkspacePage() {
 
           <button
             aria-label={contextMeterTitle}
-            className={`composer-context-meter composer-context-meter-${contextMeter.tone}`}
+            className={`composer-context-meter composer-context-meter-${contextMeter.tone}${isCompactingContext ? " composer-context-meter-compacting" : ""}`}
             disabled={isStreaming || !currentUserId || !threadHasHistory || startManualCompact.isPending}
             onClick={() => startManualCompact.mutate()}
             title={contextMeterTitle}
@@ -1434,8 +1436,8 @@ export function WorkspacePage() {
               className="composer-context-meter-fill"
               style={{ width: `${contextMeter.remainingPercent}%` }}
             />
-            <span className="composer-context-meter-label">
-              {startManualCompact.isPending || (isStreaming && currentRunMode === "compact")
+            <span className={`composer-context-meter-label${isCompactingContext ? " deciding-sweep" : ""}`}>
+              {isCompactingContext
                 ? "Compacting..."
                 : `${contextMeter.remainingPercent}% until auto-compact`}
             </span>

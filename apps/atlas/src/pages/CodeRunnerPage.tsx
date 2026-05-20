@@ -164,6 +164,7 @@ export function CodeRunnerPage() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [dockerReason, setDockerReason] = useState<string>("");
   const [vncUrl, setVncUrl] = useState<string | null>(null);
+  const [webUrl, setWebUrl] = useState<string | null>(null);
   const [vncReady, setVncReady] = useState(false);
   const [clientPreviewNonce, setClientPreviewNonce] = useState(0);
   const [serverLogsOpen, setServerLogsOpen] = useState(false);
@@ -175,7 +176,13 @@ export function CodeRunnerPage() {
 
   const clientLang = useMemo(() => (language ? isClientLanguage(language) : false), [language]);
   const showVncPane = Boolean(vncUrl && vncReady && phase !== "finished" && phase !== "error");
+  const showWebPane = Boolean(webUrl && phase !== "finished" && phase !== "error");
+  const showServerPreview = showVncPane || showWebPane;
   const outputLineCount = output.length + (errorMessage ? 1 : 0);
+  const activityLabel = useMemo(
+    () => runnerActivityLabel({ clientLang, output, phase, vncReady, vncUrl, webUrl }),
+    [clientLang, output, phase, vncReady, vncUrl, webUrl],
+  );
 
   useEffect(() => {
     if (!token) {
@@ -241,6 +248,7 @@ export function CodeRunnerPage() {
     setDurationMs(null);
     setErrorMessage(null);
     setVncUrl(null);
+    setWebUrl(null);
     setVncReady(false);
     setServerLogsOpen(false);
 
@@ -264,6 +272,7 @@ export function CodeRunnerPage() {
       currentRunId.current = started.run_id;
       setRunId(started.run_id);
       setVncUrl(started.vnc_url ?? null);
+      setWebUrl(started.web_url ?? null);
       setServerLogsOpen(false);
       setPhase("running");
       streamDisposer.current?.();
@@ -379,6 +388,7 @@ export function CodeRunnerPage() {
         <div className="runner-title">
           <span className="runner-lang-pill">{language}</span>
           <RunnerStatusBadge phase={phase} exitCode={exitCode} />
+          {activityLabel ? <span className="runner-activity-label">{activityLabel}</span> : null}
         </div>
         <div className="runner-actions">
           <button
@@ -405,7 +415,7 @@ export function CodeRunnerPage() {
         </div>
       </header>
 
-      <main className={`runner-body${showVncPane ? " with-vnc" : ""}${sourceOpen ? " with-source" : ""}`}>
+      <main className={`runner-body${showServerPreview ? " with-vnc" : ""}${sourceOpen ? " with-source" : ""}`}>
         {sourceOpen ? (
           <RunnerSourcePanel
             code={code}
@@ -421,6 +431,19 @@ export function CodeRunnerPage() {
         ) : showVncPane && vncUrl ? (
           <>
             <VncPane url={vncUrl} />
+            <ServerLogDrawer
+              errorMessage={errorMessage}
+              isOpen={serverLogsOpen}
+              onToggle={() => setServerLogsOpen((current) => !current)}
+              output={output}
+              outputLineCount={outputLineCount}
+              outputRef={outputRef}
+              phase={phase}
+            />
+          </>
+        ) : showWebPane && webUrl ? (
+          <>
+            <WebPreviewPane url={webUrl} />
             <ServerLogDrawer
               errorMessage={errorMessage}
               isOpen={serverLogsOpen}
@@ -509,6 +532,56 @@ function RunnerStatusBadge({ phase, exitCode }: { phase: Phase; exitCode: number
     return <span className="runner-status fail">Docker down</span>;
   }
   return <span className="runner-status pending">Ready</span>;
+}
+
+function runnerActivityLabel({
+  clientLang,
+  output,
+  phase,
+  vncReady,
+  vncUrl,
+  webUrl,
+}: {
+  clientLang: boolean;
+  output: OutputLine[];
+  phase: Phase;
+  vncReady: boolean;
+  vncUrl: string | null;
+  webUrl: string | null;
+}) {
+  if (clientLang) {
+    return phase === "idle" ? "Client preview ready" : null;
+  }
+  if (phase === "loading") {
+    return "Checking runner...";
+  }
+  if (phase !== "running") {
+    return null;
+  }
+
+  const latest = output.length ? output[output.length - 1].text.toLowerCase() : "";
+  if (latest.includes("installing system dependencies")) {
+    return vncUrl ? "Installing GUI dependencies..." : "Installing system dependencies...";
+  }
+  if (latest.includes("installing python packages")) {
+    return "Installing Python packages...";
+  }
+  if (latest.includes("installing:") || latest.includes("resolving modules")) {
+    return "Resolving dependencies...";
+  }
+  if (latest.includes("gui ready on port")) {
+    return vncReady ? "Opening GUI preview..." : "Starting virtual display...";
+  }
+  if (latest.includes("web preview will use")) {
+    return "Starting web preview...";
+  }
+  if (vncUrl) {
+    return vncReady ? "Running GUI app" : "Starting virtual display...";
+  }
+  if (webUrl) {
+    return "Running web app";
+  }
+  return "Running code...";
 }
 
 function ServerLogDrawer({
@@ -676,6 +749,38 @@ function ClientPreview({ code }: { code: string }) {
 }
 
 function VncPane({ url }: { url: string }) {
+  return (
+    <RunnerUrlPreview
+      background="dark"
+      loadingLabel="Starting GUI..."
+      title="Atlas GUI preview"
+      url={url}
+    />
+  );
+}
+
+function WebPreviewPane({ url }: { url: string }) {
+  return (
+    <RunnerUrlPreview
+      background="light"
+      loadingLabel="Starting web preview..."
+      title="Atlas web preview"
+      url={url}
+    />
+  );
+}
+
+function RunnerUrlPreview({
+  background,
+  loadingLabel,
+  title,
+  url,
+}: {
+  background: "dark" | "light";
+  loadingLabel: string;
+  title: string;
+  url: string;
+}) {
   const [ready, setReady] = useState(false);
   const [src, setSrc] = useState<string | null>(null);
 
@@ -708,11 +813,11 @@ function VncPane({ url }: { url: string }) {
   }, [url]);
 
   return (
-    <div className="runner-vnc">
+    <div className={`runner-vnc ${background === "light" ? "runner-web-preview" : ""}`}>
       {ready && src ? (
-        <iframe className="runner-vnc-frame" src={src} title="Atlas GUI preview" />
+        <iframe className="runner-vnc-frame" src={src} title={title} />
       ) : (
-        <div className="runner-vnc-placeholder">Starting GUI...</div>
+        <div className="runner-vnc-placeholder">{loadingLabel}</div>
       )}
     </div>
   );
