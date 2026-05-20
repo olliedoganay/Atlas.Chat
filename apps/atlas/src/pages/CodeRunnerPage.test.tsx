@@ -105,6 +105,19 @@ describe("CodeRunnerPage client preview", () => {
     expect(tokens).not.toContain("allow-same-origin");
   });
 
+  it("installs sandbox-safe storage fallbacks before user scripts", () => {
+    const code =
+      '<!DOCTYPE html><html><head></head><body><script>localStorage.setItem("score", "1");</script></body></html>';
+    const preview = buildClientPreviewDocument(code, "storage-channel");
+
+    expect(preview).toContain('installStorageFallback("localStorage")');
+    expect(preview).toContain('installStorageFallback("sessionStorage")');
+    expect(preview.indexOf('installStorageFallback("localStorage")')).toBeLessThan(
+      preview.indexOf('localStorage.setItem("score", "1")'),
+    );
+    expect(CLIENT_PREVIEW_SANDBOX.split(" ")).not.toContain("allow-same-origin");
+  });
+
   it("shows the runnable source beside the preview and lets the user hide it", async () => {
     window.localStorage.setItem(
       "atlas-runner:token-1",

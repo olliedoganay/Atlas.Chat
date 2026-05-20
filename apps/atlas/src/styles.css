@@ -2434,6 +2434,16 @@ pre {
   min-height: var(--control-height);
 }
 
+.workspace-thinking-open-button {
+  min-height: var(--control-height);
+}
+
+.workspace-thinking-open-button.active {
+  border-color: color-mix(in srgb, var(--accent) 52%, var(--border) 48%);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--text);
+}
+
 .workspace-model-lock {
   display: inline-flex;
   align-items: center;

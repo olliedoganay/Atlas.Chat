@@ -879,6 +879,13 @@ export function WorkspacePage() {
     setIsThinkingPanelOpen(true);
   };
 
+  const toggleThinkingPanel = () => {
+    if (!canToggleThinkingPanel) {
+      return;
+    }
+    setIsThinkingPanelOpen((current) => !current);
+  };
+
   const closeThinkingPanel = () => {
     setIsThinkingPanelOpen(false);
   };
@@ -948,6 +955,23 @@ export function WorkspacePage() {
                 Markdown
               </button>
             </div>
+
+            {canToggleThinkingPanel ? (
+              <div className="workspace-model-group">
+                <span className="workspace-model-label">Trace</span>
+                <button
+                  aria-expanded={isThinkingPanelOpen}
+                  aria-label={isThinkingPanelOpen ? "Hide thinking panel" : "Show thinking panel"}
+                  className={`ghost-button compact-button workspace-thinking-open-button${isThinkingPanelOpen ? " active" : ""}`}
+                  onClick={toggleThinkingPanel}
+                  title={isThinkingPanelOpen ? "Hide thinking panel" : "Show thinking panel"}
+                  type="button"
+                >
+                  <Lightbulb size={15} />
+                  Thinking
+                </button>
+              </div>
+            ) : null}
 
             <div className="workspace-model-group">
               <span className="workspace-model-label">Model</span>
