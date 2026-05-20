@@ -10,10 +10,13 @@ If you need to work inside this folder directly, these are the only commands tha
 npm run dev
 npm test
 npm run build
+npm run build:release
 npm run tauri dev
 ```
 
-Generated folders such as `dist`, `output`, and `src-tauri/target` are ignored and should not be committed.
+`npm run build` checks and builds only the frontend. `npm run build:release` also packages the Python backend resources used by Tauri release builds.
+
+Generated folders such as `dist`, `output`, `src-tauri/resources/backend`, `src-tauri/resources/prompts`, and `src-tauri/target` are ignored and should not be committed.
 
 ## Recommended IDE Setup
 

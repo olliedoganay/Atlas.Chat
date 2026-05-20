@@ -28,8 +28,11 @@ def _load_versions(repo_root: Path) -> dict[str, str]:
     cargo_lock = (repo_root / "apps" / "atlas" / "src-tauri" / "Cargo.lock").read_text(encoding="utf-8")
     pyproject = tomllib.loads((repo_root / "pyproject.toml").read_text(encoding="utf-8"))
     readme = (repo_root / "README.md").read_text(encoding="utf-8")
+    ai_note = (repo_root / "AI.md").read_text(encoding="utf-8")
     cargo_lock_version = _cargo_lock_package_version(cargo_lock, package_name="atlas-desktop")
     readme_version = _readme_current_version(readme)
+    ai_version = _ai_current_version(ai_note)
+    ai_release_tag_version = _ai_current_release_tag_version(ai_note)
     return {
         "package.json": str(package_json["version"]).strip(),
         "package-lock.json": str(package_lock["version"]).strip(),
@@ -39,6 +42,8 @@ def _load_versions(repo_root: Path) -> dict[str, str]:
         "Cargo.lock atlas-desktop": cargo_lock_version,
         "pyproject.toml": str(pyproject["project"]["version"]).strip(),
         "README.md": readme_version,
+        "AI.md current version": ai_version,
+        "AI.md current release tag": ai_release_tag_version,
     }
 
 
@@ -56,6 +61,20 @@ def _readme_current_version(content: str) -> str:
     match = re.search(r"(?m)^Current version: `([^`]+)`$", content)
     if not match:
         raise SystemExit("Could not find README current version line.")
+    return match.group(1).strip()
+
+
+def _ai_current_version(content: str) -> str:
+    match = re.search(r"(?m)^- Current version: `([^`]+)`$", content)
+    if not match:
+        raise SystemExit("Could not find AI.md current version line.")
+    return match.group(1).strip()
+
+
+def _ai_current_release_tag_version(content: str) -> str:
+    match = re.search(r"(?m)^- Current release tag: `v([^`]+)`$", content)
+    if not match:
+        raise SystemExit("Could not find AI.md current release tag line.")
     return match.group(1).strip()
 
 

@@ -41,6 +41,8 @@ def _replace_manifest_versions(repo_root: Path, old_version: str, new_version: s
     _replace(repo_root / "apps" / "atlas" / "src-tauri" / "tauri.conf.json", version_json, rf'\1"{new_version}"')
     _replace(repo_root / "apps" / "atlas" / "src-tauri" / "Cargo.toml", version_toml, f'version = "{new_version}"')
     _replace(repo_root / "README.md", rf"(?m)^Current version: `{escaped_old}`$", f"Current version: `{new_version}`")
+    _replace(repo_root / "AI.md", rf"(?m)^- Current version: `{escaped_old}`$", f"- Current version: `{new_version}`")
+    _replace(repo_root / "AI.md", rf"(?m)^- Current release tag: `v{escaped_old}`$", f"- Current release tag: `v{new_version}`")
 
     package_lock = repo_root / "apps" / "atlas" / "package-lock.json"
     _replace(package_lock, version_json, rf'\1"{new_version}"')

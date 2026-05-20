@@ -8,7 +8,7 @@
 
 Atlas Chat is a local-first desktop app for working with local Ollama models. It provides a multi-thread chat workspace, profile-scoped memory, hardware-aware model discovery, run inspection, and a built-in code runner while keeping Atlas-managed state on the local machine.
 
-Current version: `1.0.34`
+Current version: `1.1.0`
 
 <p align="center">
   <img src="docs/assets/atlas-chat-workspace.png" alt="Atlas Chat workspace" style="max-width: 100%; height: auto;">
@@ -40,7 +40,7 @@ Atlas requires a local Ollama runtime. Docker is optional for chat, but required
 1. Open `https://github.com/olliedoganay/Atlas.Chat/releases/latest`.
 2. Download the installer for your platform:
    - Windows: current x64 MSI installer.
-   - Linux: current x64 `.deb` package or AppImage.
+   - Linux: current x64 `.deb`, `.rpm`, or AppImage package.
 3. Install and launch `Atlas Chat`.
 
 Atlas Chat does not currently publish macOS installers. Use the source workflow on macOS.
@@ -167,6 +167,7 @@ Copy `.env.example` to `.env` and adjust it if needed.
 | `LANGGRAPH_CHECKPOINT_DB` | SQLite checkpoint path for thread state | `.data/langgraph/checkpoints.sqlite` |
 | `MEM0_HISTORY_DB` | SQLite history path for memory records | `.data/mem0_history.sqlite` |
 | `MEMORY_TOP_K` | Number of recalled memories to inject into a turn | `5` |
+| `ATLAS_COMPACTION_TIMEOUT_SECONDS` | Max seconds to wait for a model-backed context compaction before falling back | `25` |
 
 Runtime overrides:
 
@@ -180,6 +181,9 @@ Runtime overrides:
 | `ATLAS_ALLOWED_ORIGINS` | Comma-separated explicit origin allowlist override | built-in Tauri/dev origins |
 | `ATLAS_ALLOW_INSECURE_LOCALHOST` | Allow localhost-only direct backend development without the managed instance token | off |
 | `ATLAS_DISCOVERY_MANIFEST` | Optional path to a versioned Discovery recommendation manifest | bundled manifest |
+| `ATLAS_RUNNER_NETWORK` | Docker network mode for code runs; `none` or `bridge` | `none` |
+| `ATLAS_RUNNER_TIMEOUT_SECONDS` | Non-GUI code-runner timeout in seconds | `120` |
+| `ATLAS_RUNNER_GUI_TIMEOUT_SECONDS` | GUI code-runner timeout in seconds | `900` |
 | `VITE_ATLAS_BACKEND_URL` | Frontend-only direct backend URL for plain browser/Vite development | unset |
 | `VITE_ATLAS_BACKEND_TOKEN` | Optional token paired with `VITE_ATLAS_BACKEND_URL` | unset |
 
@@ -254,16 +258,18 @@ apps\atlas\src-tauri\target\release\bundle\
 
 Atlas builds MSI as the canonical Windows installer. The Windows release workflow publishes MSI artifacts only.
 
-Linux release bundles are built on GitHub Actions with the `release-linux` workflow. It publishes `.deb` and AppImage artifacts for tagged releases.
+Linux release bundles are built on GitHub Actions with the `release-linux` workflow. It publishes `.deb`, `.rpm`, and AppImage artifacts for tagged releases.
 
 ## Repository Layout
 
 - `src/atlas_local`: Python backend, API, graph execution, memory, discovery, security helpers, code runner, and CLI entrypoints
 - `apps/atlas/src`: React and Vite desktop UI
 - `apps/atlas/src-tauri`: Rust Tauri shell that launches and manages the backend
-- `prompts`: backend prompt templates
+- `prompts/answer.md`: backend answer prompt template packaged with the desktop app
 - `scripts`: development, verification, packaging, and cleanup helpers
 - `tests`: backend and API tests
+- `atlas.py`, `smoke_test.py`: source-tree CLI wrappers that reuse `.venv` when present
+- `AI.md`: compact operational notes for AI/coding agents; release tooling keeps its version fields in sync
 
 ## Local Data
 

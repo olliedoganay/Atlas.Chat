@@ -1,5 +1,4 @@
 .env
-.claude/
 .venv/
 .pytest_cache/
 .mypy_cache/
@@ -24,8 +23,6 @@ Desktop.ini
 
 output/
 test-results/
-claude-code-main (1)/
-AI.md
 
 apps/atlas/.playwright-cli/
 apps/atlas/dist/

@@ -178,7 +178,7 @@ class CodeRunnerPolicyTests(unittest.TestCase):
                 if len(spec.command) >= 2 and spec.command[0] == "sh":
                     self.assertNotEqual(spec.command[1], "-lc")
 
-    def test_runner_images_are_fully_qualified_for_podman_compatibility(self) -> None:
+    def test_runner_images_are_fully_qualified(self) -> None:
         for language, spec in LANGUAGES.items():
             with self.subTest(language=language):
                 self.assertRegex(spec.image, r"^(docker\.io|mcr\.microsoft\.com)/")
