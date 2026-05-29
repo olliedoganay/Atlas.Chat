@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -69,6 +70,15 @@ class ChatContextTests(unittest.TestCase):
         self.assertIn("User ID: u1", str(messages[0].content))
         self.assertIn("name: Atlas Tester", str(messages[0].content))
         self.assertEqual(messages[-1].content, "What is my name?")
+
+    def test_default_answer_prompt_describes_runtime_context_without_hard_denials(self) -> None:
+        prompt_path = Path(__file__).resolve().parents[1] / "prompts" / "answer.md"
+        prompt = prompt_path.read_text(encoding="utf-8")
+
+        self.assertIn("Runtime note", prompt)
+        self.assertIn("conversation history, summaries, retrieved memories, attachments, or tool/run outputs", prompt)
+        self.assertNotIn("do not claim", prompt)
+        self.assertNotIn("do not have direct", prompt)
 
     def test_thread_summary_replaces_compacted_prefix_in_prompt(self) -> None:
         state = {

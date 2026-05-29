@@ -7,6 +7,8 @@ type ResetDialogProps = {
   title: string;
   description: string;
   confirmLabel: string;
+  confirmIntent?: "danger" | "primary";
+  busyLabel?: string;
   onConfirm: () => Promise<void> | void;
 };
 
@@ -16,6 +18,8 @@ export function ResetDialog({
   title,
   description,
   confirmLabel,
+  confirmIntent = "danger",
+  busyLabel = "Applying...",
   onConfirm,
 }: ResetDialogProps) {
   const [busy, setBusy] = useState(false);
@@ -31,8 +35,12 @@ export function ResetDialog({
       return;
     }
     setBusy(true);
-    await onConfirm();
-    onOpenChange(false);
+    try {
+      await onConfirm();
+      onOpenChange(false);
+    } finally {
+      setBusy(false);
+    }
   };
 
   return (
@@ -48,8 +56,13 @@ export function ResetDialog({
                 Cancel
               </button>
             </Dialog.Close>
-            <button className="danger-button" disabled={busy} onClick={handleConfirm} type="button">
-              {busy ? "Applying..." : confirmLabel}
+            <button
+              className={confirmIntent === "primary" ? "primary-button" : "danger-button"}
+              disabled={busy}
+              onClick={handleConfirm}
+              type="button"
+            >
+              {busy ? busyLabel : confirmLabel}
             </button>
           </div>
         </Dialog.Content>

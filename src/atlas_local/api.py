@@ -60,6 +60,10 @@ class ModelContextWindowRequest(BaseModel):
     context_window: int | None = Field(default=None, ge=1024, le=262144)
 
 
+class ModelUnloadRequest(BaseModel):
+    model: str = Field(..., min_length=1)
+
+
 class ThreadTitleRequest(BaseModel):
     user_id: str = Field(..., min_length=1)
     title: str = Field(..., min_length=1)
@@ -162,6 +166,10 @@ def create_api_app(service: AtlasBackendService | None = None) -> FastAPI:
         return _handle_runtime(
             lambda: backend().set_ollama_context_window(context_window=request.context_window)
         )
+
+    @app.post("/models/unload")
+    def unload_ollama_model(request: ModelUnloadRequest) -> dict[str, Any]:
+        return _handle_runtime(lambda: backend().unload_ollama_model(model=request.model))
 
     @app.get("/discovery")
     def discovery() -> dict[str, Any]:

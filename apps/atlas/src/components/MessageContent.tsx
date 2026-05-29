@@ -11,17 +11,13 @@ const MarkdownMessageContent = lazy(async () => {
 });
 
 export const MessageContent = memo(function MessageContent({ content, streaming = false }: MessageContentProps) {
-  if (streaming) {
-    return <div className="message-content message-content-plain">{content}</div>;
-  }
-
   if (!looksLikeMarkdown(content)) {
     return <div className="message-content message-content-plain">{content}</div>;
   }
 
   return (
-    <div className="message-content">
-      <Suspense fallback={<div className="message-content message-content-plain">{content}</div>}>
+    <div className={`message-content${streaming ? " message-content-streaming" : ""}`}>
+      <Suspense fallback={<div className="message-content-plain">{content}</div>}>
         <MarkdownMessageContent content={content} />
       </Suspense>
     </div>

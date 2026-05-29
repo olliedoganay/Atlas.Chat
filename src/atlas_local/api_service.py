@@ -79,6 +79,8 @@ class AtlasBackendService:
     _shutdown_requested: bool = field(default=False, init=False, repr=False)
     _model_catalog_cache: tuple[float, OllamaCatalogSnapshot] | None = field(default=None, init=False, repr=False)
     _unlocked_users: set[str] = field(default_factory=set)
+    _last_chat_model: str = field(default="", init=False, repr=False)
+    _known_chat_models: set[str] = field(default_factory=set, init=False, repr=False)
 
     @classmethod
     def create(cls, config: AppConfig | None = None) -> "AtlasBackendService":
@@ -172,6 +174,10 @@ class AtlasBackendService:
             self._worker_thread = None
         if not hasattr(self, "_unlocked_users") or self._unlocked_users is None:
             self._unlocked_users = set()
+        if not hasattr(self, "_last_chat_model"):
+            self._last_chat_model = ""
+        if not hasattr(self, "_known_chat_models") or self._known_chat_models is None:
+            self._known_chat_models = set()
 
     def _ensure_worker_started(self) -> None:
         self._ensure_runtime_state()
@@ -260,6 +266,7 @@ class AtlasBackendService:
             "ollama_online": catalog.ollama_online,
             "has_local_models": catalog.has_local_models,
             "catalog_source": catalog.source,
+            "loaded_models": self._loaded_ollama_models(catalog),
             "models": [item.name for item in catalog.models],
             "model_details": [item.to_dict() for item in catalog.models],
         }
@@ -274,6 +281,96 @@ class AtlasBackendService:
             "configured_context_window": saved_value,
             "ollama_context_window": self._ollama_context_window_payload(catalog),
         }
+
+    def unload_ollama_model(self, *, model: str) -> dict[str, Any]:
+        unloader = getattr(self.app.llm_provider, "unload_model", None)
+        if not callable(unloader):
+            raise RuntimeError("This runtime cannot stop Ollama models.")
+        payload = unloader(model)
+        payload["loaded_models"] = self._loaded_ollama_models(self._get_model_catalog())
+        return payload
+
+    def _loaded_ollama_models(self, catalog: OllamaCatalogSnapshot | None = None) -> list[str]:
+        provider = getattr(getattr(self, "app", None), "llm_provider", None)
+        getter = getattr(provider, "loaded_models", None)
+        if not callable(getter):
+            return []
+        allowed_models = {item.name for item in catalog.models} if catalog is not None else None
+        try:
+            loaded: list[str] = []
+            for model in getter():
+                model_name = str(model).strip()
+                if not model_name:
+                    continue
+                if allowed_models is not None and model_name not in allowed_models:
+                    continue
+                loaded.append(model_name)
+            return loaded
+        except Exception:
+            return []
+
+    def _prepare_ollama_model_switch(self, target_model: str) -> list[str]:
+        target = str(target_model or "").strip()
+        if not target:
+            return []
+        provider = getattr(getattr(self, "app", None), "llm_provider", None)
+        unloader = getattr(provider, "unload_model", None)
+        if not callable(unloader):
+            return []
+
+        known_models = sorted(
+            str(model).strip()
+            for model in getattr(self, "_known_chat_models", set())
+            if str(model).strip()
+        )
+        candidates = [
+            model
+            for model in self._loaded_ollama_models()
+            if not _looks_like_embedding_model(model)
+        ]
+        last_model = str(getattr(self, "_last_chat_model", "") or "").strip()
+        if last_model:
+            candidates.append(last_model)
+        candidates.extend(known_models)
+
+        unloaded: list[str] = []
+        target_key = target.casefold()
+        seen: set[str] = set()
+        for model in candidates:
+            model_name = str(model or "").strip()
+            model_key = model_name.casefold()
+            if not model_name or model_key == target_key or model_key in seen:
+                continue
+            seen.add(model_key)
+            try:
+                unloader(model_name)
+            except Exception:
+                continue
+            unloaded.append(model_name)
+        return unloaded
+
+    def _remember_ollama_chat_model(self, model: str) -> None:
+        model_name = str(model or "").strip()
+        if not model_name:
+            return
+        if not hasattr(self, "_known_chat_models") or self._known_chat_models is None:
+            self._known_chat_models = set()
+        self._known_chat_models.add(model_name)
+        self._last_chat_model = model_name
+
+    def _cleanup_ollama_model_after_resource_failure(self, chat_model: str, error_message: str) -> bool:
+        model_name = str(chat_model or "").strip()
+        if not model_name or not _looks_like_ollama_resource_failure(error_message):
+            return False
+        provider = getattr(getattr(self, "app", None), "llm_provider", None)
+        unloader = getattr(provider, "unload_model", None)
+        if not callable(unloader):
+            return False
+        try:
+            unloader(model_name)
+        except Exception:
+            return False
+        return True
 
     def _ollama_context_window_payload(self, catalog: OllamaCatalogSnapshot) -> dict[str, Any]:
         provider = getattr(getattr(self, "app", None), "llm_provider", None)
@@ -1091,6 +1188,8 @@ class AtlasBackendService:
             raise RuntimeError(f"Model '{chat_model}' does not appear to support image input.")
         if _reasoning_mode_requested(reasoning_mode) and not self._model_supports_reasoning(chat_model):
             reasoning_mode = "off"
+        self._prepare_ollama_model_switch(chat_model)
+        self._remember_ollama_chat_model(chat_model)
         effective_context_window = self.app.llm_provider.effective_context_window(chat_model)
         new_user_message = HumanMessage(
             content=_build_user_message_content(prompt, validated_attachments),
@@ -1211,6 +1310,7 @@ class AtlasBackendService:
             )
         except Exception as exc:  # pragma: no cover - integration path
             error_message = "Run stopped by user." if self._is_cancelled(run_id) else str(exc)
+            self._cleanup_ollama_model_after_resource_failure(chat_model, error_message)
             self.run_store.fail_run(run_id, error=error_message)
             self._emit_event(run_id, "run_failed", {"error": error_message})
 
@@ -1227,6 +1327,8 @@ class AtlasBackendService:
         snapshot = self._get_snapshot(user_id=user_id, thread_id=thread_id)
         all_messages = list(snapshot.values.get("messages", []))
 
+        self._prepare_ollama_model_switch(chat_model)
+        self._remember_ollama_chat_model(chat_model)
         effective_context_window = self.app.llm_provider.effective_context_window(chat_model)
         state: dict[str, Any] = dict(snapshot.values)
         state["messages"] = all_messages
@@ -1336,6 +1438,7 @@ class AtlasBackendService:
             )
         except Exception as exc:  # pragma: no cover - integration path
             error_message = "Run stopped by user." if self._is_cancelled(run_id) else str(exc)
+            self._cleanup_ollama_model_after_resource_failure(chat_model, error_message)
             self.run_store.fail_run(run_id, error=error_message)
             self._emit_event(run_id, "run_failed", {"error": error_message})
 
@@ -2933,6 +3036,26 @@ def _estimate_text_tokens(value: str) -> int:
     if not cleaned:
         return 0
     return max(1, len(cleaned) // 4)
+
+
+def _looks_like_embedding_model(model_name: str) -> bool:
+    normalized = str(model_name or "").casefold()
+    return any(marker in normalized for marker in ("embed", "embedding", "bert"))
+
+
+def _looks_like_ollama_resource_failure(error_message: str) -> bool:
+    normalized = str(error_message or "").casefold()
+    return any(
+        marker in normalized
+        for marker in (
+            "cuda",
+            "cgo execution",
+            "out of memory",
+            "memory exhaustion",
+            "model failed to load",
+            "failed to load",
+        )
+    )
 
 
 def _persistent_thread_timeline_events(items: list[dict[str, Any]] | Any) -> list[dict[str, Any]]:

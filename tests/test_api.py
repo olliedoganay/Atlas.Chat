@@ -62,6 +62,7 @@ class FakeService:
                 "effective_context_window": 8192,
                 "source": "configured",
             },
+            "loaded_models": ["test-model"],
             "models": ["test-model", "model-b"],
             "model_details": [
                 {"name": "test-model", "supports_images": False},
@@ -78,6 +79,9 @@ class FakeService:
                 "source": "configured" if context_window else "ollama",
             },
         }
+
+    def unload_ollama_model(self, *, model: str):
+        return {"status": "unloaded", "model": model, "loaded_models": []}
 
     def discovery(self):
         return {
@@ -317,6 +321,7 @@ class ApiTests(unittest.TestCase):
         self.assertIsNone(models.json()["default_temperature"])
         self.assertTrue(models.json()["ollama_online"])
         self.assertTrue(models.json()["has_local_models"])
+        self.assertEqual(models.json()["loaded_models"], ["test-model"])
         self.assertTrue(models.json()["model_details"][1]["supports_images"])
         self.assertEqual(models.json()["context_window_presets"], [4096, 8192, 16384])
         self.assertEqual(models.json()["ollama_context_window"]["configured_context_window"], 8192)
@@ -335,6 +340,14 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["configured_context_window"], 16384)
         self.assertEqual(response.json()["ollama_context_window"]["configured_context_window"], 16384)
+
+    def test_ollama_model_unload(self) -> None:
+        response = self.client.post("/models/unload", json={"model": "test-model"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "unloaded")
+        self.assertEqual(response.json()["model"], "test-model")
+        self.assertEqual(response.json()["loaded_models"], [])
 
     def test_thread_listing_and_run_details(self) -> None:
         response = self.client.get("/threads", params={"user_id": "research_user"})

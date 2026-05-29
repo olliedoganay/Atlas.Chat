@@ -177,12 +177,16 @@ class ModelCatalogCachingTests(unittest.TestCase):
 
         service = AtlasBackendService.__new__(AtlasBackendService)
         service.config = SimpleNamespace(chat_model="qwen", chat_temperature=0.2)
+        service.app = SimpleNamespace(
+            llm_provider=SimpleNamespace(loaded_models=lambda: ("qwen", "nomic-embed-text:v1.5"))
+        )
         service._model_catalog_cache = None
 
         payload = AtlasBackendService.list_models(service)
         supports_images = AtlasBackendService._model_supports_images(service, "qwen")
 
         self.assertEqual(payload["models"], ["qwen"])
+        self.assertEqual(payload["loaded_models"], ["qwen"])
         self.assertTrue(payload["ollama_online"])
         self.assertTrue(payload["has_local_models"])
         self.assertEqual(payload["catalog_source"], "ollama")
@@ -251,6 +255,97 @@ class ModelCatalogCachingTests(unittest.TestCase):
         self.assertFalse(payload["has_local_models"])
         self.assertEqual(payload["catalog_source"], "fallback")
         self.assertEqual(payload["models"], [])
+
+    def test_prepare_ollama_model_switch_unloads_different_chat_models(self) -> None:
+        unloaded: list[str] = []
+        service = AtlasBackendService.__new__(AtlasBackendService)
+        service.app = SimpleNamespace(
+            llm_provider=SimpleNamespace(
+                loaded_models=lambda: (
+                    "qwen3-coder:30b",
+                    "nomic-embed-text:v1.5",
+                    "qwen3.6:27b",
+                    "qwen3-coder:30b",
+                ),
+                unload_model=lambda model: unloaded.append(model) or {"status": "unloaded", "model": model},
+            )
+        )
+        service._last_chat_model = "gpt-oss:20b"
+        service._known_chat_models = {"llama3.2:3b", "qwen3.6:27b", "gpt-oss:20b"}
+
+        result = AtlasBackendService._prepare_ollama_model_switch(service, "qwen3.6:27b")
+
+        self.assertEqual(result, ["qwen3-coder:30b", "gpt-oss:20b", "llama3.2:3b"])
+        self.assertEqual(unloaded, result)
+
+    def test_prepare_ollama_model_switch_ignores_unload_failures(self) -> None:
+        unloaded: list[str] = []
+
+        def unload_model(model: str) -> dict[str, str]:
+            if model == "stuck-model:latest":
+                raise RuntimeError("Ollama refused unload")
+            unloaded.append(model)
+            return {"status": "unloaded", "model": model}
+
+        service = AtlasBackendService.__new__(AtlasBackendService)
+        service.app = SimpleNamespace(
+            llm_provider=SimpleNamespace(
+                loaded_models=lambda: ("stuck-model:latest", "old-model:latest"),
+                unload_model=unload_model,
+            )
+        )
+        service._last_chat_model = ""
+        service._known_chat_models = set()
+
+        result = AtlasBackendService._prepare_ollama_model_switch(service, "target-model:latest")
+
+        self.assertEqual(result, ["old-model:latest"])
+        self.assertEqual(unloaded, ["old-model:latest"])
+
+    def test_remember_ollama_chat_model_tracks_last_and_known_models(self) -> None:
+        service = AtlasBackendService.__new__(AtlasBackendService)
+
+        AtlasBackendService._remember_ollama_chat_model(service, " qwen3.6:27b ")
+        AtlasBackendService._remember_ollama_chat_model(service, "gpt-oss:20b")
+
+        self.assertEqual(service._last_chat_model, "gpt-oss:20b")
+        self.assertEqual(service._known_chat_models, {"qwen3.6:27b", "gpt-oss:20b"})
+
+    def test_cleanup_ollama_model_after_resource_failure_unloads_failed_model(self) -> None:
+        unloaded: list[str] = []
+        service = AtlasBackendService.__new__(AtlasBackendService)
+        service.app = SimpleNamespace(
+            llm_provider=SimpleNamespace(
+                unload_model=lambda model: unloaded.append(model) or {"status": "unloaded", "model": model}
+            )
+        )
+
+        cleaned = AtlasBackendService._cleanup_ollama_model_after_resource_failure(
+            service,
+            "qwen3.6:27b",
+            "Ollama request failed. Original error: CUDA error: out of memory",
+        )
+
+        self.assertTrue(cleaned)
+        self.assertEqual(unloaded, ["qwen3.6:27b"])
+
+    def test_cleanup_ollama_model_after_resource_failure_ignores_unrelated_errors(self) -> None:
+        unloaded: list[str] = []
+        service = AtlasBackendService.__new__(AtlasBackendService)
+        service.app = SimpleNamespace(
+            llm_provider=SimpleNamespace(
+                unload_model=lambda model: unloaded.append(model) or {"status": "unloaded", "model": model}
+            )
+        )
+
+        cleaned = AtlasBackendService._cleanup_ollama_model_after_resource_failure(
+            service,
+            "qwen3.6:27b",
+            "Model returned an empty response.",
+        )
+
+        self.assertFalse(cleaned)
+        self.assertEqual(unloaded, [])
 
 
 class ThreadTemperatureResolutionTests(unittest.TestCase):

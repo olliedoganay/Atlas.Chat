@@ -4,7 +4,13 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from atlas_local.llm import LLMProvider, format_runtime_error, inspect_local_ollama_models
+from atlas_local.llm import (
+    LLMProvider,
+    format_runtime_error,
+    inspect_local_ollama_models,
+    loaded_ollama_models,
+    unload_ollama_model,
+)
 
 
 class _FakeResponse(io.BytesIO):
@@ -290,6 +296,49 @@ class LLMProviderTemperatureTests(unittest.TestCase):
 
         self.assertEqual(catalog.models[0].name, "gemma3:4b")
         self.assertTrue(catalog.models[0].supports_images)
+
+    def test_loaded_ollama_models_reads_runtime_inventory(self) -> None:
+        responses = {
+            "api/ps": {
+                "models": [
+                    {"name": "qwen3-coder:30b"},
+                    {"model": "gpt-oss:20b"},
+                    {"name": "qwen3-coder:30b"},
+                    {"name": ""},
+                ]
+            }
+        }
+
+        def fake_urlopen(request_object, timeout=0):
+            url = getattr(request_object, "full_url", str(request_object))
+            self.assertTrue(url.endswith("/api/ps"))
+            return _FakeResponse(json.dumps(responses["api/ps"]).encode("utf-8"))
+
+        with patch("atlas_local.llm.request.urlopen", side_effect=fake_urlopen):
+            loaded = loaded_ollama_models(self.config)
+
+        self.assertEqual(loaded, ["qwen3-coder:30b", "gpt-oss:20b"])
+
+    def test_unload_ollama_model_requests_keep_alive_zero(self) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_urlopen(request_object, timeout=0):
+            captured["url"] = getattr(request_object, "full_url", str(request_object))
+            captured["method"] = request_object.get_method()
+            captured["body"] = json.loads((request_object.data or b"{}").decode("utf-8"))
+            return _FakeResponse(json.dumps({"done": True, "done_reason": "unload"}).encode("utf-8"))
+
+        with patch("atlas_local.llm.request.urlopen", side_effect=fake_urlopen):
+            payload = unload_ollama_model(self.config, "qwen3-coder:30b")
+
+        self.assertEqual(captured["url"], "http://127.0.0.1:11434/api/generate")
+        self.assertEqual(captured["method"], "POST")
+        self.assertEqual(
+            captured["body"],
+            {"model": "qwen3-coder:30b", "prompt": "", "stream": False, "keep_alive": 0},
+        )
+        self.assertEqual(payload["status"], "unloaded")
+        self.assertEqual(payload["model"], "qwen3-coder:30b")
 
 
 if __name__ == "__main__":

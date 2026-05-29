@@ -161,6 +161,14 @@ class LLMProvider:
         self._clear_model_caches()
         return saved_value
 
+    def loaded_models(self) -> tuple[str, ...]:
+        return tuple(loaded_ollama_models(self.config))
+
+    def unload_model(self, model: str) -> dict[str, Any]:
+        payload = unload_ollama_model(self.config, model)
+        self._clear_model_caches()
+        return payload
+
     def abort_active_requests(self) -> None:
         for chat_model in list(self._chat_models.values()):
             _close_chat_client(chat_model)
@@ -250,6 +258,46 @@ class OllamaCatalogSnapshot:
 
 def list_local_ollama_models(config: AppConfig, *, timeout_seconds: float = 3.0) -> list[str]:
     return [item.name for item in list_local_ollama_model_info(config, timeout_seconds=timeout_seconds)]
+
+
+def loaded_ollama_models(config: AppConfig, *, timeout_seconds: float = 2.0) -> list[str]:
+    payload = _ollama_json_request(config, "api/ps", timeout_seconds=timeout_seconds)
+    models = payload.get("models", [])
+    if not isinstance(models, list):
+        return []
+    loaded: list[str] = []
+    seen: set[str] = set()
+    for item in models:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or item.get("model") or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        loaded.append(name)
+    return loaded
+
+
+def unload_ollama_model(config: AppConfig, model: str, *, timeout_seconds: float = 10.0) -> dict[str, Any]:
+    resolved_model = model.strip()
+    if not resolved_model:
+        raise RuntimeError("Model name is required before Atlas can stop an Ollama model.")
+    payload = _ollama_json_request_required(
+        config,
+        "api/generate",
+        timeout_seconds=timeout_seconds,
+        body={
+            "model": resolved_model,
+            "prompt": "",
+            "stream": False,
+            "keep_alive": 0,
+        },
+    )
+    return {
+        "status": "unloaded",
+        "model": resolved_model,
+        "ollama": payload,
+    }
 
 
 def list_local_ollama_model_info(config: AppConfig, *, timeout_seconds: float = 3.0) -> list[OllamaModelInfo]:
@@ -355,6 +403,35 @@ def _ollama_json_request(
             return payload if isinstance(payload, dict) else {}
     except (error.URLError, TimeoutError, json.JSONDecodeError, OSError):
         return {}
+
+
+def _ollama_json_request_required(
+    config: AppConfig,
+    endpoint: str,
+    *,
+    timeout_seconds: float,
+    body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    url = urljoin(f"{config.ollama_url.rstrip('/')}/", endpoint)
+    data = None
+    headers = {}
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request_object = request.Request(url, data=data, headers=headers, method="POST" if body is not None else "GET")
+    try:
+        with request.urlopen(request_object, timeout=timeout_seconds) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+            return payload if isinstance(payload, dict) else {}
+    except error.HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8", errors="replace").strip()
+        except OSError:
+            detail = ""
+        reason = detail or str(exc)
+        raise RuntimeError(f"Ollama could not stop the model through {endpoint}: {reason}") from exc
+    except (error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+        raise RuntimeError(f"Ollama could not stop the model through {endpoint}: {exc}") from exc
 
 
 def _context_from_ps_payload(payload: dict[str, Any], model: str) -> int | None:

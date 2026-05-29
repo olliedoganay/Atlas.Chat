@@ -101,6 +101,7 @@ export type ModelCatalog = {
   catalog_source: "ollama" | "fallback";
   temperature_presets: TemperaturePreset[];
   context_window_presets: number[];
+  loaded_models: string[];
   ollama_context_window: {
     configured_context_window?: number | null;
     effective_context_window?: number | null;
@@ -287,6 +288,17 @@ export function setOllamaContextWindow(contextWindow: number | null) {
   }>("/models/context-window", {
     method: "PATCH",
     body: JSON.stringify({ context_window: contextWindow }),
+  });
+}
+
+export function unloadOllamaModel(model: string) {
+  return request<{
+    status: string;
+    model: string;
+    loaded_models?: string[];
+  }>("/models/unload", {
+    method: "POST",
+    body: JSON.stringify({ model }),
   });
 }
 

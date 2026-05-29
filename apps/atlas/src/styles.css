@@ -2917,18 +2917,27 @@ pre {
 
 .message-content {
   margin-top: 10px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--text-md);
+  font-weight: 400;
+  line-height: 1.55;
+  letter-spacing: 0;
 }
 
 .message-content.message-content-plain {
   margin: 10px 0 0;
+}
+
+.message-content-plain {
   white-space: pre-wrap;
   word-break: break-word;
-  color: var(--text);
+  color: inherit;
   font-family: inherit;
-  font-size: 1rem;
-  font-weight: 400;
-  line-height: 1.65;
-  letter-spacing: 0;
+  font-size: inherit;
+  font-weight: inherit;
+  line-height: inherit;
+  letter-spacing: inherit;
 }
 
 .stream-waiting-line {
@@ -3036,12 +3045,36 @@ pre {
 .message-content ul,
 .message-content ol,
 .message-content pre,
-.message-content blockquote,
+.message-content blockquote {
+  margin: 0 0 12px;
+  color: inherit;
+  font-family: inherit;
+  font-size: inherit;
+  font-weight: inherit;
+  line-height: inherit;
+  letter-spacing: inherit;
+}
+
 .message-content h1,
 .message-content h2,
 .message-content h3,
 .message-content h4 {
   margin: 0 0 12px;
+  color: inherit;
+  font-family: inherit;
+  font-weight: 700;
+  line-height: 1.35;
+  letter-spacing: 0;
+}
+
+.message-content h1,
+.message-content h2 {
+  font-size: var(--text-lg);
+}
+
+.message-content h3,
+.message-content h4 {
+  font-size: var(--text-md);
 }
 
 .message-content ul,
@@ -6185,7 +6218,7 @@ body {
 }
 
 .message-content.message-content-plain {
-  line-height: 1.5;
+  line-height: 1.55;
 }
 
 .composer-shell,

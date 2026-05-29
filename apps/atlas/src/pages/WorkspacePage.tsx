@@ -19,6 +19,7 @@ import {
 import { useNavigate } from "react-router-dom";
 
 import { MessageContent } from "../components/MessageContent";
+import { ResetDialog } from "../components/ResetDialog";
 import {
   cancelRun,
   branchThread,
@@ -34,6 +35,7 @@ import {
   renameThread,
   startCompact,
   startChat,
+  unloadOllamaModel,
   type ImageAttachment,
   type ReasoningMode,
   type RunStatusEvent,
@@ -105,11 +107,21 @@ type ReasoningOption = {
   label: string;
 };
 
+type PendingModelSwitch = {
+  fromModels: string[];
+  toModel: string;
+  payload: StartPromptPayload;
+  clearDraft: () => void;
+};
+
 export function WorkspacePage() {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   const conversationViewportRef = useRef<HTMLDivElement | null>(null);
   const autoScrollToLatestRef = useRef(true);
+  const scrollToLatestFrameRef = useRef<number | null>(null);
+  const scrollToLatestRetryFrameRef = useRef<number | null>(null);
+  const scrollToLatestTimeoutRef = useRef<number | null>(null);
   const composerRef = useRef<WorkspaceComposerHandle | null>(null);
 
   const currentUserId = useAtlasStore((state) => state.currentUserId);
@@ -151,6 +163,8 @@ export function WorkspacePage() {
   const [isThinkingPanelOpen, setIsThinkingPanelOpen] = useState(false);
   const [highlightedHistoryIndex, setHighlightedHistoryIndex] = useState<number | null>(null);
   const [copiedMessageKey, setCopiedMessageKey] = useState<string | null>(null);
+  const [pendingModelSwitch, setPendingModelSwitch] = useState<PendingModelSwitch | null>(null);
+  const [modelSwitchCheckPending, setModelSwitchCheckPending] = useState(false);
 
   const {
     data: status,
@@ -233,6 +247,7 @@ export function WorkspacePage() {
     models?.default_temperature ?? status?.default_chat_temperature ?? status?.chat_temperature ?? null;
   const modelCatalogLoaded = Boolean(models);
   const availableModels = (models?.models ?? []).filter(Boolean);
+  const loadedModels = models?.loaded_models ?? [];
   const ollamaOnline = Boolean(models?.ollama_online);
   const hasLocalModels = Boolean(models?.has_local_models);
   const ollamaUrl = status?.ollama_url || "http://127.0.0.1:11434";
@@ -477,6 +492,48 @@ export function WorkspacePage() {
     setIsThinkingPanelOpen(false);
   }, [currentThreadId, currentUserId]);
 
+  const clearScheduledScrollToLatest = useCallback(() => {
+    if (scrollToLatestFrameRef.current !== null) {
+      window.cancelAnimationFrame(scrollToLatestFrameRef.current);
+      scrollToLatestFrameRef.current = null;
+    }
+    if (scrollToLatestRetryFrameRef.current !== null) {
+      window.cancelAnimationFrame(scrollToLatestRetryFrameRef.current);
+      scrollToLatestRetryFrameRef.current = null;
+    }
+    if (scrollToLatestTimeoutRef.current !== null) {
+      window.clearTimeout(scrollToLatestTimeoutRef.current);
+      scrollToLatestTimeoutRef.current = null;
+    }
+  }, []);
+
+  const scrollConversationToLatest = useCallback(() => {
+    const viewport = conversationViewportRef.current;
+    if (!viewport || !autoScrollToLatestRef.current) {
+      return;
+    }
+    viewport.scrollTo({ top: viewport.scrollHeight });
+  }, []);
+
+  const scheduleScrollToLatest = useCallback(() => {
+    autoScrollToLatestRef.current = true;
+    clearScheduledScrollToLatest();
+    scrollToLatestFrameRef.current = window.requestAnimationFrame(() => {
+      scrollToLatestFrameRef.current = null;
+      scrollConversationToLatest();
+      scrollToLatestRetryFrameRef.current = window.requestAnimationFrame(() => {
+        scrollToLatestRetryFrameRef.current = null;
+        scrollConversationToLatest();
+      });
+    });
+    scrollToLatestTimeoutRef.current = window.setTimeout(() => {
+      scrollToLatestTimeoutRef.current = null;
+      scrollConversationToLatest();
+    }, 160);
+  }, [clearScheduledScrollToLatest, scrollConversationToLatest]);
+
+  useEffect(() => clearScheduledScrollToLatest, [clearScheduledScrollToLatest]);
+
   const startRun = useMutation({
     mutationFn: async (payload: StartPromptPayload) => {
       if (!currentUserId) {
@@ -673,8 +730,9 @@ export function WorkspacePage() {
       : startupState.idleKicker;
 
   useEffect(() => {
-    autoScrollToLatestRef.current = true;
-  }, [currentUserId, currentThreadId]);
+    setHighlightedHistoryIndex(null);
+    scheduleScrollToLatest();
+  }, [currentUserId, currentThreadId, scheduleScrollToLatest]);
 
   useEffect(() => {
     if (!searchJumpTarget) {
@@ -736,15 +794,11 @@ export function WorkspacePage() {
   }, [copiedMessageKey]);
 
   useEffect(() => {
-    const viewport = conversationViewportRef.current;
-    if (!viewport) {
-      return;
-    }
     if (!autoScrollToLatestRef.current) {
       return;
     }
-    viewport.scrollTo({ top: viewport.scrollHeight });
-  }, [transcript]);
+    scheduleScrollToLatest();
+  }, [scheduleScrollToLatest, transcript]);
 
   const handleConversationScroll = (event: UIEvent<HTMLDivElement>) => {
     autoScrollToLatestRef.current = isNearBottom(event.currentTarget);
@@ -828,8 +882,51 @@ export function WorkspacePage() {
 
   const startRunMutate = startRun.mutate;
   const handleSubmitPrompt = useCallback((payload: StartPromptPayload, clearDraft: () => void) => {
+    if (modelSwitchCheckPending || pendingModelSwitch) {
+      return;
+    }
+    const modelForRun = (lockedThreadModel || selectedModel || "").trim();
+    setModelSwitchCheckPending(true);
+    void queryClient.fetchQuery({ queryKey: ["models"], queryFn: getModels, staleTime: 0 })
+      .catch(() => models)
+      .then((freshModels) => {
+        const fromModels = modelsToStopBeforeSwitch(freshModels?.loaded_models ?? loadedModels, modelForRun);
+        if (modelForRun && fromModels.length) {
+          setPendingModelSwitch({
+            fromModels,
+            toModel: modelForRun,
+            payload,
+            clearDraft,
+          });
+          return;
+        }
+        startRunMutate(payload, { onSuccess: clearDraft });
+      })
+      .finally(() => setModelSwitchCheckPending(false));
+  }, [loadedModels, lockedThreadModel, modelSwitchCheckPending, models, pendingModelSwitch, queryClient, selectedModel, startRunMutate]);
+
+  const confirmModelSwitch = useCallback(async () => {
+    if (!pendingModelSwitch) {
+      return;
+    }
+    try {
+      for (const model of pendingModelSwitch.fromModels) {
+        await unloadOllamaModel(model);
+      }
+      await queryClient.invalidateQueries({ queryKey: ["models"] });
+    } catch (error) {
+      failRun(
+        error instanceof Error ? error.message : "Atlas could not stop the previous Ollama model.",
+        currentUserId,
+        currentThreadId,
+      );
+      setPendingModelSwitch(null);
+      return;
+    }
+    const { payload, clearDraft } = pendingModelSwitch;
+    setPendingModelSwitch(null);
     startRunMutate(payload, { onSuccess: clearDraft });
-  }, [startRunMutate]);
+  }, [currentThreadId, currentUserId, failRun, pendingModelSwitch, queryClient, startRunMutate]);
 
   const startManualCompactMutate = startManualCompact.mutate;
   const handleManualCompact = useCallback(() => {
@@ -1246,7 +1343,7 @@ export function WorkspacePage() {
         selectedModelSupportsReasoning={selectedModelSupportsReasoning}
         setReasoningMode={setReasoningMode}
         startManualCompactPending={startManualCompact.isPending}
-        startRunPending={startRun.isPending}
+        startRunPending={startRun.isPending || modelSwitchCheckPending || Boolean(pendingModelSwitch)}
         stopRunPending={stopRun.isPending}
         threadHasHistory={threadHasHistory}
         visibleHistory={visibleHistory}
@@ -1326,6 +1423,20 @@ export function WorkspacePage() {
           </div>
         </aside>
       ) : null}
+      <ResetDialog
+        open={Boolean(pendingModelSwitch)}
+        onOpenChange={(open) => {
+          if (!open) {
+            setPendingModelSwitch(null);
+          }
+        }}
+        title={pendingModelSwitch ? `Switch to ${formatModelLabel(pendingModelSwitch.toModel)}?` : "Switch model?"}
+        description={modelSwitchDialogDescription(pendingModelSwitch)}
+        confirmLabel="Switch model"
+        confirmIntent="primary"
+        busyLabel="Switching..."
+        onConfirm={confirmModelSwitch}
+      />
     </section>
   );
 }
@@ -1887,6 +1998,31 @@ const LEVEL_REASONING_OPTIONS: Array<{ value: ReasoningMode; label: string }> = 
 
 function formatModelLabel(value: string) {
   return value || "Select model";
+}
+
+function modelsToStopBeforeSwitch(loadedModels: string[], targetModel: string) {
+  const normalizedTarget = targetModel.trim().toLowerCase();
+  if (!normalizedTarget) {
+    return [];
+  }
+  const seen = new Set<string>();
+  return loadedModels.filter((model) => {
+    const normalizedModel = model.trim().toLowerCase();
+    if (!normalizedModel || normalizedModel === normalizedTarget || seen.has(normalizedModel)) {
+      return false;
+    }
+    seen.add(normalizedModel);
+    return true;
+  });
+}
+
+function modelSwitchDialogDescription(pending: PendingModelSwitch | null) {
+  if (!pending) {
+    return "";
+  }
+  const stoppedModels = pending.fromModels.map(formatModelLabel).join(", ");
+  const warmStateCopy = pending.fromModels.length === 1 ? "that model's" : "those models'";
+  return `Atlas will stop ${stoppedModels} in Ollama before starting ${formatModelLabel(pending.toModel)}. Your saved chat history stays intact, but ${warmStateCopy} warm in-memory state will be cleared.`;
 }
 
 function buildReasoningOptions(strategy: "none" | "boolean" | "levels") {
