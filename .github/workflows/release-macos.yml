@@ -94,8 +94,7 @@ jobs:
             exit 1
           fi
           for file in "${files[@]}"; do
-            base="$(basename "$file" .dmg)"
-            cp "$file" "../../dist/macos/${base}-${{ matrix.arch }}.dmg"
+            cp "$file" "../../dist/macos/Atlas.Chat_${{ steps.version.outputs.atlas_version }}_${{ matrix.arch }}.dmg"
           done
 
       - name: Upload release artifacts
