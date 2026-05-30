@@ -47,6 +47,50 @@ Atlas requires a local Ollama runtime. Docker is optional for chat, but required
 
 Atlas Chat packages community/open-source desktop builds without Apple notarization. On macOS, Gatekeeper may require opening the app manually from Finder the first time.
 
+## Install Ollama
+
+Atlas Chat requires Ollama to run locally. Install Ollama before sending your first message, then pull at least one chat model and one embedding model.
+
+Official Ollama install docs:
+
+- Windows: `https://docs.ollama.com/windows`
+- macOS: `https://docs.ollama.com/macos`
+- Linux: `https://docs.ollama.com/linux`
+
+Windows:
+
+1. Download and run the Ollama installer from `https://ollama.com/download`.
+2. Start Ollama from the Start menu. It runs in the background and exposes the `ollama` command in PowerShell or Command Prompt.
+
+macOS:
+
+1. Download the Ollama DMG from `https://ollama.com/download`.
+2. Mount it, drag `Ollama.app` to `Applications`, then start Ollama.
+3. Allow Ollama to add the `ollama` command to your PATH if macOS asks.
+
+Linux:
+
+```bash
+curl -fsSL https://ollama.com/install.sh | sh
+sudo systemctl start ollama
+```
+
+Verify Ollama is reachable:
+
+```bash
+ollama -v
+ollama list
+```
+
+Pull models for Atlas:
+
+```bash
+ollama pull gpt-oss:20b
+ollama pull nomic-embed-text:latest
+```
+
+Atlas connects to Ollama on `http://127.0.0.1:11434` by default. If Atlas says Ollama is unavailable, start Ollama and refresh the local model list.
+
 ## Requirements
 
 - Python 3.14+
