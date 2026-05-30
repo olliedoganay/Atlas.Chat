@@ -2,6 +2,11 @@ name: release-macos
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release tag to publish macOS DMGs to, for example v1.1.4. Leave blank to build artifacts only."
+        required: false
+        type: string
   push:
     tags:
       - "v*"
@@ -11,7 +16,16 @@ permissions:
 
 jobs:
   build-release:
-    runs-on: macos-13
+    name: build-release-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: macos-15-intel
+          - arch: arm64
+            runner: macos-15
     defaults:
       run:
         shell: bash
@@ -53,8 +67,12 @@ jobs:
 
       - name: Resolve Atlas version
         id: version
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || '' }}
         run: |
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+          if [[ -n "$RELEASE_TAG" ]]; then
+            version="$(./.venv/bin/python ./scripts/check_atlas_version.py --tag "$RELEASE_TAG")"
+          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
             version="$(./.venv/bin/python ./scripts/check_atlas_version.py --tag "$GITHUB_REF_NAME")"
           else
             version="$(./.venv/bin/python ./scripts/check_atlas_version.py)"
@@ -65,20 +83,54 @@ jobs:
         working-directory: apps/atlas
         run: npm run tauri build -- --ci
 
+      - name: Stage architecture-specific DMG
+        working-directory: apps/atlas
+        run: |
+          mkdir -p ../../dist/macos
+          shopt -s nullglob
+          files=(src-tauri/target/release/bundle/dmg/*.dmg)
+          if (( ${#files[@]} == 0 )); then
+            echo "No DMG files were produced."
+            exit 1
+          fi
+          for file in "${files[@]}"; do
+            base="$(basename "$file" .dmg)"
+            cp "$file" "../../dist/macos/${base}-${{ matrix.arch }}.dmg"
+          done
+
       - name: Upload release artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: atlas-macos-x64-v${{ steps.version.outputs.atlas_version }}
+          name: atlas-macos-${{ matrix.arch }}-v${{ steps.version.outputs.atlas_version }}
           path: |
-            apps/atlas/src-tauri/target/release/bundle/dmg/*.dmg
+            dist/macos/*.dmg
           if-no-files-found: error
 
+  publish-release:
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+    needs: build-release
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Resolve Atlas version
+        id: version
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          echo "atlas_version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Download macOS release artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: atlas-macos-*-v${{ steps.version.outputs.atlas_version }}
+          path: dist/macos
+          merge-multiple: true
+
       - name: Publish GitHub Release assets
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
           name: Atlas v${{ steps.version.outputs.atlas_version }}
-          files: |
-            apps/atlas/src-tauri/target/release/bundle/dmg/*.dmg
+          files: dist/macos/*.dmg
           fail_on_unmatched_files: true
           generate_release_notes: true

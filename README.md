@@ -306,7 +306,7 @@ Atlas builds MSI as the canonical Windows installer. The Windows release workflo
 
 Linux release bundles are built on GitHub Actions with the `release-linux` workflow. It publishes `.deb`, `.rpm`, and AppImage artifacts for tagged releases.
 
-macOS release bundles are built on GitHub Actions with the `release-macos` workflow. It publishes unsigned x64 `.dmg` artifacts for tagged releases.
+macOS release bundles are built on GitHub Actions with the `release-macos` workflow. It publishes unsigned `.dmg` artifacts for Intel/x64 and Apple Silicon/arm64 Macs.
 
 ## Repository Layout
 
