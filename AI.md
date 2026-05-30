@@ -1,7 +1,7 @@
 # Atlas Repo Note
 
 - Repo: `olliedoganay/AtlasChat`
-- Current version: `1.1.3`
+- Current version: `1.1.4`
 - Stack: Tauri 2 + React/Vite frontend, Rust desktop shell, Python FastAPI backend, Ollama, Docker-backed code runner.
 - Runtime shape: local-first desktop app; Tauri launches a loopback backend protected by a per-launch instance token.
 
@@ -15,7 +15,7 @@
 - Code runner: `src/atlas_local/code_runner.py`
 - Answer prompt: `prompts/answer.md`
 - Tests: `tests`, `apps/atlas/src/**/*.test.ts*`
-- Release workflows: `.github/workflows/release-windows.yml`, `.github/workflows/release-linux.yml`
+- Release workflows: `.github/workflows/release-windows.yml`, `.github/workflows/release-linux.yml`, `.github/workflows/release-macos.yml`
 
 ## Setup
 
@@ -112,11 +112,12 @@ When changing language specs, run focused `tests.test_code_runner` coverage and 
 
 ## Releases
 
-- Current release tag: `v1.1.3`
+- Current release tag: `v1.1.4`
 - `scripts/bump_atlas_version.py` updates this file and `README.md` together with the release manifests.
 - `scripts/check_atlas_version.py` validates this file and `README.md` together with the release manifests.
 - Windows release workflow publishes MSI artifacts.
 - Linux release workflow publishes `.deb`, `.rpm`, and AppImage artifacts.
+- macOS release workflow publishes unsigned x64 `.dmg` artifacts.
 - Release tags must match every checked manifest version:
   - `AI.md`
   - `README.md`
@@ -135,4 +136,4 @@ Safe release sequence:
 4. Commit the release change.
 5. Tag it: `git tag -a vX.Y.Z -m "Atlas Chat vX.Y.Z"`.
 6. Push `main`, then push the tag.
-7. Watch `ci`, `release-windows`, and `release-linux` on GitHub Actions.
+7. Watch `ci`, `release-windows`, `release-linux`, and `release-macos` on GitHub Actions.

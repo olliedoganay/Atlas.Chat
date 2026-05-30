@@ -3,12 +3,13 @@
 [![CI](https://github.com/olliedoganay/AtlasChat/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/olliedoganay/AtlasChat/actions/workflows/ci.yml)
 [![Windows release](https://github.com/olliedoganay/AtlasChat/actions/workflows/release-windows.yml/badge.svg)](https://github.com/olliedoganay/AtlasChat/actions/workflows/release-windows.yml)
 [![Linux release](https://github.com/olliedoganay/AtlasChat/actions/workflows/release-linux.yml/badge.svg)](https://github.com/olliedoganay/AtlasChat/actions/workflows/release-linux.yml)
+[![macOS release](https://github.com/olliedoganay/AtlasChat/actions/workflows/release-macos.yml/badge.svg)](https://github.com/olliedoganay/AtlasChat/actions/workflows/release-macos.yml)
 [![Latest release](https://img.shields.io/github/v/release/olliedoganay/AtlasChat?label=latest%20release)](https://github.com/olliedoganay/AtlasChat/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Atlas Chat is a local-first desktop app for working with local Ollama models. It provides a multi-thread chat workspace, profile-scoped memory, hardware-aware model discovery, run inspection, and a built-in code runner while keeping Atlas-managed state on the local machine.
 
-Current version: `1.1.3`
+Current version: `1.1.4`
 
 <p align="center">
   <img src="docs/assets/atlas-chat-workspace.png" alt="Atlas Chat workspace" style="max-width: 100%; height: auto;">
@@ -41,9 +42,10 @@ Atlas requires a local Ollama runtime. Docker is optional for chat, but required
 2. Download the installer for your platform:
    - Windows: current x64 MSI installer.
    - Linux: current x64 `.deb`, `.rpm`, or AppImage package.
+   - macOS: current unsigned x64 `.dmg` package.
 3. Install and launch `Atlas Chat`.
 
-Atlas Chat does not currently publish macOS installers. Use the source workflow on macOS.
+Atlas Chat packages community/open-source desktop builds without Apple notarization. On macOS, Gatekeeper may require opening the app manually from Finder the first time.
 
 ## Requirements
 
@@ -259,6 +261,8 @@ apps\atlas\src-tauri\target\release\bundle\
 Atlas builds MSI as the canonical Windows installer. The Windows release workflow publishes MSI artifacts only.
 
 Linux release bundles are built on GitHub Actions with the `release-linux` workflow. It publishes `.deb`, `.rpm`, and AppImage artifacts for tagged releases.
+
+macOS release bundles are built on GitHub Actions with the `release-macos` workflow. It publishes unsigned x64 `.dmg` artifacts for tagged releases.
 
 ## Repository Layout
 

@@ -27,6 +27,7 @@ import { StatusPill } from "../components/ui/StatusPill";
 import packageInfo from "../../package.json";
 import tauriConfig from "../../src-tauri/tauri.conf.json";
 import tauriLinuxConfig from "../../src-tauri/tauri.linux.conf.json";
+import tauriMacosConfig from "../../src-tauri/tauri.macos.conf.json";
 import {
   createMemory,
   createUser,
@@ -1104,7 +1105,7 @@ export function SettingsPage() {
 
                 <SettingsRow
                   label="Application IDs"
-                  description="Installer and Linux identity are read from the same desktop manifests used for release builds."
+                  description="Desktop installer and Linux identity are read from the same manifests used for release builds."
                 >
                   <ChipList>
                     {desktopIdentifiers.map((identifier) => (
@@ -1246,6 +1247,9 @@ function releaseTargetLabels() {
   for (const target of readBundleTargets(tauriLinuxConfig.bundle?.targets)) {
     targets.add(formatBundleTarget(target));
   }
+  for (const target of readBundleTargets(tauriMacosConfig.bundle?.targets)) {
+    targets.add(formatBundleTarget(target));
+  }
   return Array.from(targets);
 }
 
@@ -1273,6 +1277,9 @@ function formatBundleTarget(value: string) {
   if (normalized === "appimage") {
     return "AppImage";
   }
+  if (normalized === "dmg") {
+    return "DMG";
+  }
   return value;
 }
 
@@ -1280,6 +1287,7 @@ function appIdentifierLabels() {
   const labels = new Set<string>();
   if (tauriConfig.identifier) {
     labels.add(`Windows ${tauriConfig.identifier}`);
+    labels.add(`macOS ${tauriConfig.identifier}`);
   }
   if (tauriLinuxConfig.identifier) {
     labels.add(`Linux ${tauriLinuxConfig.identifier}`);
