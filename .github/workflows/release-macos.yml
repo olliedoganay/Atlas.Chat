@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Existing release tag to publish macOS DMGs to, for example v1.1.4. Leave blank to build artifacts only."
+        description: "Existing release tag to publish macOS DMGs to, for example v1.1.5. Leave blank to build artifacts only."
         required: false
         type: string
   push:

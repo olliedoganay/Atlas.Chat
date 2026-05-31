@@ -118,7 +118,7 @@ When changing language specs, run focused `tests.test_code_runner` coverage and 
 - `scripts/check_atlas_version.py` validates this file and `README.md` together with the release manifests.
 - Windows release workflow publishes MSI artifacts.
 - Linux release workflow publishes `.deb`, `.rpm`, and AppImage artifacts.
-- macOS release workflow publishes unsigned x64 `.dmg` artifacts.
+- macOS release workflow publishes unsigned x64 and arm64 `.dmg` artifacts.
 - Release tags must match every checked manifest version:
   - `AI.md`
   - `README.md`

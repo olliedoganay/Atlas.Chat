@@ -358,9 +358,10 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 If the desktop app opens but no models appear:
 
-1. Make sure Ollama is running.
-2. Make sure the models in `.env` have been pulled locally.
-3. Restart Atlas.
+1. Make sure your selected local model provider is running.
+2. Make sure at least one chat model is installed or loaded in that provider.
+3. For Ollama, make sure the models in `.env` have been pulled locally.
+4. Restart Atlas.
 
 If the backend shows offline after a Python code change, fully close and reopen the app. A frontend refresh is not enough for backend changes.
 
