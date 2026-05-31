@@ -18,7 +18,7 @@ from uuid import uuid4
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from pypdf import PdfReader
 
-from .config import AppConfig, load_config
+from .config import AppConfig, chat_provider_label, is_ollama_chat_provider, load_config
 from .discovery import build_discovery_report
 from .graph.builder import AgentApplication, build_chat_application
 from .graph.builder import post_synthesis_node_sequence, pre_synthesis_node_sequence
@@ -29,7 +29,7 @@ from .llm import (
     OllamaCatalogSnapshot,
     OllamaModelInfo,
     format_runtime_error,
-    inspect_local_ollama_models,
+    inspect_local_models,
 )
 from .memory.models import MemoryRecord
 from .run_contract import RunEvent, RunHub, TERMINAL_EVENT_TYPES
@@ -136,6 +136,9 @@ class AtlasBackendService:
             "chat_temperature": self.config.chat_temperature,
             "embed_model": self.config.embed_model,
             "ollama_url": self.config.ollama_url,
+            "chat_provider": getattr(self.config, "chat_provider", "ollama"),
+            "chat_provider_label": chat_provider_label(getattr(self.config, "chat_provider", "ollama")),
+            "chat_base_url": getattr(self.config, "chat_base_url", self.config.ollama_url),
             "runtime_mode": "chat-only",
             "compaction_timeout_seconds": self._compaction_timeout_seconds(),
             "busy": busy,
@@ -265,6 +268,15 @@ class AtlasBackendService:
             "ollama_context_window": context_window,
             "ollama_online": catalog.ollama_online,
             "has_local_models": catalog.has_local_models,
+            "provider": catalog.provider,
+            "provider_label": catalog.provider_label,
+            "provider_base_url": catalog.provider_base_url
+            or getattr(self.config, "chat_base_url", None)
+            or getattr(self.config, "ollama_url", "http://127.0.0.1:11434"),
+            "provider_online": catalog.provider_online or catalog.ollama_online,
+            "has_chat_models": catalog.has_local_models,
+            "supports_context_window": catalog.supports_context_window,
+            "supports_model_unload": catalog.supports_model_unload,
             "catalog_source": catalog.source,
             "loaded_models": self._loaded_ollama_models(catalog),
             "models": [item.name for item in catalog.models],
@@ -310,6 +322,8 @@ class AtlasBackendService:
             return []
 
     def _prepare_ollama_model_switch(self, target_model: str) -> list[str]:
+        if not is_ollama_chat_provider(getattr(getattr(self, "config", None), "chat_provider", "ollama")):
+            return []
         target = str(target_model or "").strip()
         if not target:
             return []
@@ -359,6 +373,8 @@ class AtlasBackendService:
         self._last_chat_model = model_name
 
     def _cleanup_ollama_model_after_resource_failure(self, chat_model: str, error_message: str) -> bool:
+        if not is_ollama_chat_provider(getattr(getattr(self, "config", None), "chat_provider", "ollama")):
+            return False
         model_name = str(chat_model or "").strip()
         if not model_name or not _looks_like_ollama_resource_failure(error_message):
             return False
@@ -373,6 +389,12 @@ class AtlasBackendService:
         return True
 
     def _ollama_context_window_payload(self, catalog: OllamaCatalogSnapshot) -> dict[str, Any]:
+        if not catalog.supports_context_window:
+            return {
+                "configured_context_window": None,
+                "effective_context_window": None,
+                "source": "provider",
+            }
         provider = getattr(getattr(self, "app", None), "llm_provider", None)
         configured_getter = getattr(provider, "ollama_context_window", None)
         configured_value = configured_getter() if callable(configured_getter) else None
@@ -2063,7 +2085,7 @@ class AtlasBackendService:
             return locked_model
         resolved = requested
         if not resolved:
-            raise RuntimeError("Select a local Ollama model before starting this chat.")
+            raise RuntimeError("Select a local chat model before starting this chat.")
         return resolved
 
     def _thread_last_run_model(self, thread: dict[str, Any] | None) -> str:
@@ -2195,7 +2217,7 @@ class AtlasBackendService:
         now = monotonic()
         if cached and now - cached[0] < ttl_seconds:
             return cached[1]
-        catalog = inspect_local_ollama_models(self.config)
+        catalog = inspect_local_models(self.config)
         self._model_catalog_cache = (now, catalog)
         return catalog
 

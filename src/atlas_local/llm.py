@@ -7,9 +7,17 @@ from typing import Any
 from urllib import error, request
 from urllib.parse import urljoin
 
+from langchain_core.messages import AIMessage
 from langchain_ollama import ChatOllama
 
-from .config import AppConfig
+from .config import (
+    DEFAULT_OLLAMA_URL,
+    OPENAI_COMPATIBLE_PROVIDER_DEFAULT_URLS,
+    AppConfig,
+    chat_provider_label,
+    is_ollama_chat_provider,
+    normalize_chat_provider,
+)
 
 
 OLLAMA_CONTEXT_WINDOW_PRESETS = (4096, 8192, 16384, 32768, 65536, 131072, 262144)
@@ -19,6 +27,9 @@ MAX_OLLAMA_CONTEXT_WINDOW = 262144
 
 def format_runtime_error(config: AppConfig, exc: Exception, *, chat_model: str | None = None) -> RuntimeError:
     resolved_chat_model = (chat_model or "").strip()
+    provider = _config_chat_provider(config)
+    provider_label = chat_provider_label(provider)
+    base_url = _config_chat_base_url(config)
     model_detail = (
         f"Requested chat_model={resolved_chat_model!r}, "
         if resolved_chat_model
@@ -26,25 +37,31 @@ def format_runtime_error(config: AppConfig, exc: Exception, *, chat_model: str |
     )
     original_error = str(exc).strip()
     message = (
-        "Ollama request failed. "
+        f"{provider_label} request failed. "
         f"{model_detail}"
         f"embed_model={config.embed_model!r}, "
-        f"base_url={config.ollama_url!r}. "
-        "Make sure Ollama is running and the required models are pulled."
+        f"base_url={base_url!r}. "
+        f"Make sure {provider_label} is running locally and the required models are available."
     )
     if original_error:
         message = f"{message} Original error: {original_error}"
     normalized_error = original_error.lower()
     if "cuda" in normalized_error:
         message = (
-            f"{message} This looks like an Ollama GPU/CUDA runtime failure; restart Ollama, "
+            f"{message} This looks like a local GPU/CUDA runtime failure; restart {provider_label}, "
             "then retry or switch to a smaller/local model if it keeps happening."
         )
     if "out of memory" in normalized_error:
-        message = (
-            f"{message} Ollama also reported GPU memory exhaustion. Lower the Ollama context window "
-            "in Settings > Models or switch to a smaller model before retrying."
-        )
+        if is_ollama_chat_provider(provider):
+            message = (
+                f"{message} Ollama also reported GPU memory exhaustion. Lower the Ollama context window "
+                "in Settings > Models or switch to a smaller model before retrying."
+            )
+        else:
+            message = (
+                f"{message} The local runtime reported memory exhaustion. Lower that runtime's context setting "
+                "or switch to a smaller model before retrying."
+            )
     if any(marker in normalized_error for marker in ("context length", "maximum context", "num_ctx", "prompt too long", "too many tokens")):
         message = (
             f"{message} The prompt appears too large for this model context. Compact the thread, lower the "
@@ -56,8 +73,8 @@ def format_runtime_error(config: AppConfig, exc: Exception, *, chat_model: str |
 @dataclass
 class LLMProvider:
     config: AppConfig
-    _chat_models: dict[tuple[str, float | None, str, int | None], ChatOllama] = field(default_factory=dict, init=False, repr=False)
-    _json_chat_models: dict[tuple[str, int | None], ChatOllama] = field(default_factory=dict, init=False, repr=False)
+    _chat_models: dict[tuple[Any, ...], Any] = field(default_factory=dict, init=False, repr=False)
+    _json_chat_models: dict[tuple[Any, ...], Any] = field(default_factory=dict, init=False, repr=False)
     _context_windows: dict[str, tuple[float, int]] = field(default_factory=dict, init=False, repr=False)
     _ollama_context_window: int | None = field(default=None, init=False, repr=False)
     _ollama_context_window_loaded: bool = field(default=False, init=False, repr=False)
@@ -68,18 +85,31 @@ class LLMProvider:
         *,
         temperature: float | None = None,
         reasoning: bool | str | None = None,
-    ) -> ChatOllama:
+    ) -> Any:
         resolved_model = (model or "").strip()
         if not resolved_model:
-            raise RuntimeError("Select a local Ollama model before starting this chat.")
+            raise RuntimeError(f"Select a local {chat_provider_label(_config_chat_provider(self.config))} model before starting this chat.")
         resolved_temperature = None if temperature is None else float(temperature)
+        provider = _config_chat_provider(self.config)
+        base_url = _config_chat_base_url(self.config)
+        if not is_ollama_chat_provider(provider):
+            cache_key = (provider, base_url, resolved_model, resolved_temperature, "chat")
+            if cache_key not in self._chat_models:
+                self._chat_models[cache_key] = OpenAICompatibleChat(
+                    model=resolved_model,
+                    base_url=base_url,
+                    temperature=resolved_temperature,
+                    api_key=_config_chat_api_key(self.config),
+                )
+            return self._chat_models[cache_key]
+
         resolved_reasoning = _resolve_reasoning_for_model(resolved_model, reasoning)
         context_window = self.ollama_context_window()
-        cache_key = (resolved_model, resolved_temperature, repr(resolved_reasoning), context_window)
+        cache_key = (provider, base_url, resolved_model, resolved_temperature, repr(resolved_reasoning), context_window)
         if cache_key not in self._chat_models:
             options: dict[str, Any] = {
                 "model": resolved_model,
-                "base_url": self.config.ollama_url,
+                "base_url": base_url,
                 "validate_model_on_init": True,
             }
             if resolved_temperature is not None:
@@ -91,16 +121,30 @@ class LLMProvider:
             self._chat_models[cache_key] = ChatOllama(**options)
         return self._chat_models[cache_key]
 
-    def json_chat(self, model: str | None = None) -> ChatOllama:
+    def json_chat(self, model: str | None = None) -> Any:
         resolved_model = (model or "").strip()
         if not resolved_model:
-            raise RuntimeError("Select a local Ollama model before starting this chat.")
+            raise RuntimeError(f"Select a local {chat_provider_label(_config_chat_provider(self.config))} model before starting this chat.")
+        provider = _config_chat_provider(self.config)
+        base_url = _config_chat_base_url(self.config)
+        if not is_ollama_chat_provider(provider):
+            cache_key = (provider, base_url, resolved_model, "json")
+            if cache_key not in self._json_chat_models:
+                self._json_chat_models[cache_key] = OpenAICompatibleChat(
+                    model=resolved_model,
+                    base_url=base_url,
+                    temperature=0.0,
+                    response_format={"type": "json_object"},
+                    api_key=_config_chat_api_key(self.config),
+                )
+            return self._json_chat_models[cache_key]
+
         context_window = self.ollama_context_window()
-        cache_key = (resolved_model, context_window)
+        cache_key = (provider, base_url, resolved_model, context_window)
         if cache_key not in self._json_chat_models:
             options: dict[str, Any] = {
                 "model": resolved_model,
-                "base_url": self.config.ollama_url,
+                "base_url": base_url,
                 "temperature": 0.0,
                 "format": "json",
                 "validate_model_on_init": True,
@@ -116,6 +160,8 @@ class LLMProvider:
             return 0
         if not resolved_model:
             return _approximate_message_tokens(messages)
+        if not is_ollama_chat_provider(_config_chat_provider(self.config)):
+            return _approximate_message_tokens(messages)
         try:
             counter = getattr(self.chat(resolved_model), "get_num_tokens_from_messages", None)
             if callable(counter):
@@ -130,6 +176,8 @@ class LLMProvider:
         resolved_model = (model or "").strip()
         if not resolved_model:
             return 0
+        if not is_ollama_chat_provider(_config_chat_provider(self.config)):
+            return 8192
         override = self.ollama_context_window()
         if override is not None:
             return override
@@ -146,6 +194,8 @@ class LLMProvider:
         return self._ollama_context_window
 
     def set_ollama_context_window(self, context_window: int | None) -> int | None:
+        if not is_ollama_chat_provider(_config_chat_provider(self.config)):
+            raise RuntimeError("Context window overrides are only available for Ollama runtimes.")
         if context_window is None:
             saved_value = None
         else:
@@ -162,9 +212,13 @@ class LLMProvider:
         return saved_value
 
     def loaded_models(self) -> tuple[str, ...]:
+        if not is_ollama_chat_provider(_config_chat_provider(self.config)):
+            return ()
         return tuple(loaded_ollama_models(self.config))
 
     def unload_model(self, model: str) -> dict[str, Any]:
+        if not is_ollama_chat_provider(_config_chat_provider(self.config)):
+            raise RuntimeError("This local provider does not expose an Atlas model-unload operation.")
         payload = unload_ollama_model(self.config, model)
         self._clear_model_caches()
         return payload
@@ -231,6 +285,64 @@ class LLMProvider:
         self._json_chat_models.clear()
 
 
+@dataclass
+class OpenAICompatibleChat:
+    model: str
+    base_url: str
+    temperature: float | None = None
+    response_format: dict[str, Any] | None = None
+    api_key: str | None = None
+    timeout_seconds: float = 120.0
+
+    def invoke(self, messages: list[Any]) -> AIMessage:
+        payload = self._chat_payload(messages, stream=False)
+        response = _openai_compatible_json_request_required(
+            self.base_url,
+            "chat/completions",
+            timeout_seconds=self.timeout_seconds,
+            body=payload,
+            api_key=self.api_key,
+        )
+        return AIMessage(content=_openai_compatible_response_text(response))
+
+    def stream(self, messages: list[Any]):
+        payload = self._chat_payload(messages, stream=True)
+        emitted = False
+        try:
+            for content in _stream_openai_compatible_chat(
+                self.base_url,
+                payload,
+                timeout_seconds=self.timeout_seconds,
+                api_key=self.api_key,
+            ):
+                if content:
+                    emitted = True
+                    yield AIMessage(content=content)
+            if emitted:
+                return
+        except Exception:
+            # Some local OpenAI-compatible servers expose chat but not SSE streaming.
+            pass
+        response = self.invoke(messages)
+        if response.content:
+            yield response
+
+    def get_num_tokens_from_messages(self, messages: list[Any]) -> int:
+        return _approximate_message_tokens(messages)
+
+    def _chat_payload(self, messages: list[Any], *, stream: bool) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": _messages_to_openai_compatible(messages),
+            "stream": stream,
+        }
+        if self.temperature is not None:
+            payload["temperature"] = self.temperature
+        if self.response_format is not None:
+            payload["response_format"] = self.response_format
+        return payload
+
+
 @dataclass(frozen=True)
 class OllamaModelInfo:
     name: str
@@ -254,6 +366,19 @@ class OllamaCatalogSnapshot:
     ollama_online: bool = False
     has_local_models: bool = False
     source: str = "fallback"
+    provider: str = "ollama"
+    provider_label: str = "Ollama"
+    provider_base_url: str = ""
+    provider_online: bool = False
+    supports_context_window: bool = True
+    supports_model_unload: bool = True
+
+
+def inspect_local_models(config: AppConfig, *, timeout_seconds: float = 3.0) -> OllamaCatalogSnapshot:
+    provider = _config_chat_provider(config)
+    if is_ollama_chat_provider(provider):
+        return inspect_local_ollama_models(config, timeout_seconds=timeout_seconds)
+    return inspect_openai_compatible_models(config, timeout_seconds=timeout_seconds)
 
 
 def list_local_ollama_models(config: AppConfig, *, timeout_seconds: float = 3.0) -> list[str]:
@@ -310,7 +435,13 @@ def inspect_local_ollama_models(config: AppConfig, *, timeout_seconds: float = 3
         with request.urlopen(endpoint, timeout=timeout_seconds) as response:
             payload: dict[str, Any] = json.loads(response.read().decode("utf-8"))
     except (error.URLError, TimeoutError, json.JSONDecodeError, OSError):
-        return OllamaCatalogSnapshot()
+        return OllamaCatalogSnapshot(
+            provider="ollama",
+            provider_label=chat_provider_label("ollama"),
+            provider_base_url=config.ollama_url,
+            supports_context_window=True,
+            supports_model_unload=True,
+        )
 
     models = payload.get("models", [])
     entries: list[OllamaModelInfo] = []
@@ -353,6 +484,83 @@ def inspect_local_ollama_models(config: AppConfig, *, timeout_seconds: float = 3
         ollama_online=True,
         has_local_models=bool(entries),
         source="ollama",
+        provider="ollama",
+        provider_label=chat_provider_label("ollama"),
+        provider_base_url=config.ollama_url,
+        provider_online=True,
+        supports_context_window=True,
+        supports_model_unload=True,
+    )
+
+
+def inspect_openai_compatible_models(config: AppConfig, *, timeout_seconds: float = 3.0) -> OllamaCatalogSnapshot:
+    provider = _config_chat_provider(config)
+    base_url = _config_chat_base_url(config)
+    payload = _openai_compatible_json_request(
+        base_url,
+        "models",
+        timeout_seconds=timeout_seconds,
+        api_key=_config_chat_api_key(config),
+    )
+    if not payload:
+        return OllamaCatalogSnapshot(
+            source=provider,
+            provider=provider,
+            provider_label=chat_provider_label(provider),
+            provider_base_url=base_url,
+            provider_online=False,
+            supports_context_window=False,
+            supports_model_unload=False,
+        )
+
+    raw_models = payload.get("data", payload.get("models", []))
+    entries: list[OllamaModelInfo] = []
+    seen: set[str] = set()
+    if isinstance(raw_models, list):
+        for item in raw_models:
+            model_payload = item if isinstance(item, dict) else {"id": item}
+            name = str(
+                model_payload.get("id")
+                or model_payload.get("name")
+                or model_payload.get("model")
+                or ""
+            ).strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            inferred_payload = {
+                "name": name,
+                "model": name,
+                "details": {
+                    "family": str(model_payload.get("owned_by") or model_payload.get("family") or "").strip(),
+                    "families": [],
+                },
+                "capabilities": model_payload.get("capabilities", []),
+            }
+            if not _is_chat_capable_model(inferred_payload):
+                continue
+            entries.append(
+                OllamaModelInfo(
+                    name=name,
+                    family=str(inferred_payload["details"]["family"]),
+                    capabilities=_payload_capabilities(inferred_payload),
+                    supports_images=_is_vision_capable_model(inferred_payload),
+                    supports_reasoning=_is_reasoning_capable_model(inferred_payload),
+                    reasoning_mode_strategy=_reasoning_mode_strategy(inferred_payload),
+                )
+            )
+    entries.sort(key=lambda item: item.name)
+    return OllamaCatalogSnapshot(
+        models=tuple(entries),
+        ollama_online=False,
+        has_local_models=bool(entries),
+        source=provider,
+        provider=provider,
+        provider_label=chat_provider_label(provider),
+        provider_base_url=base_url,
+        provider_online=True,
+        supports_context_window=False,
+        supports_model_unload=False,
     )
 
 
@@ -432,6 +640,97 @@ def _ollama_json_request_required(
         raise RuntimeError(f"Ollama could not stop the model through {endpoint}: {reason}") from exc
     except (error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
         raise RuntimeError(f"Ollama could not stop the model through {endpoint}: {exc}") from exc
+
+
+def _openai_compatible_json_request(
+    base_url: str,
+    endpoint: str,
+    *,
+    timeout_seconds: float,
+    body: dict[str, Any] | None = None,
+    api_key: str | None = None,
+) -> dict[str, Any]:
+    try:
+        return _openai_compatible_json_request_required(
+            base_url,
+            endpoint,
+            timeout_seconds=timeout_seconds,
+            body=body,
+            api_key=api_key,
+        )
+    except Exception:
+        return {}
+
+
+def _openai_compatible_json_request_required(
+    base_url: str,
+    endpoint: str,
+    *,
+    timeout_seconds: float,
+    body: dict[str, Any] | None = None,
+    api_key: str | None = None,
+) -> dict[str, Any]:
+    url = urljoin(f"{base_url.rstrip('/')}/", endpoint.lstrip("/"))
+    data = None
+    headers = {"Accept": "application/json"}
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    request_object = request.Request(url, data=data, headers=headers, method="POST" if body is not None else "GET")
+    try:
+        with request.urlopen(request_object, timeout=timeout_seconds) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+            return payload if isinstance(payload, dict) else {}
+    except error.HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8", errors="replace").strip()
+        except OSError:
+            detail = ""
+        reason = detail or str(exc)
+        raise RuntimeError(f"OpenAI-compatible local request to {endpoint} failed: {reason}") from exc
+    except (error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+        raise RuntimeError(f"OpenAI-compatible local request to {endpoint} failed: {exc}") from exc
+
+
+def _stream_openai_compatible_chat(
+    base_url: str,
+    body: dict[str, Any],
+    *,
+    timeout_seconds: float,
+    api_key: str | None = None,
+):
+    url = urljoin(f"{base_url.rstrip('/')}/", "chat/completions")
+    headers = {
+        "Accept": "text/event-stream",
+        "Content-Type": "application/json",
+    }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    request_object = request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    with request.urlopen(request_object, timeout=timeout_seconds) as response:
+        for raw_line in response:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line or line.startswith(":"):
+                continue
+            if not line.startswith("data:"):
+                continue
+            data = line.partition(":")[2].strip()
+            if data == "[DONE]":
+                break
+            try:
+                payload = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            text = _openai_compatible_delta_text(payload)
+            if text:
+                yield text
 
 
 def _context_from_ps_payload(payload: dict[str, Any], model: str) -> int | None:
@@ -554,7 +853,8 @@ def _payload_capabilities(payload: dict[str, Any]) -> tuple[str, ...]:
 
 
 def _payload_declares_capabilities(payload: dict[str, Any]) -> bool:
-    return isinstance(payload.get("capabilities"), list)
+    capabilities = payload.get("capabilities")
+    return isinstance(capabilities, list) and bool(capabilities)
 
 
 def _payload_has_capability(payload: dict[str, Any], capability: str) -> bool:
@@ -674,7 +974,127 @@ def _descriptor_explicitly_disables_reasoning(descriptor: str) -> bool:
     )
 
 
-def _close_chat_client(chat_model: ChatOllama) -> None:
+def _config_chat_provider(config: AppConfig) -> str:
+    return normalize_chat_provider(getattr(config, "chat_provider", "ollama"))
+
+
+def _config_chat_base_url(config: AppConfig) -> str:
+    provider = _config_chat_provider(config)
+    value = str(getattr(config, "chat_base_url", "") or "").strip()
+    if value:
+        return value
+    if is_ollama_chat_provider(provider):
+        return str(getattr(config, "ollama_url", DEFAULT_OLLAMA_URL) or DEFAULT_OLLAMA_URL).strip()
+    return OPENAI_COMPATIBLE_PROVIDER_DEFAULT_URLS.get(
+        provider,
+        OPENAI_COMPATIBLE_PROVIDER_DEFAULT_URLS["openai-compatible"],
+    )
+
+
+def _config_chat_api_key(config: AppConfig) -> str | None:
+    value = getattr(config, "chat_api_key", None)
+    text = str(value or "").strip()
+    return text or None
+
+
+def _messages_to_openai_compatible(messages: list[Any]) -> list[dict[str, Any]]:
+    converted: list[dict[str, Any]] = []
+    for message in messages:
+        role = _openai_role_for_message(message)
+        converted.append({"role": role, "content": _openai_content_for_message(getattr(message, "content", message))})
+    return converted
+
+
+def _openai_role_for_message(message: Any) -> str:
+    message_type = str(getattr(message, "type", "") or "").lower()
+    if message_type in {"system", "human", "ai"}:
+        return {"system": "system", "human": "user", "ai": "assistant"}[message_type]
+    class_name = type(message).__name__.lower()
+    if "system" in class_name:
+        return "system"
+    if "human" in class_name or "user" in class_name:
+        return "user"
+    if "ai" in class_name or "assistant" in class_name:
+        return "assistant"
+    return "user"
+
+
+def _openai_content_for_message(content: Any) -> Any:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content)
+    parts: list[Any] = []
+    for item in content:
+        if isinstance(item, str):
+            parts.append({"type": "text", "text": item})
+            continue
+        if not isinstance(item, dict):
+            parts.append({"type": "text", "text": str(item)})
+            continue
+        item_type = str(item.get("type", "")).strip().lower()
+        if item_type == "text":
+            parts.append({"type": "text", "text": str(item.get("text", ""))})
+        elif item_type == "image_url":
+            parts.append({"type": "image_url", "image_url": item.get("image_url", {})})
+        else:
+            parts.append(item)
+    return parts
+
+
+def _openai_compatible_response_text(payload: dict[str, Any]) -> str:
+    choices = payload.get("choices", [])
+    if not isinstance(choices, list) or not choices:
+        return ""
+    first = choices[0]
+    if not isinstance(first, dict):
+        return ""
+    message = first.get("message", {})
+    if isinstance(message, dict):
+        content = message.get("content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return _text_from_openai_content_parts(content)
+    text = first.get("text", "")
+    return text if isinstance(text, str) else ""
+
+
+def _openai_compatible_delta_text(payload: dict[str, Any]) -> str:
+    choices = payload.get("choices", [])
+    if not isinstance(choices, list) or not choices:
+        return ""
+    first = choices[0]
+    if not isinstance(first, dict):
+        return ""
+    delta = first.get("delta", {})
+    if isinstance(delta, dict):
+        content = delta.get("content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return _text_from_openai_content_parts(content)
+    message = first.get("message", {})
+    if isinstance(message, dict):
+        content = message.get("content", "")
+        if isinstance(content, str):
+            return content
+    return ""
+
+
+def _text_from_openai_content_parts(parts: list[Any]) -> str:
+    texts: list[str] = []
+    for item in parts:
+        if isinstance(item, str):
+            texts.append(item)
+        elif isinstance(item, dict):
+            text = item.get("text")
+            if isinstance(text, str):
+                texts.append(text)
+    return "".join(texts)
+
+
+def _close_chat_client(chat_model: Any) -> None:
     client_wrapper = getattr(chat_model, "_client", None)
     transport_client = getattr(client_wrapper, "_client", None)
     close = getattr(transport_client, "close", None)

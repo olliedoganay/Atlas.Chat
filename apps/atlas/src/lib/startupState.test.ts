@@ -51,18 +51,19 @@ describe("resolveStartupState", () => {
     expect(state.composerPlaceholder).toContain("Unlock");
   });
 
-  it("reports Ollama availability after model discovery starts", () => {
+  it("reports provider availability after model discovery starts", () => {
     const state = resolveStartupState({
       ...baseOptions,
       ollamaOnline: false,
+      providerLabel: "LM Studio",
     });
 
     expect(state.key).toBe("ollama-offline");
-    expect(state.idleTitle).toBe("Ollama unavailable");
+    expect(state.idleTitle).toBe("LM Studio unavailable");
     expect(state.canStartChat).toBe(false);
   });
 
-  it("reports missing local chat models separately from Ollama outage", () => {
+  it("reports missing local chat models separately from provider outage", () => {
     const state = resolveStartupState({
       ...baseOptions,
       hasLocalModels: false,

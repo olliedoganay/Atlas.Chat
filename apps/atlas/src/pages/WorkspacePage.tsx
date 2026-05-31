@@ -248,9 +248,12 @@ export function WorkspacePage() {
   const modelCatalogLoaded = Boolean(models);
   const availableModels = (models?.models ?? []).filter(Boolean);
   const loadedModels = models?.loaded_models ?? [];
-  const ollamaOnline = Boolean(models?.ollama_online);
-  const hasLocalModels = Boolean(models?.has_local_models);
-  const ollamaUrl = status?.ollama_url || "http://127.0.0.1:11434";
+  const providerOnline = Boolean(models?.provider_online ?? models?.ollama_online);
+  const hasLocalModels = Boolean(models?.has_chat_models ?? models?.has_local_models);
+  const providerLabel = models?.provider_label || status?.chat_provider_label || "Ollama";
+  const providerBaseUrl = models?.provider_base_url || status?.chat_base_url || status?.ollama_url || "http://127.0.0.1:11434";
+  const isOllamaProvider = (models?.provider || status?.chat_provider || "ollama") === "ollama";
+  const supportsModelUnload = Boolean(models?.supports_model_unload ?? true);
 
   const currentThread = useMemo(() => {
     const existing = threadItems.find((item) => item.thread_id === currentThreadId);
@@ -361,9 +364,10 @@ export function WorkspacePage() {
     currentUserId,
     currentUserLocked,
     modelCatalogLoaded,
-    ollamaOnline,
+    ollamaOnline: providerOnline,
     hasLocalModels,
     selectedModel,
+    providerLabel,
     selectedModelSupportsImages,
     threadHasHistory,
   });
@@ -539,15 +543,15 @@ export function WorkspacePage() {
       if (!currentUserId) {
         throw new Error("Choose a profile before starting the first chat.");
       }
-      if (!ollamaOnline) {
-        throw new Error("Start Ollama on this machine before starting the first chat.");
+      if (!providerOnline) {
+        throw new Error(`Start ${providerLabel} on this machine before starting the first chat.`);
       }
       if (!hasLocalModels) {
-        throw new Error("Pull a local chat model with Ollama before starting the first chat.");
+        throw new Error(`Add a local chat model to ${providerLabel} before starting the first chat.`);
       }
       const modelForRun = lockedThreadModel || selectedModel;
       if (!modelForRun) {
-        throw new Error("Select a local Ollama model before starting this chat.");
+        throw new Error("Select a local chat model before starting this chat.");
       }
       const temperatureForRun = lockedThreadTemperature !== undefined ? lockedThreadTemperature : (selectedTemperature ?? null);
       return startChat(
@@ -890,7 +894,10 @@ export function WorkspacePage() {
     void queryClient.fetchQuery({ queryKey: ["models"], queryFn: getModels, staleTime: 0 })
       .catch(() => models)
       .then((freshModels) => {
-        const fromModels = modelsToStopBeforeSwitch(freshModels?.loaded_models ?? loadedModels, modelForRun);
+        const canUnloadModels = Boolean(freshModels?.supports_model_unload ?? supportsModelUnload);
+        const fromModels = canUnloadModels
+          ? modelsToStopBeforeSwitch(freshModels?.loaded_models ?? loadedModels, modelForRun)
+          : [];
         if (modelForRun && fromModels.length) {
           setPendingModelSwitch({
             fromModels,
@@ -903,7 +910,7 @@ export function WorkspacePage() {
         startRunMutate(payload, { onSuccess: clearDraft });
       })
       .finally(() => setModelSwitchCheckPending(false));
-  }, [loadedModels, lockedThreadModel, modelSwitchCheckPending, models, pendingModelSwitch, queryClient, selectedModel, startRunMutate]);
+  }, [loadedModels, lockedThreadModel, modelSwitchCheckPending, models, pendingModelSwitch, queryClient, selectedModel, startRunMutate, supportsModelUnload]);
 
   const confirmModelSwitch = useCallback(async () => {
     if (!pendingModelSwitch) {
@@ -916,7 +923,7 @@ export function WorkspacePage() {
       await queryClient.invalidateQueries({ queryKey: ["models"] });
     } catch (error) {
       failRun(
-        error instanceof Error ? error.message : "Atlas could not stop the previous Ollama model.",
+        error instanceof Error ? error.message : "Atlas could not stop the previous local model.",
         currentUserId,
         currentThreadId,
       );
@@ -1100,9 +1107,9 @@ export function WorkspacePage() {
         {showOllamaWarning ? (
           <div className="workspace-warning-banner" role="status">
             <div className="workspace-warning-copy">
-              <strong>Ollama is not running.</strong>
+              <strong>{providerLabel} is not running.</strong>
               <span>
-                Open Ollama on this machine at <strong>{ollamaUrl}</strong>, then refresh Atlas.
+                Start the local provider at <strong>{providerBaseUrl}</strong>, then refresh Atlas.
               </span>
             </div>
             <button className="ghost-button compact-button" onClick={() => void refreshModels()} type="button">
@@ -1178,24 +1185,34 @@ export function WorkspacePage() {
                       </div>
                     ) : startupState.key === "ollama-offline" ? (
                       <div className="workspace-idle-actions">
-                        <a
-                          className="primary-button"
-                          href="https://ollama.com/download"
-                          onClick={(event) => {
-                            event.preventDefault();
-                            void openExternalUrl("https://ollama.com/download");
-                          }}
-                          rel="noreferrer"
-                          target="_blank"
-                        >
-                          Get Ollama
-                        </a>
+                        {isOllamaProvider ? (
+                          <a
+                            className="primary-button"
+                            href="https://ollama.com/download"
+                            onClick={(event) => {
+                              event.preventDefault();
+                              void openExternalUrl("https://ollama.com/download");
+                            }}
+                            rel="noreferrer"
+                            target="_blank"
+                          >
+                            Get Ollama
+                          </a>
+                        ) : (
+                          <button
+                            className="primary-button"
+                            onClick={() => void refreshModels()}
+                            type="button"
+                          >
+                            Refresh
+                          </button>
+                        )}
                         <button
                           className="ghost-button"
-                          onClick={() => navigate("/discovery")}
+                          onClick={() => navigate("/settings?section=connections")}
                           type="button"
                         >
-                          Open Discovery
+                          Connections
                         </button>
                       </div>
                     ) : startupState.key === "no-local-models" ? (
@@ -1225,36 +1242,46 @@ export function WorkspacePage() {
                           <Terminal size={16} />
                           <div>
                             <h3 id="workspace-setup-title">New to local AI?</h3>
-                            <p>Atlas Chat needs Ollama plus local models before the first real chat.</p>
+                            <p>Atlas Chat needs a local model provider plus local models before the first real chat.</p>
                           </div>
                         </div>
                         <div className="wizard-help-steps">
                           <div>
-                            <strong>1. Install Ollama</strong>
-                            <p>{platformOllamaInstallCopy}</p>
-                            <a
-                              className="source-link wizard-help-link"
-                              href="https://ollama.com/download"
-                              onClick={(event) => {
-                                event.preventDefault();
-                                void openExternalUrl("https://ollama.com/download");
-                              }}
-                              rel="noreferrer"
-                              target="_blank"
-                            >
-                              Open Ollama download
-                              <ExternalLink size={13} />
-                            </a>
+                            <strong>1. Connect a local provider</strong>
+                            <p>
+                              {isOllamaProvider
+                                ? platformOllamaInstallCopy
+                                : `Start ${providerLabel} and make sure it exposes its local API at ${providerBaseUrl}.`}
+                            </p>
+                            {isOllamaProvider ? (
+                              <a
+                                className="source-link wizard-help-link"
+                                href="https://ollama.com/download"
+                                onClick={(event) => {
+                                  event.preventDefault();
+                                  void openExternalUrl("https://ollama.com/download");
+                                }}
+                                rel="noreferrer"
+                                target="_blank"
+                              >
+                                Open Ollama download
+                                <ExternalLink size={13} />
+                              </a>
+                            ) : null}
                           </div>
                           <div>
                             <strong>2. Pull a chat model</strong>
-                            <p>Open {platformShell} and download this example chat model.</p>
-                            <code>ollama pull {starterChatModel}</code>
+                            <p>
+                              {isOllamaProvider
+                                ? `Open ${platformShell} and download this example chat model.`
+                                : `Install or load a chat model inside ${providerLabel}.`}
+                            </p>
+                            <code>{isOllamaProvider ? `ollama pull ${starterChatModel}` : "Use your provider's local model manager"}</code>
                           </div>
                           <div>
                             <strong>3. Pull the memory model</strong>
                             <p>This embedding model supports local memory and retrieval.</p>
-                            <code>ollama pull {resolvedEmbedModel}</code>
+                            <code>{isOllamaProvider ? `ollama pull ${resolvedEmbedModel}` : resolvedEmbedModel}</code>
                           </div>
                         </div>
                       </section>
@@ -1336,6 +1363,7 @@ export function WorkspacePage() {
         pendingAttachments={pendingAttachments}
         pendingPrompt={pendingPrompt}
         placeholder={composerPlaceholder}
+        providerLabel={providerLabel}
         reasoningOptions={reasoningOptions}
         ref={composerRef}
         runDetectedContextWindow={runDetails?.detected_context_window}
@@ -1431,7 +1459,7 @@ export function WorkspacePage() {
           }
         }}
         title={pendingModelSwitch ? `Switch to ${formatModelLabel(pendingModelSwitch.toModel)}?` : "Switch model?"}
-        description={modelSwitchDialogDescription(pendingModelSwitch)}
+        description={modelSwitchDialogDescription(pendingModelSwitch, providerLabel)}
         confirmLabel="Switch model"
         confirmIntent="primary"
         busyLabel="Switching..."
@@ -1458,6 +1486,7 @@ type WorkspaceComposerProps = {
   pendingPrompt: string;
   pendingAttachments: ImageAttachment[];
   liveAnswer: string;
+  providerLabel: string;
   isStreaming: boolean;
   isCompactingContext: boolean;
   threadHasHistory: boolean;
@@ -1489,6 +1518,7 @@ const WorkspaceComposer = memo(forwardRef<WorkspaceComposerHandle, WorkspaceComp
   pendingPrompt,
   pendingAttachments,
   liveAnswer,
+  providerLabel,
   isStreaming,
   isCompactingContext,
   threadHasHistory,
@@ -1574,7 +1604,7 @@ const WorkspaceComposer = memo(forwardRef<WorkspaceComposerHandle, WorkspaceComp
     runDetectedContextWindow,
     visibleHistory,
   ]);
-  const contextMeterTitle = formatContextMeterTitle(contextMeter, currentThreadHasActiveRun);
+  const contextMeterTitle = formatContextMeterTitle(contextMeter, currentThreadHasActiveRun, providerLabel);
 
   const appendAttachmentsFromFiles = async (files: File[]) => {
     if (!files.length) {
@@ -2016,13 +2046,13 @@ function modelsToStopBeforeSwitch(loadedModels: string[], targetModel: string) {
   });
 }
 
-function modelSwitchDialogDescription(pending: PendingModelSwitch | null) {
+function modelSwitchDialogDescription(pending: PendingModelSwitch | null, providerLabel: string) {
   if (!pending) {
     return "";
   }
   const stoppedModels = pending.fromModels.map(formatModelLabel).join(", ");
   const warmStateCopy = pending.fromModels.length === 1 ? "that model's" : "those models'";
-  return `Atlas will stop ${stoppedModels} in Ollama before starting ${formatModelLabel(pending.toModel)}. Your saved chat history stays intact, but ${warmStateCopy} warm in-memory state will be cleared.`;
+  return `Atlas will stop ${stoppedModels} in ${providerLabel} before starting ${formatModelLabel(pending.toModel)}. Your saved chat history stays intact, but ${warmStateCopy} warm in-memory state will be cleared.`;
 }
 
 function buildReasoningOptions(strategy: "none" | "boolean" | "levels") {
@@ -2083,11 +2113,11 @@ function formatTemperatureLabel(value: number | null | undefined) {
   return value.toFixed(1);
 }
 
-function formatContextMeterTitle(meter: ContextMeter, hasActiveRun: boolean) {
+function formatContextMeterTitle(meter: ContextMeter, hasActiveRun: boolean, providerLabel: string) {
   if (!meter.detected) {
     return `~${meter.tokensUsed.toLocaleString()} tokens estimated. Exact model window unknown until the first run. Click to compact now.`;
   }
-  const sourceCopy = meter.fromServer ? "detected from Ollama" : "estimated";
+  const sourceCopy = meter.fromServer ? `detected from ${providerLabel}` : "estimated";
   const parts = [
     `Prompt context: ~${meter.tokensUsed.toLocaleString()} of ~${meter.autoCompactBudget.toLocaleString()} auto-compact budget used.`,
     `Model window: ${meter.contextWindow.toLocaleString()} tokens (${sourceCopy}).`,

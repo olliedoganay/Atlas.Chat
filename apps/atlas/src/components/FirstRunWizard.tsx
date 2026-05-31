@@ -12,12 +12,18 @@ export function FirstRunWizard({
   ollamaOnline,
   hasLocalModels,
   embedModel,
+  providerLabel = "Ollama",
+  providerBaseUrl = "http://127.0.0.1:11434",
+  isOllamaProvider = true,
   onProfileCreated,
   onDismiss,
 }: {
   ollamaOnline: boolean;
   hasLocalModels: boolean;
   embedModel?: string;
+  providerLabel?: string;
+  providerBaseUrl?: string;
+  isOllamaProvider?: boolean;
   onProfileCreated: (userId: string) => Promise<void> | void;
   onDismiss: () => void;
 }) {
@@ -97,30 +103,36 @@ export function FirstRunWizard({
         <div className={`wizard-step ${step2}`}>
           <div className="wizard-step-head">
             <span className="wizard-step-num">{step2 === "done" ? <Check size={14} /> : "2"}</span>
-            <h3>Connect Ollama</h3>
+            <h3>Connect {providerLabel}</h3>
           </div>
           <div className="wizard-step-body">
             <span>
-              Atlas Chat uses Ollama as the local app that downloads and runs AI models on this machine.{" "}
+              Atlas Chat uses {providerLabel} as the local runtime for chat models on this machine.{" "}
               <strong style={{ color: ollamaOnline ? "var(--success)" : "var(--danger)" }}>
                 {ollamaOnline ? "Connected" : "Not running"}
               </strong>
             </span>
             {!ollamaOnline ? (
               <div className="wizard-form">
-                <a
-                  className="ghost-button compact-button"
-                  href="https://ollama.com/download"
-                  onClick={(event) => {
-                    event.preventDefault();
-                    void openExternalUrl("https://ollama.com/download");
-                  }}
-                  rel="noreferrer"
-                  target="_blank"
-                >
-                  <ExternalLink size={14} />
-                  Download Ollama
-                </a>
+                {isOllamaProvider ? (
+                  <a
+                    className="ghost-button compact-button"
+                    href="https://ollama.com/download"
+                    onClick={(event) => {
+                      event.preventDefault();
+                      void openExternalUrl("https://ollama.com/download");
+                    }}
+                    rel="noreferrer"
+                    target="_blank"
+                  >
+                    <ExternalLink size={14} />
+                    Download Ollama
+                  </a>
+                ) : (
+                  <span style={{ color: "var(--muted)", fontSize: "var(--text-sm)" }}>
+                    Start the local API at {providerBaseUrl}.
+                  </span>
+                )}
               </div>
             ) : null}
           </div>
@@ -154,36 +166,42 @@ export function FirstRunWizard({
             <Terminal size={16} />
             <div>
               <h3 id="wizard-help-title">New to local AI?</h3>
-              <p>Install Ollama first, then pull the models Atlas Chat can use.</p>
+              <p>Connect a local provider first, then make at least one chat model available.</p>
             </div>
           </div>
           <div className="wizard-help-steps">
             <div>
-              <strong>1. Install Ollama</strong>
-              <p>{installCopy}</p>
-              <a
-                className="source-link wizard-help-link"
-                href="https://ollama.com/download"
-                onClick={(event) => {
-                  event.preventDefault();
-                  void openExternalUrl("https://ollama.com/download");
-                }}
-                rel="noreferrer"
-                target="_blank"
-              >
-                Open Ollama download
-                <ExternalLink size={13} />
-              </a>
+              <strong>1. Connect {providerLabel}</strong>
+              <p>{isOllamaProvider ? installCopy : `Start ${providerLabel} and expose its OpenAI-compatible local API at ${providerBaseUrl}.`}</p>
+              {isOllamaProvider ? (
+                <a
+                  className="source-link wizard-help-link"
+                  href="https://ollama.com/download"
+                  onClick={(event) => {
+                    event.preventDefault();
+                    void openExternalUrl("https://ollama.com/download");
+                  }}
+                  rel="noreferrer"
+                  target="_blank"
+                >
+                  Open Ollama download
+                  <ExternalLink size={13} />
+                </a>
+              ) : null}
             </div>
             <div>
               <strong>2. Pull a chat model</strong>
-              <p>Open {shellName} and run this example command. You can choose a different model later.</p>
-              <code>ollama pull {starterChatModel}</code>
+              <p>
+                {isOllamaProvider
+                  ? `Open ${shellName} and run this example command. You can choose a different model later.`
+                  : `Load or install a chat model inside ${providerLabel}.`}
+              </p>
+              <code>{isOllamaProvider ? `ollama pull ${starterChatModel}` : "Use your provider's local model manager"}</code>
             </div>
             <div>
               <strong>3. Pull the memory model</strong>
               <p>This embedding model lets Atlas Chat support local memory and retrieval features.</p>
-              <code>ollama pull {resolvedEmbedModel}</code>
+              <code>{isOllamaProvider ? `ollama pull ${resolvedEmbedModel}` : resolvedEmbedModel}</code>
             </div>
             <div>
               <strong>4. Return to Atlas</strong>

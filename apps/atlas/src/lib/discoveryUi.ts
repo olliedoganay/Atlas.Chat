@@ -21,7 +21,7 @@ export function discoveryStatusLabel(status: DiscoveryReport["atlas"]["status"])
     return "Memory degraded";
   }
   if (status === "runtime-unavailable") {
-    return "Ollama offline";
+    return "Provider offline";
   }
   return "Chat blocked";
 }

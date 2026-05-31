@@ -26,6 +26,7 @@ type StartupStateOptions = {
   ollamaOnline: boolean;
   hasLocalModels: boolean;
   selectedModel: string;
+  providerLabel?: string;
   selectedModelSupportsImages?: boolean;
   threadHasHistory?: boolean;
 };
@@ -50,6 +51,7 @@ export function resolveStartupState({
   ollamaOnline,
   hasLocalModels,
   selectedModel,
+  providerLabel = "Ollama",
   selectedModelSupportsImages = false,
   threadHasHistory = false,
 }: StartupStateOptions): StartupState {
@@ -115,10 +117,10 @@ export function resolveStartupState({
       tone: "starting",
       shellLabel: "Checking models",
       idleKicker: "Models",
-      headerSummary: "Checking the local Ollama model list.",
+      headerSummary: "Checking the local model list.",
       idleTitle: "Checking models",
-      idleDescription: "Atlas is checking the local Ollama model list before the first message.",
-      composerPlaceholder: "Checking the local Ollama model list.",
+      idleDescription: "Atlas is checking the local model provider before the first message.",
+      composerPlaceholder: "Checking the local model list.",
       canStartChat: false,
     };
   }
@@ -127,12 +129,12 @@ export function resolveStartupState({
     return {
       key: "ollama-offline",
       tone: "warning",
-      shellLabel: "Ollama offline",
-      idleKicker: "Ollama",
-      headerSummary: "Atlas is online, but Ollama is not responding yet.",
-      idleTitle: "Ollama unavailable",
-      idleDescription: "Open Ollama on this machine, then refresh the local model list before sending the first message.",
-      composerPlaceholder: "Start Ollama on this machine first.",
+      shellLabel: `${providerLabel} offline`,
+      idleKicker: "Provider",
+      headerSummary: `Atlas is online, but ${providerLabel} is not responding yet.`,
+      idleTitle: `${providerLabel} unavailable`,
+      idleDescription: `Start ${providerLabel} on this machine, then refresh the local model list before sending the first message.`,
+      composerPlaceholder: `Start ${providerLabel} on this machine first.`,
       canStartChat: false,
     };
   }
@@ -143,10 +145,10 @@ export function resolveStartupState({
       tone: "warning",
       shellLabel: "No local models",
       idleKicker: "Models",
-      headerSummary: "Ollama is running, but there are no local chat models installed yet.",
+      headerSummary: `${providerLabel} is running, but there are no local chat models available yet.`,
       idleTitle: "No local models",
-      idleDescription: "Pull at least one local chat model with Ollama, then refresh Atlas to use it in new chats.",
-      composerPlaceholder: "Pull a local Ollama model before sending the first message.",
+      idleDescription: `Add at least one local chat model to ${providerLabel}, then refresh Atlas to use it in new chats.`,
+      composerPlaceholder: "Add a local chat model before sending the first message.",
       canStartChat: false,
     };
   }

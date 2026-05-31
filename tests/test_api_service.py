@@ -164,7 +164,7 @@ class GraphExecutionSequenceTests(unittest.TestCase):
 
 
 class ModelCatalogCachingTests(unittest.TestCase):
-    @patch("atlas_local.api_service.inspect_local_ollama_models")
+    @patch("atlas_local.api_service.inspect_local_models")
     @patch("atlas_local.api_service.monotonic")
     def test_model_catalog_is_cached_across_calls(self, monotonic_mock, model_info_mock) -> None:
         monotonic_mock.side_effect = [10.0, 11.0]
@@ -193,7 +193,7 @@ class ModelCatalogCachingTests(unittest.TestCase):
         self.assertTrue(supports_images)
         self.assertEqual(model_info_mock.call_count, 1)
 
-    @patch("atlas_local.api_service.inspect_local_ollama_models")
+    @patch("atlas_local.api_service.inspect_local_models")
     def test_model_catalog_reports_reasoning_support_from_catalog(self, model_info_mock) -> None:
         model_info_mock.return_value = OllamaCatalogSnapshot(
             models=(
@@ -213,7 +213,7 @@ class ModelCatalogCachingTests(unittest.TestCase):
         self.assertTrue(AtlasBackendService._model_supports_reasoning(service, "thinker:latest"))
         self.assertFalse(AtlasBackendService._model_supports_reasoning(service, "missing:latest"))
 
-    @patch("atlas_local.api_service.inspect_local_ollama_models")
+    @patch("atlas_local.api_service.inspect_local_models")
     def test_model_catalog_reports_ollama_context_window_override(self, model_info_mock) -> None:
         model_info_mock.return_value = OllamaCatalogSnapshot(
             models=(
@@ -241,7 +241,7 @@ class ModelCatalogCachingTests(unittest.TestCase):
         self.assertEqual(payload["ollama_context_window"]["configured_context_window"], 16384)
         self.assertEqual(payload["ollama_context_window"]["effective_context_window"], 16384)
 
-    @patch("atlas_local.api_service.inspect_local_ollama_models")
+    @patch("atlas_local.api_service.inspect_local_models")
     def test_model_catalog_reports_ollama_offline_without_local_models(self, model_info_mock) -> None:
         model_info_mock.return_value = OllamaCatalogSnapshot()
 

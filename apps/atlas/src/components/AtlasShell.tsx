@@ -219,14 +219,20 @@ export function AtlasShell() {
 
   const defaultTemperature =
     models?.default_temperature ?? status?.default_chat_temperature ?? status?.chat_temperature ?? null;
+  const providerOnline = Boolean(models?.provider_online ?? models?.ollama_online);
+  const hasChatModels = Boolean(models?.has_chat_models ?? models?.has_local_models);
+  const providerLabel = models?.provider_label || status?.chat_provider_label || "Ollama";
+  const providerBaseUrl = models?.provider_base_url || status?.chat_base_url || status?.ollama_url || "http://127.0.0.1:11434";
+  const isOllamaProvider = (models?.provider || status?.chat_provider || "ollama") === "ollama";
   const startupState = resolveStartupState({
     backendPhase,
     currentUserId,
     currentUserLocked,
     modelCatalogLoaded: Boolean(models),
-    ollamaOnline: Boolean(models?.ollama_online),
-    hasLocalModels: Boolean(models?.has_local_models),
+    ollamaOnline: providerOnline,
+    hasLocalModels: hasChatModels,
     selectedModel: draftThreadModel,
+    providerLabel,
   });
   const threadItems = useMemo(() => {
     const seen = new Set<string>();
@@ -727,8 +733,9 @@ export function AtlasShell() {
       {showFirstRun ? (
         <FirstRunWizard
           embedModel={status?.embed_model}
-          hasLocalModels={Boolean(models?.has_local_models)}
-          ollamaOnline={Boolean(models?.ollama_online)}
+          hasLocalModels={hasChatModels}
+          isOllamaProvider={isOllamaProvider}
+          ollamaOnline={providerOnline}
           onDismiss={() => setFirstRunDismissed(true)}
           onProfileCreated={async (userId) => {
             queryClient.setQueryData<UserSummary[]>(["users"], (current = []) => {
@@ -747,6 +754,8 @@ export function AtlasShell() {
             });
             await handleProfilePick(userId);
           }}
+          providerBaseUrl={providerBaseUrl}
+          providerLabel={providerLabel}
         />
       ) : null}
       <ChatSearchDialog

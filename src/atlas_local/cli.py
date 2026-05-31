@@ -16,12 +16,12 @@ def build_parser() -> argparse.ArgumentParser:
     ask_parser.add_argument("prompt", help="Prompt to send to the agent.")
     ask_parser.add_argument("--user-id", required=True)
     ask_parser.add_argument("--thread-id", default="default-thread")
-    ask_parser.add_argument("--model", required=True, help="Local Ollama chat model to use.")
+    ask_parser.add_argument("--model", required=True, help="Local chat model to use.")
 
     chat_parser = subparsers.add_parser("chat", help="Start an interactive chat session.")
     chat_parser.add_argument("--user-id", required=True)
     chat_parser.add_argument("--thread-id", default="default-thread")
-    chat_parser.add_argument("--model", required=True, help="Local Ollama chat model to use.")
+    chat_parser.add_argument("--model", required=True, help="Local chat model to use.")
 
     memories_parser = subparsers.add_parser("memories", help="List stored memories for a user.")
     memories_parser.add_argument("--user-id", required=True)

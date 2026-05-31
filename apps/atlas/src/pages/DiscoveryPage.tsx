@@ -46,6 +46,8 @@ export function DiscoveryPage() {
   const recommendedModels = data?.recommended_models ?? [];
   const primaryGpu = data ? selectPrimaryGpu(data.system.gpus) : null;
   const nextStep = data ? selectNextStep(recommendedModels) : null;
+  const providerLabel = data?.atlas.provider_label || "Ollama";
+  const providerOnline = Boolean(data?.atlas.provider_online ?? data?.atlas.ollama_online);
   const installedCount = recommendedModels.filter((item) => item.installed).length;
   const needsPullCount = recommendedModels.length - installedCount;
   const discoveryNotes = useMemo(() => {
@@ -118,7 +120,7 @@ export function DiscoveryPage() {
             <span className="status-dot" />
             Loading
           </span>
-          <p>Checking Ollama, local models, and hardware.</p>
+          <p>Checking the local provider, local models, and hardware.</p>
         </div>
       ) : null}
 
@@ -129,7 +131,7 @@ export function DiscoveryPage() {
             className={`discovery-overview discovery-overview-${discoveryStatusTone(data.atlas.status)}`}
           >
             <DiscoveryMetric
-              detail={data.atlas.ollama_online ? "Ollama reachable" : "Ollama unavailable"}
+              detail={providerOnline ? `${providerLabel} reachable` : `${providerLabel} unavailable`}
               icon={<Server size={16} />}
               label="Status"
               tone={discoveryStatusTone(data.atlas.status)}

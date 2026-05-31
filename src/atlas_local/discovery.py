@@ -12,7 +12,7 @@ from typing import Any
 from urllib import error, request
 from urllib.parse import urljoin
 
-from .config import AppConfig
+from .config import AppConfig, is_ollama_chat_provider
 from .llm import OllamaCatalogSnapshot
 
 
@@ -110,20 +110,26 @@ FALLBACK_DISCOVERY_MODELS: tuple[RecommendedModel, ...] = (
 
 def build_discovery_report(config: AppConfig, catalog: OllamaCatalogSnapshot) -> dict[str, Any]:
     system = detect_local_hardware()
-    installed_model_names = list_installed_ollama_model_names(config)
+    provider_is_ollama = is_ollama_chat_provider(catalog.provider)
+    provider_online = catalog.provider_online or catalog.ollama_online
+    installed_model_names = (
+        list_installed_ollama_model_names(config)
+        if provider_is_ollama
+        else [model.name for model in catalog.models]
+    )
     installed_lookup = {_normalize_model_name(name): name for name in installed_model_names}
     chat_models = list(catalog.models)
     chat_lookup = {_normalize_model_name(item.name): item for item in chat_models}
 
-    chat_available = catalog.ollama_online and catalog.has_local_models
+    chat_available = provider_online and catalog.has_local_models
     configured_embed_installed = _is_model_installed(config.embed_model, installed_lookup)
 
     atlas_status = "ready"
     atlas_summary = "Atlas can start chats and memory retrieval is fully configured."
     atlas_notes: list[str] = []
-    if not catalog.ollama_online:
+    if not provider_online:
         atlas_status = "runtime-unavailable"
-        atlas_summary = "Atlas cannot validate local models until Ollama is running."
+        atlas_summary = f"Atlas cannot validate local models until {catalog.provider_label} is running."
     elif not catalog.has_local_models:
         atlas_status = "chat-blocked"
         atlas_summary = "Atlas cannot start chats until at least one local chat model is installed."
@@ -169,6 +175,10 @@ def build_discovery_report(config: AppConfig, catalog: OllamaCatalogSnapshot) ->
             "notes": atlas_notes,
             "ollama_url": config.ollama_url,
             "ollama_online": catalog.ollama_online,
+            "provider": catalog.provider,
+            "provider_label": catalog.provider_label,
+            "provider_base_url": catalog.provider_base_url,
+            "provider_online": provider_online,
             "has_local_chat_models": catalog.has_local_models,
             "configured_embed_model": config.embed_model,
             "configured_embed_model_installed": configured_embed_installed,

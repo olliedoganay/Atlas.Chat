@@ -126,6 +126,13 @@ export function SettingsPage() {
     () => visibleUsers.find((user) => user.user_id === currentUserId) ?? null,
     [currentUserId, visibleUsers],
   );
+  const providerLabel = models?.provider_label || status?.chat_provider_label || "Ollama";
+  const providerBaseUrl = models?.provider_base_url || status?.chat_base_url || status?.ollama_url || "http://127.0.0.1:11434";
+  const providerOnline = Boolean(models?.provider_online ?? models?.ollama_online);
+  const hasChatModels = Boolean(models?.has_chat_models ?? models?.has_local_models);
+  const supportsContextWindow = Boolean(models?.supports_context_window ?? true);
+  const modelNames = models?.models ?? [];
+  const modelCount = modelNames.length;
   const contextWindowPresets = models?.context_window_presets?.length
     ? models.context_window_presets
     : DEFAULT_CONTEXT_WINDOW_PRESETS;
@@ -139,7 +146,7 @@ export function SettingsPage() {
   const selectedContextWindow = contextWindowChoices[contextWindowIndex] ?? null;
   const effectiveContextWindowText = effectiveContextWindow
     ? `Effective ${formatContextWindow(effectiveContextWindow)}`
-    : "Effective after Ollama reports a model";
+    : `Effective after ${providerLabel} reports a model`;
   const contextWindowProgress = formatSliderStopPosition(contextWindowIndex, contextWindowChoices.length);
   const manualMemories = useMemo(
     () =>
@@ -488,7 +495,7 @@ export function SettingsPage() {
 
               <SettingsRow
                 label="Auto compact long chats"
-                description="Atlas Chat trims old thread context automatically using the effective context window detected from Ollama."
+                description={`Atlas Chat trims old thread context automatically using the effective context window detected from ${providerLabel}.`}
               >
                 <div className="segmented-control">
                   <button
@@ -723,10 +730,10 @@ export function SettingsPage() {
 
               <SettingsRow
                 label="Ollama context window"
-                description="Set the global Ollama context length Atlas requests with num_ctx. Larger windows use more RAM or VRAM."
+                description="Ollama-only num_ctx override. Other local providers keep their context window inside the provider runtime."
                 block
               >
-                {models?.ollama_online && models.has_local_models ? (
+                {supportsContextWindow && providerOnline && hasChatModels ? (
                   <div className="settings-column settings-context-window-panel">
                     <div className="settings-context-window-toolbar">
                       <div className="settings-context-window-value">
@@ -788,11 +795,19 @@ export function SettingsPage() {
                 ) : (
                   <EmptyState
                     icon={<Monitor size={18} />}
-                    title={models?.ollama_online ? "No models installed" : "Ollama not reachable"}
+                    title={
+                      !supportsContextWindow
+                        ? "Managed by provider"
+                        : providerOnline
+                          ? "No models installed"
+                          : `${providerLabel} not reachable`
+                    }
                     description={
-                      models?.ollama_online
+                      !supportsContextWindow
+                        ? `${providerLabel} exposes context settings in its own local runtime. Atlas will not write an Ollama num_ctx override for it.`
+                        : providerOnline
                         ? "Install a chat model before setting a context window."
-                        : "Start Ollama before changing model context windows."
+                        : `Start ${providerLabel} before changing model context windows.`
                     }
                   />
                 )}
@@ -806,9 +821,9 @@ export function SettingsPage() {
                 <div className="settings-column">
                   <div className="inline-actions" style={{ justifyContent: "space-between" }}>
                     <span style={{ color: "var(--muted)", fontSize: "var(--text-sm)" }}>
-                      {models?.ollama_online
-                        ? `${models.models.length} model${models.models.length === 1 ? "" : "s"} installed`
-                        : "Waiting for Ollama"}
+                      {providerOnline
+                        ? `${modelCount} model${modelCount === 1 ? "" : "s"} installed`
+                        : `Waiting for ${providerLabel}`}
                     </span>
                     <button
                       className="ghost-button compact-button"
@@ -819,23 +834,23 @@ export function SettingsPage() {
                       Refresh
                     </button>
                   </div>
-                  {models?.ollama_online && models.has_local_models ? (
+                  {providerOnline && hasChatModels ? (
                     <ChipList>
-                      {models.models.map((m) => (
+                      {modelNames.map((m) => (
                         <Chip key={m}>{m}</Chip>
                       ))}
                     </ChipList>
-                  ) : models?.ollama_online ? (
+                  ) : providerOnline ? (
                     <EmptyState
                       icon={<Monitor size={18} />}
                       title="No models installed"
-                      description="Open Discovery to find a model that fits your machine."
+                      description={`Add a chat model to ${providerLabel}, then refresh Atlas.`}
                     />
                   ) : (
                     <EmptyState
                       icon={<Plug size={18} />}
-                      title="Ollama not reachable"
-                      description="Atlas Chat needs Ollama running locally. Check Connections."
+                      title={`${providerLabel} not reachable`}
+                      description="Atlas Chat needs a local model provider running. Check Connections."
                     />
                   )}
                 </div>
@@ -846,15 +861,15 @@ export function SettingsPage() {
           {section === "connections" ? (
             <div className="settings-rows">
               <SettingsRow
-                label="Ollama"
+                label={providerLabel}
                 description="Local model runtime. Atlas Chat checks this before opening a new chat."
               >
                 <div className="inline-actions">
                   <span style={{ color: "var(--muted)", fontSize: "var(--text-sm)" }}>
-                    {status?.ollama_url || "127.0.0.1:11434"}
+                    {providerBaseUrl}
                   </span>
-                  <StatusPill intent={models?.ollama_online ? "ok" : "error"}>
-                    {models?.ollama_online ? "Connected" : "Not running"}
+                  <StatusPill intent={providerOnline ? "ok" : "error"}>
+                    {providerOnline ? "Connected" : "Not running"}
                   </StatusPill>
                 </div>
               </SettingsRow>
@@ -975,7 +990,7 @@ export function SettingsPage() {
                     <p className="eyebrow">Desktop application</p>
                     <h3 id="about-product-title">{status?.product_name || "Atlas Chat"}</h3>
                     <p>
-                      Local-first workspace for Ollama chat, image and file attachments, context compaction,
+                      Local-first workspace for local model chat, image and file attachments, context compaction,
                       model discovery, diagnostics, and the multi-language code runner.
                     </p>
                   </div>
@@ -993,12 +1008,12 @@ export function SettingsPage() {
                     <p>{backendRuntimeVersion ? `Runtime v${backendRuntimeVersion}` : status?.runtime_mode || "Waiting for runtime"}</p>
                   </div>
                   <div className="settings-about-status-item">
-                    <span>Ollama</span>
-                    <strong>{models?.ollama_online ? "Connected" : "Not running"}</strong>
+                    <span>Model provider</span>
+                    <strong>{providerOnline ? "Connected" : "Not running"}</strong>
                     <p>
-                      {models?.ollama_online
-                        ? `${models.models.length} chat model${models.models.length === 1 ? "" : "s"} installed`
-                        : "Local model service"}
+                      {providerOnline
+                        ? `${modelCount} chat model${modelCount === 1 ? "" : "s"} installed`
+                        : providerLabel}
                     </p>
                   </div>
                   <div className="settings-about-status-item">
@@ -1034,7 +1049,7 @@ export function SettingsPage() {
                   description="This list is maintained in the app surface so the About page reflects what Atlas actually exposes."
                 >
                   <ChipList>
-                    <Chip>Local Ollama chat</Chip>
+                    <Chip>Local model chat</Chip>
                     <Chip>Attachments</Chip>
                     <Chip>Context compaction</Chip>
                     <Chip>Discovery</Chip>

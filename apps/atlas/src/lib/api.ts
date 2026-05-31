@@ -66,6 +66,9 @@ export type BackendStatus = {
   chat_temperature: number | null;
   embed_model: string;
   ollama_url: string;
+  chat_provider?: string;
+  chat_provider_label?: string;
+  chat_base_url?: string;
   runtime_mode: string;
   busy: boolean;
   security: {
@@ -98,14 +101,21 @@ export type ModelCatalog = {
   default_temperature: number | null;
   ollama_online: boolean;
   has_local_models: boolean;
-  catalog_source: "ollama" | "fallback";
+  provider?: string;
+  provider_label?: string;
+  provider_base_url?: string;
+  provider_online?: boolean;
+  has_chat_models?: boolean;
+  supports_context_window?: boolean;
+  supports_model_unload?: boolean;
+  catalog_source: string;
   temperature_presets: TemperaturePreset[];
   context_window_presets: number[];
   loaded_models: string[];
   ollama_context_window: {
     configured_context_window?: number | null;
     effective_context_window?: number | null;
-    source?: "configured" | "ollama";
+    source?: "configured" | "ollama" | "provider";
   };
   models: string[];
   model_details: Array<{
@@ -147,6 +157,10 @@ export type DiscoveryReport = {
     notes: string[];
     ollama_url: string;
     ollama_online: boolean;
+    provider?: string;
+    provider_label?: string;
+    provider_base_url?: string;
+    provider_online?: boolean;
     has_local_chat_models: boolean;
     configured_embed_model: string;
     configured_embed_model_installed: boolean;

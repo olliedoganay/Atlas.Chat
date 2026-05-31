@@ -9,6 +9,22 @@ from dotenv import load_dotenv
 
 
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
+DEFAULT_CHAT_PROVIDER = "ollama"
+OPENAI_COMPATIBLE_PROVIDER_DEFAULT_URLS = {
+    "lmstudio": "http://127.0.0.1:1234/v1",
+    "llamacpp": "http://127.0.0.1:8080/v1",
+    "vllm": "http://127.0.0.1:8000/v1",
+    "localai": "http://127.0.0.1:8080/v1",
+    "openai-compatible": "http://127.0.0.1:8000/v1",
+}
+CHAT_PROVIDER_LABELS = {
+    "ollama": "Ollama",
+    "lmstudio": "LM Studio",
+    "llamacpp": "llama.cpp server",
+    "vllm": "vLLM",
+    "localai": "LocalAI",
+    "openai-compatible": "OpenAI-compatible local runtime",
+}
 DEFAULT_CHAT_TEMPERATURE: float | None = None
 DEFAULT_EMBED_MODEL = "nomic-embed-text:latest"
 DEFAULT_MEM0_COLLECTION = "atlas_local_memory"
@@ -26,6 +42,9 @@ class AppConfig:
     langgraph_checkpoint_db: Path
     mem0_history_db: Path
     ollama_url: str
+    chat_provider: str
+    chat_base_url: str
+    chat_api_key: str | None
     chat_temperature: float | None
     embed_model: str
     mem0_collection: str
@@ -51,6 +70,46 @@ def _path_value(env: Mapping[str, str], key: str, default: Path, *, base: Path |
 def _value(env: Mapping[str, str], key: str, default: str) -> str:
     value = env.get(key, default)
     return value.strip() if isinstance(value, str) else default
+
+
+def normalize_chat_provider(value: str | None) -> str:
+    normalized = str(value or DEFAULT_CHAT_PROVIDER).strip().lower()
+    aliases = {
+        "lm-studio": "lmstudio",
+        "lm_studio": "lmstudio",
+        "llama.cpp": "llamacpp",
+        "llama-cpp": "llamacpp",
+        "llama_cpp": "llamacpp",
+        "llama": "llamacpp",
+        "openai": "openai-compatible",
+        "openai_compatible": "openai-compatible",
+        "openai-compatible": "openai-compatible",
+        "local-ai": "localai",
+        "local_ai": "localai",
+    }
+    return aliases.get(normalized, normalized) if normalized in CHAT_PROVIDER_LABELS or normalized in aliases else DEFAULT_CHAT_PROVIDER
+
+
+def chat_provider_label(provider: str | None) -> str:
+    return CHAT_PROVIDER_LABELS.get(normalize_chat_provider(provider), CHAT_PROVIDER_LABELS[DEFAULT_CHAT_PROVIDER])
+
+
+def is_ollama_chat_provider(provider: str | None) -> bool:
+    return normalize_chat_provider(provider) == "ollama"
+
+
+def _default_chat_base_url(provider: str, ollama_url: str) -> str:
+    if is_ollama_chat_provider(provider):
+        return ollama_url
+    return OPENAI_COMPATIBLE_PROVIDER_DEFAULT_URLS.get(provider, OPENAI_COMPATIBLE_PROVIDER_DEFAULT_URLS["openai-compatible"])
+
+
+def _optional_secret_value(env: Mapping[str, str], key: str) -> str | None:
+    value = env.get(key)
+    if value is None:
+        return None
+    text = value.strip() if isinstance(value, str) else str(value).strip()
+    return text or None
 
 
 def _optional_float_value(env: Mapping[str, str], key: str, default: float | None) -> float | None:
@@ -104,6 +163,11 @@ def load_config(
     checkpoint_db.parent.mkdir(parents=True, exist_ok=True)
     mem0_history_db.parent.mkdir(parents=True, exist_ok=True)
 
+    ollama_url = _value(source, "OLLAMA_URL", DEFAULT_OLLAMA_URL)
+    chat_provider = normalize_chat_provider(_value(source, "ATLAS_CHAT_PROVIDER", DEFAULT_CHAT_PROVIDER))
+    default_chat_base_url = _default_chat_base_url(chat_provider, ollama_url)
+    chat_base_url = _value(source, "ATLAS_CHAT_BASE_URL", default_chat_base_url) or default_chat_base_url
+
     return AppConfig(
         project_root=root,
         prompt_dir=prompt_dir,
@@ -111,7 +175,10 @@ def load_config(
         qdrant_path=qdrant_path,
         langgraph_checkpoint_db=checkpoint_db,
         mem0_history_db=mem0_history_db,
-        ollama_url=_value(source, "OLLAMA_URL", DEFAULT_OLLAMA_URL),
+        ollama_url=ollama_url,
+        chat_provider=chat_provider,
+        chat_base_url=chat_base_url,
+        chat_api_key=_optional_secret_value(source, "ATLAS_CHAT_API_KEY"),
         chat_temperature=_optional_float_value(source, "CHAT_TEMPERATURE", DEFAULT_CHAT_TEMPERATURE),
         embed_model=_value(source, "EMBED_MODEL", DEFAULT_EMBED_MODEL),
         mem0_collection=_value(source, "MEM0_COLLECTION", DEFAULT_MEM0_COLLECTION),

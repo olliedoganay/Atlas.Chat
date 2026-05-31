@@ -7,9 +7,9 @@
 [![Latest release](https://img.shields.io/github/v/release/olliedoganay/AtlasChat?label=latest%20release)](https://github.com/olliedoganay/AtlasChat/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Atlas Chat is a local-first desktop app for working with local Ollama models. It provides a multi-thread chat workspace, profile-scoped memory, hardware-aware model discovery, run inspection, and a built-in code runner while keeping Atlas-managed state on the local machine.
+Atlas Chat is a local-first desktop app for working with local AI models. It provides a multi-thread chat workspace, profile-scoped memory, hardware-aware model discovery, run inspection, and a built-in code runner while keeping Atlas-managed state on the local machine.
 
-Current version: `1.1.4`
+Current version: `1.1.5`
 
 <p align="center">
   <img src="docs/assets/atlas-chat-workspace.png" alt="Atlas Chat workspace" style="max-width: 100%; height: auto;">
@@ -24,7 +24,7 @@ For normal desktop usage, install the packaged desktop release instead of runnin
 ## Highlights
 
 - Multi-thread local chat workspace for long-running conversations
-- Hardware-aware Discovery page with Ollama model recommendations and pull commands
+- Hardware-aware Discovery page with local model recommendations and Ollama pull commands
 - Per-user profiles with optional password protection
 - Local search across the active profile's chats
 - Thread rename, duplicate, branch, model-lock, and temperature-lock workflows
@@ -34,7 +34,7 @@ For normal desktop usage, install the packaged desktop release instead of runnin
 - Image and file attachments in the composer
 - One-click execution for generated code snippets in isolated run windows
 
-Atlas requires a local Ollama runtime. Docker is optional for chat, but required for server-side code execution.
+Atlas requires a local model runtime. Ollama is the default path, and Atlas can also connect to local OpenAI-compatible runtimes such as LM Studio, llama.cpp server, vLLM, and LocalAI. Docker is optional for chat, but required for server-side code execution.
 
 ## Install
 
@@ -42,14 +42,14 @@ Atlas requires a local Ollama runtime. Docker is optional for chat, but required
 2. Download the installer for your platform:
    - Windows: current x64 MSI installer.
    - Linux: current x64 `.deb`, `.rpm`, or AppImage package.
-   - macOS: current unsigned x64 `.dmg` package.
+   - macOS: current unsigned `.dmg` package for Apple Silicon or Intel.
 3. Install and launch `Atlas Chat`.
 
 Atlas Chat packages community/open-source desktop builds without Apple notarization. On macOS, Gatekeeper may require opening the app manually from Finder the first time.
 
-## Install Ollama
+## Install a Local Model Provider
 
-Atlas Chat requires Ollama to run locally. Install Ollama before sending your first message, then pull at least one chat model and one embedding model.
+Atlas Chat needs a local model provider before sending your first message. Ollama remains the default setup and is still used by Atlas memory features today. Local OpenAI-compatible chat providers can be selected with environment variables.
 
 Official Ollama install docs:
 
@@ -91,12 +91,24 @@ ollama pull nomic-embed-text:latest
 
 Atlas connects to Ollama on `http://127.0.0.1:11434` by default. If Atlas says Ollama is unavailable, start Ollama and refresh the local model list.
 
+Other local chat providers:
+
+| Provider | `ATLAS_CHAT_PROVIDER` | Default local API URL |
+| --- | --- | --- |
+| LM Studio | `lmstudio` | `http://127.0.0.1:1234/v1` |
+| llama.cpp server | `llamacpp` | `http://127.0.0.1:8080/v1` |
+| vLLM | `vllm` | `http://127.0.0.1:8000/v1` |
+| LocalAI | `localai` | `http://127.0.0.1:8080/v1` |
+| Generic local OpenAI-compatible server | `openai-compatible` | `http://127.0.0.1:8000/v1` |
+
+For these providers, start the provider's local server, make a chat model available in that runtime, then set `ATLAS_CHAT_PROVIDER`. Set `ATLAS_CHAT_BASE_URL` only if your local server uses a different URL. This is local-provider support only; Atlas does not add hosted cloud providers here.
+
 ## Requirements
 
 - Python 3.14+
 - Node.js 20+
 - Rust stable toolchain with Cargo
-- Ollama running locally
+- A local chat runtime: Ollama, LM Studio, llama.cpp server, vLLM, LocalAI, or another local OpenAI-compatible endpoint
 - At least one local chat model of your choice
 - A local embedding model, for example `nomic-embed-text:latest`
 - Tauri prerequisites for your platform: `https://v2.tauri.app/start/prerequisites/`
@@ -194,8 +206,8 @@ python -m atlas_local.api
 ```
 
 - `atlas-backend` or `python -m atlas_local.api` runs only the local API/backend.
-- `atlas --user-id your_user --model <ollama-model>` starts the terminal chat CLI on thread `main`.
-- `atlas --user-id your_user --model <ollama-model> "..."` runs a single turn through the top-level launcher.
+- `atlas --user-id your_user --model <local-model>` starts the terminal chat CLI on thread `main`.
+- `atlas --user-id your_user --model <local-model> "..."` runs a single turn through the top-level launcher.
 - `python -m atlas_local.cli ...` exposes the raw `ask`, `chat`, and `memories` subcommands.
 
 ## Configuration
@@ -204,7 +216,10 @@ Copy `.env.example` to `.env` and adjust it if needed.
 
 | Variable | Purpose | Default |
 | --- | --- | --- |
-| `OLLAMA_URL` | Local Ollama base URL | `http://127.0.0.1:11434` |
+| `OLLAMA_URL` | Local Ollama base URL for Ollama chat and current memory embedding | `http://127.0.0.1:11434` |
+| `ATLAS_CHAT_PROVIDER` | Local chat provider: `ollama`, `lmstudio`, `llamacpp`, `vllm`, `localai`, or `openai-compatible` | `ollama` |
+| `ATLAS_CHAT_BASE_URL` | Override the selected provider's local API URL | provider default |
+| `ATLAS_CHAT_API_KEY` | Optional bearer token for local OpenAI-compatible runtimes that require one | blank |
 | `CHAT_TEMPERATURE` | Optional initial sampling temperature; blank uses the selected model behavior | blank |
 | `EMBED_MODEL` | Embedding model used for memory retrieval | `nomic-embed-text:latest` |
 | `QDRANT_PATH` | Local vector-store directory | `.data/qdrant` |
@@ -260,7 +275,7 @@ Atlas is built as a local desktop system:
 - The backend binds to `127.0.0.1` on a random local port.
 - The frontend authenticates every request with a per-launch instance token.
 - The backend rejects unexpected origins unless explicitly configured for direct localhost development.
-- Ollama is expected to run locally on the same machine.
+- The selected model provider is expected to run locally on the same machine.
 - Local state is stored under Atlas-managed directories, with additional at-rest protection where supported.
 
 For source runs, local data is written under `.data/`. Packaged builds use the app data directory for the current user.

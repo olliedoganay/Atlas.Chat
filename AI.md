@@ -1,8 +1,8 @@
 # Atlas Repo Note
 
 - Repo: `olliedoganay/AtlasChat`
-- Current version: `1.1.4`
-- Stack: Tauri 2 + React/Vite frontend, Rust desktop shell, Python FastAPI backend, Ollama, Docker-backed code runner.
+- Current version: `1.1.5`
+- Stack: Tauri 2 + React/Vite frontend, Rust desktop shell, Python FastAPI backend, local model providers, Docker-backed code runner.
 - Runtime shape: local-first desktop app; Tauri launches a loopback backend protected by a per-launch instance token.
 
 ## Main Paths
@@ -10,7 +10,7 @@
 - UI: `apps/atlas/src`
 - Tauri shell/backend launcher: `apps/atlas/src-tauri/src/lib.rs`
 - Backend API/service: `src/atlas_local/api.py`, `src/atlas_local/api_service.py`
-- LLM/Ollama provider: `src/atlas_local/llm.py`, `src/atlas_local/providers`
+- LLM/local provider layer: `src/atlas_local/llm.py`, `src/atlas_local/providers`
 - Config/version/context settings: `src/atlas_local/config.py`
 - Code runner: `src/atlas_local/code_runner.py`
 - Answer prompt: `prompts/answer.md`
@@ -66,11 +66,12 @@ Plain `pytest` from repo root is intended to be safe when pytest is installed, b
 ## Current Feature Notes
 
 - CI and release workflows use Python `3.14` and Node `20`.
-- Settings > Models has a global Ollama context-window slider. Atlas sends the selected value as `num_ctx`; `Auto` follows Ollama defaults.
+- Settings > Models has a global Ollama context-window slider when the chat provider is Ollama. Atlas sends the selected value as `num_ctx`; `Auto` follows Ollama defaults.
+- Local chat providers are selected with `ATLAS_CHAT_PROVIDER`: `ollama`, `lmstudio`, `llamacpp`, `vllm`, `localai`, or `openai-compatible`. Non-Ollama providers use local OpenAI-compatible `/v1` APIs.
 - Context compaction is automatic/manual, uses the effective context window, and has visible compaction status/animation in the composer area.
 - Only model outputs, thinking traces, and compaction summaries should be text-selectable in the app UI.
 - The titlebar is custom and compact; keep it visually close to VS Code-style density.
-- Offline Ollama states should stay compact. Avoid large blocking banners when the empty-state already explains what is wrong.
+- Offline local provider states should stay compact. Avoid large blocking banners when the empty-state already explains what is wrong.
 
 ## Code Runner
 
@@ -112,7 +113,7 @@ When changing language specs, run focused `tests.test_code_runner` coverage and 
 
 ## Releases
 
-- Current release tag: `v1.1.4`
+- Current release tag: `v1.1.5`
 - `scripts/bump_atlas_version.py` updates this file and `README.md` together with the release manifests.
 - `scripts/check_atlas_version.py` validates this file and `README.md` together with the release manifests.
 - Windows release workflow publishes MSI artifacts.

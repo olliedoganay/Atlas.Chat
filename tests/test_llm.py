@@ -4,9 +4,12 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from langchain_core.messages import HumanMessage
+
 from atlas_local.llm import (
     LLMProvider,
     format_runtime_error,
+    inspect_openai_compatible_models,
     inspect_local_ollama_models,
     loaded_ollama_models,
     unload_ollama_model,
@@ -91,6 +94,61 @@ class LLMProviderTemperatureTests(unittest.TestCase):
         message = str(error)
         self.assertIn("prompt appears too large", message)
         self.assertIn("Compact the thread", message)
+
+    def test_openai_compatible_provider_invokes_chat_completions(self) -> None:
+        config = SimpleNamespace(
+            chat_provider="lmstudio",
+            chat_base_url="http://127.0.0.1:1234/v1",
+            chat_api_key=None,
+            embed_model="nomic-embed-text:v1.5",
+            ollama_url="http://127.0.0.1:11434",
+        )
+        captured: dict[str, object] = {}
+
+        def fake_urlopen(request_object, timeout=0):
+            captured["url"] = getattr(request_object, "full_url", str(request_object))
+            captured["method"] = request_object.get_method()
+            captured["body"] = json.loads((request_object.data or b"{}").decode("utf-8"))
+            return _FakeResponse(
+                json.dumps({"choices": [{"message": {"content": "hello from lm studio"}}]}).encode("utf-8")
+            )
+
+        with patch("atlas_local.llm.request.urlopen", side_effect=fake_urlopen):
+            response = LLMProvider(config).chat("local-model").invoke([HumanMessage(content="hi")])
+
+        self.assertEqual(str(response.content), "hello from lm studio")
+        self.assertEqual(captured["url"], "http://127.0.0.1:1234/v1/chat/completions")
+        self.assertEqual(captured["method"], "POST")
+        self.assertEqual(
+            captured["body"],
+            {
+                "model": "local-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": False,
+            },
+        )
+
+    def test_inspect_openai_compatible_models_reads_v1_models(self) -> None:
+        config = SimpleNamespace(
+            chat_provider="llamacpp",
+            chat_base_url="http://127.0.0.1:8080/v1",
+            chat_api_key=None,
+            embed_model="nomic-embed-text:v1.5",
+            ollama_url="http://127.0.0.1:11434",
+        )
+
+        def fake_urlopen(request_object, timeout=0):
+            self.assertEqual(getattr(request_object, "full_url", str(request_object)), "http://127.0.0.1:8080/v1/models")
+            return _FakeResponse(json.dumps({"data": [{"id": "qwen3:8b"}, {"id": "nomic-embed-text"}]}).encode("utf-8"))
+
+        with patch("atlas_local.llm.request.urlopen", side_effect=fake_urlopen):
+            catalog = inspect_openai_compatible_models(config)
+
+        self.assertEqual(catalog.provider, "llamacpp")
+        self.assertEqual(catalog.provider_label, "llama.cpp server")
+        self.assertTrue(catalog.provider_online)
+        self.assertFalse(catalog.ollama_online)
+        self.assertEqual([model.name for model in catalog.models], ["qwen3:8b"])
 
     def test_inspect_models_reads_ollama_show_vision_capability(self) -> None:
         responses = {

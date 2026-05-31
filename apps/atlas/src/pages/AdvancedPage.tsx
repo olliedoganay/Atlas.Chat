@@ -49,6 +49,9 @@ export function AdvancedPage() {
   const storageHardened =
     Boolean(status?.security.sqlite_encrypted_at_rest) &&
     Boolean(status?.security.vector_store_encrypted_at_rest);
+  const providerLabel = models?.provider_label || status?.chat_provider_label || "Local provider";
+  const providerOnline = Boolean(models?.provider_online ?? models?.ollama_online);
+  const hasChatModels = Boolean(models?.has_chat_models ?? models?.has_local_models);
 
   return (
     <section className="advanced-page">
@@ -68,17 +71,17 @@ export function AdvancedPage() {
           value={status ? "Online" : "Offline"}
         />
         <AdvancedHealthCard
-          detail={models?.ollama_online ? "Local model server reachable" : "Start Ollama to chat locally"}
+          detail={providerOnline ? `${providerLabel} reachable` : `Start ${providerLabel} to chat locally`}
           icon={<Gauge size={16} />}
-          label="Ollama"
-          tone={models?.ollama_online ? "online" : "offline"}
-          value={models?.ollama_online ? "Connected" : "Unavailable"}
+          label="Provider"
+          tone={providerOnline ? "online" : "offline"}
+          value={providerOnline ? "Connected" : "Unavailable"}
         />
         <AdvancedHealthCard
-          detail={models?.catalog_source === "ollama" ? "Live Ollama inventory" : "Fallback catalog"}
+          detail={models?.catalog_source ? `Live ${providerLabel} inventory` : "Fallback catalog"}
           icon={<Database size={16} />}
           label="Models"
-          tone={models?.has_local_models ? "online" : "warning"}
+          tone={hasChatModels ? "online" : "warning"}
           value={`${models?.models.length ?? 0} installed`}
         />
         <AdvancedHealthCard
