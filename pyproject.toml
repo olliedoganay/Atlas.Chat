@@ -13,7 +13,7 @@ authors = [
     { name = "Atlas" },
 ]
 dependencies = [
-    "cryptography==48.0.1",
+    "cryptography==49.0.0",
     "fastapi==0.139.2",
     "keyring==25.7.0",
     "langchain-ollama==1.1.0",
