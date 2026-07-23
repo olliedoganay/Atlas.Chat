@@ -1,6 +1,6 @@
-import json
 import os
 import queue
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -25,9 +25,12 @@ class FakeService:
             }
         }
         self.subscribers: dict[str, list[queue.Queue[dict[str, object]]]] = {}
+        self.close_calls = 0
+        self.closed = threading.Event()
 
     def close(self) -> None:
-        return None
+        self.close_calls += 1
+        self.closed.set()
 
     def health(self):
         return {"status": "ok", "product": "Atlas Chat"}
@@ -68,6 +71,65 @@ class FakeService:
                 {"name": "test-model", "supports_images": False},
                 {"name": "model-b", "supports_images": True},
             ],
+        }
+
+    def get_provider_settings(self):
+        return {
+            "provider": "ollama",
+            "provider_label": "Ollama",
+            "base_url": "http://127.0.0.1:11434",
+            "has_api_key": False,
+            "secure_key_storage_available": True,
+            "providers": [
+                {
+                    "id": "ollama",
+                    "label": "Ollama",
+                    "default_base_url": "http://127.0.0.1:11434",
+                }
+            ],
+        }
+
+    def save_provider_settings(
+        self,
+        *,
+        provider: str,
+        base_url: str,
+        api_key: str | None,
+        preserve_existing_key: bool,
+    ):
+        return {
+            **self.get_provider_settings(),
+            "provider": provider,
+            "base_url": base_url,
+            "has_api_key": bool(api_key) or preserve_existing_key,
+            "restart_required": True,
+        }
+
+    def clear_provider_api_key(self):
+        return {**self.get_provider_settings(), "restart_required": True}
+
+    def start_model_pull(self, *, model: str):
+        return {
+            "pull_id": "pull-1",
+            "model": model,
+            "status": "pulling",
+            "detail": "Downloading",
+            "completed": 1,
+            "total": 2,
+            "progress": 0.5,
+        }
+
+    def list_model_pulls(self):
+        return [self.start_model_pull(model="test-model")]
+
+    def get_model_pull(self, pull_id: str):
+        return {**self.start_model_pull(model="test-model"), "pull_id": pull_id}
+
+    def cancel_model_pull(self, pull_id: str):
+        return {
+            **self.get_model_pull(pull_id),
+            "status": "cancelled",
+            "detail": "Download cancelled",
         }
 
     def set_ollama_context_window(self, *, context_window):
@@ -175,6 +237,9 @@ class FakeService:
         if user_id != confirmation_user_id:
             raise RuntimeError("User confirmation did not match the requested user id.")
         return {"status": "ok", "user_id": user_id}
+
+    def reset_thread(self, *, thread_id: str, user_id: str):
+        return {"status": "ok", "user_id": user_id, "thread_id": thread_id}
 
     def list_threads(self, *, user_id=None):
         return [
@@ -341,6 +406,40 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.json()["configured_context_window"], 16384)
         self.assertEqual(response.json()["ollama_context_window"]["configured_context_window"], 16384)
 
+    def test_provider_settings_and_model_pull_endpoints(self) -> None:
+        settings = self.client.get("/settings/provider")
+        updated = self.client.put(
+            "/settings/provider",
+            json={
+                "provider": "lmstudio",
+                "base_url": "http://127.0.0.1:1234/v1",
+                "api_key": "local-secret",
+            },
+        )
+        started = self.client.post("/models/pulls", json={"model": "test-model"})
+        listed = self.client.get("/models/pulls")
+        cancelled = self.client.delete("/models/pulls/pull-1")
+
+        self.assertEqual(settings.status_code, 200)
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(updated.json()["provider"], "lmstudio")
+        self.assertNotIn("local-secret", updated.text)
+        self.assertEqual(started.json()["progress"], 0.5)
+        self.assertEqual(listed.json()[0]["pull_id"], "pull-1")
+        self.assertEqual(cancelled.json()["status"], "cancelled")
+
+    def test_provider_settings_reject_credentials_in_url(self) -> None:
+        response = self.client.put(
+            "/settings/provider",
+            json={
+                "provider": "openai-compatible",
+                "base_url": "http://user:secret@127.0.0.1:8000/v1",
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("without credentials", response.json()["detail"])
+
     def test_ollama_model_unload(self) -> None:
         response = self.client.post("/models/unload", json={"model": "test-model"})
 
@@ -436,6 +535,28 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("Prompt or attachment is required", response.json()["detail"])
 
+    def test_request_budgets_reject_oversized_and_control_character_inputs(self) -> None:
+        oversized_prompt = self.client.post(
+            "/chat",
+            json={
+                "prompt": "x" * 200_001,
+                "user_id": "research_user",
+                "thread_id": "main",
+            },
+        )
+        invalid_user = self.client.post(
+            "/users",
+            json={"user_id": "unsafe\nprofile"},
+        )
+        oversized_code = self.client.post(
+            "/runner/exec",
+            json={"language": "python", "code": "x" * 1_000_001},
+        )
+
+        self.assertEqual(oversized_prompt.status_code, 422)
+        self.assertEqual(invalid_user.status_code, 422)
+        self.assertEqual(oversized_code.status_code, 422)
+
     def test_cancel_run(self) -> None:
         response = self.client.post("/runs/run-1/cancel")
         self.assertEqual(response.status_code, 200)
@@ -477,6 +598,20 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(deleted.status_code, 200)
         self.assertEqual(deleted.json()["user_id"], "research_user")
 
+    def test_thread_reset_requires_profile_owner(self) -> None:
+        missing_owner = self.client.post(
+            "/admin/reset/thread",
+            json={"thread_id": "main"},
+        )
+        reset = self.client.post(
+            "/admin/reset/thread",
+            json={"thread_id": "main", "user_id": "research_user"},
+        )
+
+        self.assertEqual(missing_owner.status_code, 422)
+        self.assertEqual(reset.status_code, 200)
+        self.assertEqual(reset.json()["user_id"], "research_user")
+
     def test_memory_create_and_delete(self) -> None:
         created = self.client.post("/memories", json={"user_id": "research_user", "text": "remember this"})
         deleted = self.client.delete("/memories/mem-2", params={"user_id": "research_user"})
@@ -514,6 +649,47 @@ class ApiTests(unittest.TestCase):
 
         self.assertEqual(unauthorized.status_code, 401)
         self.assertEqual(authorized.status_code, 200)
+
+    def test_prepare_shutdown_is_authenticated_and_idempotent(self) -> None:
+        service = FakeService()
+        server_shutdown_calls: list[str] = []
+        server_shutdown_requested = threading.Event()
+
+        def request_server_shutdown() -> None:
+            server_shutdown_calls.append("shutdown")
+            server_shutdown_requested.set()
+
+        with patch.dict(os.environ, {"ATLAS_INSTANCE_TOKEN": "test-token"}, clear=False):
+            client = TestClient(
+                create_api_app(
+                    service,
+                    request_server_shutdown=request_server_shutdown,
+                )
+            )
+            unauthorized = client.post("/admin/prepare-shutdown")
+            scheduled = client.post(
+                "/admin/prepare-shutdown",
+                headers={"X-Atlas-Instance-Token": "test-token"},
+            )
+            self.assertTrue(service.closed.wait(1.0))
+            self.assertTrue(server_shutdown_requested.wait(1.0))
+            duplicate = client.post(
+                "/admin/prepare-shutdown",
+                headers={"X-Atlas-Instance-Token": "test-token"},
+            )
+
+        self.assertEqual(unauthorized.status_code, 401)
+        self.assertEqual(scheduled.status_code, 200)
+        self.assertEqual(
+            scheduled.json(),
+            {"status": "shutdown-scheduled", "scheduled": True},
+        )
+        self.assertEqual(
+            duplicate.json(),
+            {"status": "shutdown-already-scheduled", "scheduled": False},
+        )
+        self.assertEqual(service.close_calls, 1)
+        self.assertEqual(server_shutdown_calls, ["shutdown"])
 
     def test_requests_reject_untrusted_origins(self) -> None:
         with patch.dict(os.environ, {"ATLAS_INSTANCE_TOKEN": "test-token"}, clear=False):

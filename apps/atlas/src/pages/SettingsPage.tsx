@@ -31,17 +31,21 @@ import tauriMacosConfig from "../../src-tauri/tauri.macos.conf.json";
 import {
   createMemory,
   createUser,
+  clearProviderApiKey,
   deleteMemory,
   deleteUser,
   getAppDiagnostics,
   getMemories,
   getModels,
+  getProviderSettings,
   getStatus,
   getUsers,
   lockUser,
   openExternalUrl,
   openAppLocation,
   resetAll,
+  restartManagedBackend,
+  saveProviderSettings,
   setOllamaContextWindow,
   unlockUser,
 } from "../lib/api";
@@ -81,6 +85,10 @@ export function SettingsPage() {
   const [unlockPassword, setUnlockPassword] = useState("");
   const [appDiagnostics, setAppDiagnostics] = useState<Awaited<ReturnType<typeof getAppDiagnostics>> | null>(null);
   const [contextWindowIndex, setContextWindowIndex] = useState(0);
+  const [providerDraft, setProviderDraft] = useState("ollama");
+  const [providerUrlDraft, setProviderUrlDraft] = useState("");
+  const [providerApiKeyDraft, setProviderApiKeyDraft] = useState("");
+  const [providerFormDirty, setProviderFormDirty] = useState(false);
   const { data: status } = useQuery({
     queryKey: ["status"],
     queryFn: getStatus,
@@ -91,6 +99,13 @@ export function SettingsPage() {
   const { data: models } = useQuery({
     queryKey: ["models"],
     queryFn: getModels,
+    staleTime: 10000,
+    retry: 1,
+    refetchOnWindowFocus: false,
+  });
+  const { data: providerSettings } = useQuery({
+    queryKey: ["provider-settings"],
+    queryFn: getProviderSettings,
     staleTime: 10000,
     retry: 1,
     refetchOnWindowFocus: false,
@@ -205,6 +220,14 @@ export function SettingsPage() {
     const index = configuredContextWindow ? contextWindowChoices.indexOf(configuredContextWindow) : 0;
     setContextWindowIndex(index >= 0 ? index : 0);
   }, [configuredContextWindow, contextWindowChoices]);
+
+  useEffect(() => {
+    if (!providerSettings || providerFormDirty) {
+      return;
+    }
+    setProviderDraft(providerSettings.provider);
+    setProviderUrlDraft(providerSettings.base_url);
+  }, [providerFormDirty, providerSettings]);
 
   useEffect(() => {
     let cancelled = false;
@@ -351,6 +374,44 @@ export function SettingsPage() {
       ]);
     },
   });
+  const saveProviderMutation = useMutation({
+    mutationFn: async () => {
+      const saved = await saveProviderSettings({
+        provider: providerDraft,
+        base_url: providerUrlDraft.trim(),
+        api_key: providerApiKeyDraft.trim() || undefined,
+        preserve_existing_key: !providerApiKeyDraft.trim(),
+      });
+      try {
+        await restartManagedBackend({ attempts: 60, delayMs: 250 });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "the backend did not become ready";
+        throw new Error(`Provider settings were saved, but Atlas could not restart: ${message}`);
+      }
+      return saved;
+    },
+    onSuccess: async () => {
+      setProviderApiKeyDraft("");
+      setProviderFormDirty(false);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["provider-settings"] }),
+        queryClient.invalidateQueries({ queryKey: ["models"] }),
+        queryClient.invalidateQueries({ queryKey: ["status"] }),
+        queryClient.invalidateQueries({ queryKey: ["discovery"] }),
+      ]);
+    },
+  });
+  const clearProviderKeyMutation = useMutation({
+    mutationFn: async () => {
+      await clearProviderApiKey();
+      await restartManagedBackend({ attempts: 60, delayMs: 250 });
+    },
+    onSuccess: async () => {
+      setProviderApiKeyDraft("");
+      setProviderFormDirty(false);
+      await queryClient.invalidateQueries({ queryKey: ["provider-settings"] });
+    },
+  });
 
   const refreshModels = async () => {
     await queryClient.invalidateQueries({ queryKey: ["models"] });
@@ -403,6 +464,7 @@ export function SettingsPage() {
         <aside className="settings-nav">
           {sections.map(({ id, label, icon: Icon }) => (
             <button
+              aria-current={section === id ? "page" : undefined}
               className={`settings-nav-button ${section === id ? "active" : ""}`}
               key={id}
               onClick={() => selectSection(id)}
@@ -426,7 +488,7 @@ export function SettingsPage() {
                 label="Theme"
                 description="Choose the desktop palette. Every theme uses the same minimal layout and control treatment."
               >
-                <div className="segmented-control">
+                <div aria-label="Theme" className="segmented-control" role="group">
                   {[
                     { id: "light", label: "Light" },
                     { id: "dark", label: "Dark" },
@@ -436,6 +498,7 @@ export function SettingsPage() {
                     { id: "nasa", label: "NASA" },
                   ].map((option) => (
                     <button
+                      aria-pressed={theme === option.id}
                       className={`segmented-button ${theme === option.id ? "active" : ""}`}
                       key={option.id}
                       onClick={() => setTheme(option.id as typeof theme)}
@@ -452,8 +515,9 @@ export function SettingsPage() {
                   label="Scanlines"
                   description="Add a light terminal texture while keeping the minimal interface intact."
                 >
-                  <div className="segmented-control">
+                  <div aria-label="Scanlines" className="segmented-control" role="group">
                     <button
+                      aria-pressed={crtScanlines}
                       className={`segmented-button ${crtScanlines ? "active" : ""}`}
                       onClick={() => setCrtScanlines(true)}
                       type="button"
@@ -461,6 +525,7 @@ export function SettingsPage() {
                       On
                     </button>
                     <button
+                      aria-pressed={!crtScanlines}
                       className={`segmented-button ${!crtScanlines ? "active" : ""}`}
                       onClick={() => setCrtScanlines(false)}
                       type="button"
@@ -475,8 +540,9 @@ export function SettingsPage() {
                 label="Cross-chat memory"
                 description="Allow saved memories to inform replies for the current profile."
               >
-                <div className="segmented-control">
+                <div aria-label="Cross-chat memory" className="segmented-control" role="group">
                   <button
+                    aria-pressed={crossChatMemoryEnabled}
                     className={`segmented-button ${crossChatMemoryEnabled ? "active" : ""}`}
                     onClick={() => setCrossChatMemoryEnabled(true)}
                     type="button"
@@ -484,6 +550,7 @@ export function SettingsPage() {
                     On
                   </button>
                   <button
+                    aria-pressed={!crossChatMemoryEnabled}
                     className={`segmented-button ${!crossChatMemoryEnabled ? "active" : ""}`}
                     onClick={() => setCrossChatMemoryEnabled(false)}
                     type="button"
@@ -497,8 +564,9 @@ export function SettingsPage() {
                 label="Auto compact long chats"
                 description={`Atlas Chat trims old thread context automatically using the effective context window detected from ${providerLabel}.`}
               >
-                <div className="segmented-control">
+                <div aria-label="Automatic chat compaction" className="segmented-control" role="group">
                   <button
+                    aria-pressed={autoCompactLongChats}
                     className={`segmented-button ${autoCompactLongChats ? "active" : ""}`}
                     onClick={() => setAutoCompactLongChats(true)}
                     type="button"
@@ -506,6 +574,7 @@ export function SettingsPage() {
                     On
                   </button>
                   <button
+                    aria-pressed={!autoCompactLongChats}
                     className={`segmented-button ${!autoCompactLongChats ? "active" : ""}`}
                     onClick={() => setAutoCompactLongChats(false)}
                     type="button"
@@ -636,7 +705,7 @@ export function SettingsPage() {
                               </button>
                             </div>
                             {unlockUserMutation.isError ? (
-                              <div className="error-inline">{getMutationErrorMessage(unlockUserMutation.error)}</div>
+                              <div className="error-inline" role="alert">{getMutationErrorMessage(unlockUserMutation.error)}</div>
                             ) : null}
                           </div>
                         ) : null}
@@ -660,8 +729,9 @@ export function SettingsPage() {
                       placeholder="my_profile"
                       value={newUserId}
                     />
-                    <div className="segmented-control">
+                    <div aria-label="Profile protection" className="segmented-control" role="group">
                       <button
+                        aria-pressed={newUserProtection === "passwordless"}
                         className={`segmented-button ${newUserProtection === "passwordless" ? "active" : ""}`}
                         onClick={() => setNewUserProtection("passwordless")}
                         type="button"
@@ -669,6 +739,7 @@ export function SettingsPage() {
                         Passwordless
                       </button>
                       <button
+                        aria-pressed={newUserProtection === "password"}
                         className={`segmented-button ${newUserProtection === "password" ? "active" : ""}`}
                         onClick={() => setNewUserProtection("password")}
                         type="button"
@@ -705,7 +776,7 @@ export function SettingsPage() {
                     </button>
                   </div>
                   {createUserMutation.isError ? (
-                    <div className="error-inline">{getMutationErrorMessage(createUserMutation.error)}</div>
+                    <div className="error-inline" role="alert">{getMutationErrorMessage(createUserMutation.error)}</div>
                   ) : null}
                 </div>
               </SettingsRow>
@@ -786,10 +857,10 @@ export function SettingsPage() {
                         : "Atlas sends this value as num_ctx for Ollama chat requests."}
                     </p>
                     {setContextWindowMutation.isPending ? (
-                      <div className="settings-context-window-saving">Saving context window...</div>
+                      <div aria-live="polite" className="settings-context-window-saving" role="status">Saving context window...</div>
                     ) : null}
                     {setContextWindowMutation.isError ? (
-                      <div className="error-inline">{getMutationErrorMessage(setContextWindowMutation.error)}</div>
+                      <div className="error-inline" role="alert">{getMutationErrorMessage(setContextWindowMutation.error)}</div>
                     ) : null}
                   </div>
                 ) : (
@@ -861,12 +932,127 @@ export function SettingsPage() {
           {section === "connections" ? (
             <div className="settings-rows">
               <SettingsRow
-                label={providerLabel}
+                label="Model provider"
+                description="Choose the local runtime Atlas uses for chat. Changes are stored locally and applied after a managed restart."
+                block
+              >
+                <div className="settings-column provider-settings-form">
+                  <div className="provider-settings-grid">
+                    <label>
+                      <span>Provider</span>
+                      <select
+                        aria-label="Model provider"
+                        className="text-input"
+                        onChange={(event) => {
+                          const nextProvider = event.currentTarget.value;
+                          const definition = providerSettings?.providers.find(
+                            (item) => item.id === nextProvider,
+                          );
+                          setProviderDraft(nextProvider);
+                          setProviderUrlDraft(definition?.default_base_url ?? "");
+                          setProviderFormDirty(true);
+                        }}
+                        value={providerDraft}
+                      >
+                        {(providerSettings?.providers ?? []).map((provider) => (
+                          <option key={provider.id} value={provider.id}>
+                            {provider.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label>
+                      <span>Local API URL</span>
+                      <input
+                        aria-label="Local provider API URL"
+                        className="text-input"
+                        onChange={(event) => {
+                          setProviderUrlDraft(event.currentTarget.value);
+                          setProviderFormDirty(true);
+                        }}
+                        placeholder="http://127.0.0.1:11434"
+                        spellCheck={false}
+                        type="url"
+                        value={providerUrlDraft}
+                      />
+                    </label>
+                    <label>
+                      <span>API key (optional)</span>
+                      <input
+                        aria-label="Local provider API key"
+                        autoComplete="off"
+                        className="text-input"
+                        disabled={!providerSettings?.secure_key_storage_available}
+                        onChange={(event) => {
+                          setProviderApiKeyDraft(event.currentTarget.value);
+                          setProviderFormDirty(true);
+                        }}
+                        placeholder={
+                          providerSettings?.has_api_key
+                            ? "Secure key already configured"
+                            : "Only if your local runtime requires one"
+                        }
+                        type="password"
+                        value={providerApiKeyDraft}
+                      />
+                    </label>
+                  </div>
+                  <div className="provider-settings-actions">
+                    <div aria-live="polite" className="provider-settings-status" role="status">
+                      {providerSettings?.has_api_key
+                        ? "API key protected by the operating system."
+                        : providerSettings?.secure_key_storage_available
+                          ? "No saved API key."
+                          : "Secure key storage is unavailable; Atlas will not persist a key."}
+                    </div>
+                    <div className="inline-actions">
+                      {providerSettings?.has_api_key ? (
+                        <button
+                          className="ghost-button compact-button"
+                          disabled={clearProviderKeyMutation.isPending}
+                          onClick={() => clearProviderKeyMutation.mutate()}
+                          type="button"
+                        >
+                          {clearProviderKeyMutation.isPending ? "Clearing..." : "Clear key"}
+                        </button>
+                      ) : null}
+                      <button
+                        className="primary-button compact-button"
+                        disabled={
+                          !providerSettings ||
+                          !providerDraft ||
+                          !providerUrlDraft.trim() ||
+                          saveProviderMutation.isPending
+                        }
+                        onClick={() => saveProviderMutation.mutate()}
+                        type="button"
+                      >
+                        {saveProviderMutation.isPending ? "Restarting..." : "Save & restart"}
+                      </button>
+                    </div>
+                  </div>
+                  {saveProviderMutation.isSuccess ? (
+                    <div className="success-inline" role="status">
+                      Provider saved and Atlas restarted.
+                    </div>
+                  ) : null}
+                  {saveProviderMutation.isError || clearProviderKeyMutation.isError ? (
+                    <div className="error-inline" role="alert">
+                      {getMutationErrorMessage(
+                        saveProviderMutation.error ?? clearProviderKeyMutation.error,
+                      )}
+                    </div>
+                  ) : null}
+                </div>
+              </SettingsRow>
+
+              <SettingsRow
+                label="Current connection"
                 description="Local model runtime. Atlas Chat checks this before opening a new chat."
               >
                 <div className="inline-actions">
                   <span style={{ color: "var(--muted)", fontSize: "var(--text-sm)" }}>
-                    {providerBaseUrl}
+                    {providerLabel} · {providerBaseUrl}
                   </span>
                   <StatusPill intent={providerOnline ? "ok" : "error"}>
                     {providerOnline ? "Connected" : "Not running"}

@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ipaddress
 import json
 import os
 import queue
+import secrets
+import threading
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Callable, Literal
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,32 +32,62 @@ from .run_contract import TERMINAL_EVENT_TYPES
 from .version import atlas_version
 
 
+MAX_IDENTIFIER_LENGTH = 128
+MAX_PASSWORD_LENGTH = 1024
+MAX_PROMPT_LENGTH = 200_000
+MAX_MEMORY_LENGTH = 20_000
+MAX_THREAD_TITLE_LENGTH = 200
+MAX_MODEL_NAME_LENGTH = 200
+MAX_CODE_LENGTH = 1_000_000
+MAX_ATTACHMENTS = 8
+MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
+MAX_TOTAL_ATTACHMENT_BYTES = 25 * 1024 * 1024
+IDENTIFIER_PATTERN = r"^[^\x00-\x1f\x7f]+$"
+
+
+class AttachmentRequest(BaseModel):
+    name: str = Field(default="attachment", min_length=1, max_length=255)
+    media_type: str = Field(default="application/octet-stream", min_length=1, max_length=128)
+    kind: Literal["image", "file"] | None = None
+    data_url: str | None = Field(default=None, max_length=14_000_000)
+    text_content: str | None = Field(default=None, max_length=500_000)
+    byte_size: int | None = Field(default=None, ge=0, le=MAX_ATTACHMENT_BYTES)
+
+
 class PromptRequest(BaseModel):
-    prompt: str = ""
-    user_id: str = Field(..., min_length=1)
-    thread_id: str = Field(..., min_length=1)
-    chat_model: str | None = None
+    prompt: str = Field(default="", max_length=MAX_PROMPT_LENGTH)
+    user_id: str = Field(
+        ..., min_length=1, max_length=MAX_IDENTIFIER_LENGTH, pattern=IDENTIFIER_PATTERN
+    )
+    thread_id: str = Field(
+        ..., min_length=1, max_length=MAX_IDENTIFIER_LENGTH, pattern=IDENTIFIER_PATTERN
+    )
+    chat_model: str | None = Field(default=None, max_length=MAX_MODEL_NAME_LENGTH)
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
-    reasoning_mode: str | None = None
-    thread_title: str | None = None
+    reasoning_mode: Literal["off", "on", "low", "medium", "high"] | None = None
+    thread_title: str | None = Field(default=None, max_length=MAX_THREAD_TITLE_LENGTH)
     cross_chat_memory: bool = True
     auto_compact_long_chats: bool = True
-    attachments: list[dict[str, Any]] = Field(default_factory=list)
-    images: list[dict[str, str]] = Field(default_factory=list)
+    attachments: list[AttachmentRequest] = Field(default_factory=list, max_length=MAX_ATTACHMENTS)
+    images: list[AttachmentRequest] = Field(default_factory=list, max_length=MAX_ATTACHMENTS)
 
 
 class UserRequest(BaseModel):
-    user_id: str = Field(..., min_length=1)
-    password: str | None = None
+    user_id: str = Field(
+        ..., min_length=1, max_length=MAX_IDENTIFIER_LENGTH, pattern=IDENTIFIER_PATTERN
+    )
+    password: str | None = Field(default=None, max_length=MAX_PASSWORD_LENGTH)
 
 
 class UnlockUserRequest(BaseModel):
-    password: str | None = None
+    password: str | None = Field(default=None, max_length=MAX_PASSWORD_LENGTH)
 
 
 class MemoryCreateRequest(BaseModel):
-    user_id: str = Field(..., min_length=1)
-    text: str = Field(..., min_length=1)
+    user_id: str = Field(
+        ..., min_length=1, max_length=MAX_IDENTIFIER_LENGTH, pattern=IDENTIFIER_PATTERN
+    )
+    text: str = Field(..., min_length=1, max_length=MAX_MEMORY_LENGTH)
 
 
 class ModelContextWindowRequest(BaseModel):
@@ -61,31 +95,57 @@ class ModelContextWindowRequest(BaseModel):
 
 
 class ModelUnloadRequest(BaseModel):
-    model: str = Field(..., min_length=1)
+    model: str = Field(..., min_length=1, max_length=MAX_MODEL_NAME_LENGTH)
+
+
+class ModelPullRequest(BaseModel):
+    model: str = Field(..., min_length=1, max_length=MAX_MODEL_NAME_LENGTH)
+
+
+class ProviderSettingsRequest(BaseModel):
+    provider: Literal[
+        "ollama",
+        "lmstudio",
+        "llamacpp",
+        "vllm",
+        "localai",
+        "openai-compatible",
+    ]
+    base_url: str = Field(default="", max_length=2048)
+    api_key: str | None = Field(default=None, max_length=4096)
+    preserve_existing_key: bool = True
 
 
 class ThreadTitleRequest(BaseModel):
-    user_id: str = Field(..., min_length=1)
-    title: str = Field(..., min_length=1)
+    user_id: str = Field(
+        ..., min_length=1, max_length=MAX_IDENTIFIER_LENGTH, pattern=IDENTIFIER_PATTERN
+    )
+    title: str = Field(..., min_length=1, max_length=MAX_THREAD_TITLE_LENGTH)
 
 
 class ThreadBranchRequest(BaseModel):
-    user_id: str = Field(..., min_length=1)
-    after_message_count: int = Field(..., ge=0)
+    user_id: str = Field(
+        ..., min_length=1, max_length=MAX_IDENTIFIER_LENGTH, pattern=IDENTIFIER_PATTERN
+    )
+    after_message_count: int = Field(..., ge=0, le=1_000_000)
 
 
 class ResetThreadRequest(BaseModel):
-    thread_id: str
-    user_id: str | None = None
+    thread_id: str = Field(
+        ..., min_length=1, max_length=MAX_IDENTIFIER_LENGTH, pattern=IDENTIFIER_PATTERN
+    )
+    user_id: str = Field(
+        ..., min_length=1, max_length=MAX_IDENTIFIER_LENGTH, pattern=IDENTIFIER_PATTERN
+    )
 
 
 class ResetAllRequest(BaseModel):
-    confirmation: str
+    confirmation: str = Field(..., max_length=64)
 
 
 class RunnerExecRequest(BaseModel):
-    language: str = Field(..., min_length=1)
-    code: str = Field(..., min_length=1)
+    language: str = Field(..., min_length=1, max_length=64)
+    code: str = Field(..., min_length=1, max_length=MAX_CODE_LENGTH)
 
 
 DEFAULT_ALLOWED_ORIGINS = (
@@ -97,11 +157,17 @@ DEFAULT_ALLOWED_ORIGINS = (
 )
 
 
-def create_api_app(service: AtlasBackendService | None = None) -> FastAPI:
+def create_api_app(
+    service: AtlasBackendService | None = None,
+    *,
+    request_server_shutdown: Callable[[], None] | None = None,
+) -> FastAPI:
     managed_service = service
     required_token = os.environ.get("ATLAS_INSTANCE_TOKEN", "").strip()
     allow_insecure_localhost = _allow_insecure_localhost()
     allowed_origins = _allowed_origins()
+    shutdown_lock = threading.Lock()
+    shutdown_started = False
 
     if not required_token and not allow_insecure_localhost and service is None:
         raise RuntimeError(
@@ -127,11 +193,15 @@ def create_api_app(service: AtlasBackendService | None = None) -> FastAPI:
         CORSMiddleware,
         allow_origins=list(allowed_origins),
         allow_credentials=False,
-        allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["Content-Type", "X-Atlas-Instance-Token"],
     )
     if managed_service is not None:
         app.state.service = managed_service
+
+    @app.exception_handler(RuntimeError)
+    async def runtime_error_handler(_request: Request, exc: RuntimeError):
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
 
     @app.middleware("http")
     async def require_instance_token(request: Request, call_next):
@@ -142,12 +212,38 @@ def create_api_app(service: AtlasBackendService | None = None) -> FastAPI:
             return await call_next(request)
         if required_token:
             provided = request.headers.get("x-atlas-instance-token", "").strip()
-            if provided != required_token:
+            if not secrets.compare_digest(provided, required_token):
                 return JSONResponse(status_code=401, content={"detail": "Atlas backend identity check failed."})
         return await call_next(request)
 
     def backend() -> AtlasBackendService:
         return app.state.service
+
+    def close_backend_and_server() -> None:
+        try:
+            backend().close()
+        finally:
+            if request_server_shutdown is not None:
+                request_server_shutdown()
+
+    @app.post("/admin/prepare-shutdown")
+    def prepare_shutdown() -> dict[str, Any]:
+        nonlocal shutdown_started
+        with shutdown_lock:
+            if shutdown_started:
+                return {"status": "shutdown-already-scheduled", "scheduled": False}
+            shutdown_started = True
+        try:
+            threading.Thread(
+                target=close_backend_and_server,
+                name="atlas-backend-shutdown",
+                daemon=True,
+            ).start()
+        except Exception:
+            with shutdown_lock:
+                shutdown_started = False
+            raise
+        return {"status": "shutdown-scheduled", "scheduled": True}
 
     @app.get("/health")
     def health() -> dict[str, Any]:
@@ -160,6 +256,42 @@ def create_api_app(service: AtlasBackendService | None = None) -> FastAPI:
     @app.get("/models")
     def models() -> dict[str, Any]:
         return backend().list_models()
+
+    @app.get("/settings/provider")
+    def provider_settings() -> dict[str, Any]:
+        return backend().get_provider_settings()
+
+    @app.put("/settings/provider")
+    def update_provider_settings(request: ProviderSettingsRequest) -> dict[str, Any]:
+        base_url = _validate_provider_base_url(request.base_url)
+        return _handle_runtime(
+            lambda: backend().save_provider_settings(
+                provider=request.provider,
+                base_url=base_url,
+                api_key=request.api_key,
+                preserve_existing_key=request.preserve_existing_key,
+            )
+        )
+
+    @app.delete("/settings/provider/api-key")
+    def delete_provider_api_key() -> dict[str, Any]:
+        return _handle_runtime(backend().clear_provider_api_key)
+
+    @app.post("/models/pulls")
+    def start_model_pull(request: ModelPullRequest) -> dict[str, Any]:
+        return _handle_runtime(lambda: backend().start_model_pull(model=request.model))
+
+    @app.get("/models/pulls")
+    def model_pulls() -> list[dict[str, Any]]:
+        return backend().list_model_pulls()
+
+    @app.get("/models/pulls/{pull_id}")
+    def model_pull(pull_id: str) -> dict[str, Any]:
+        return _handle_runtime(lambda: backend().get_model_pull(pull_id))
+
+    @app.delete("/models/pulls/{pull_id}")
+    def cancel_model_pull(pull_id: str) -> dict[str, Any]:
+        return _handle_runtime(lambda: backend().cancel_model_pull(pull_id))
 
     @app.patch("/models/context-window")
     def set_ollama_context_window(request: ModelContextWindowRequest) -> dict[str, Any]:
@@ -180,7 +312,15 @@ def create_api_app(service: AtlasBackendService | None = None) -> FastAPI:
         return backend().list_users()
 
     @app.get("/memories")
-    def memories(user_id: str = Query(..., min_length=1), limit: int = Query(default=50, ge=1, le=200)) -> list[dict[str, Any]]:
+    def memories(
+        user_id: str = Query(
+            ...,
+            min_length=1,
+            max_length=MAX_IDENTIFIER_LENGTH,
+            pattern=IDENTIFIER_PATTERN,
+        ),
+        limit: int = Query(default=50, ge=1, le=200),
+    ) -> list[dict[str, Any]]:
         return backend().list_memories(user_id=user_id, limit=limit)
 
     @app.post("/memories")
@@ -278,6 +418,8 @@ def create_api_app(service: AtlasBackendService | None = None) -> FastAPI:
         attachments = request.attachments or request.images
         if not request.prompt.strip() and not attachments:
             raise HTTPException(status_code=400, detail="Prompt or attachment is required.")
+        attachment_payloads = [item.model_dump(exclude_none=True) for item in attachments]
+        _validate_attachment_budget(attachment_payloads)
         return _handle_runtime(
             lambda: backend().start_chat(
                 prompt=request.prompt,
@@ -289,7 +431,7 @@ def create_api_app(service: AtlasBackendService | None = None) -> FastAPI:
                 thread_title=request.thread_title,
                 cross_chat_memory=request.cross_chat_memory,
                 auto_compact_long_chats=request.auto_compact_long_chats,
-                attachments=attachments,
+                attachments=attachment_payloads,
             )
         )
 
@@ -339,6 +481,11 @@ def create_api_app(service: AtlasBackendService | None = None) -> FastAPI:
     @app.post("/runner/stop/{run_id}")
     def runner_stop(run_id: str) -> dict[str, Any]:
         return get_runner().stop(run_id)
+
+    @app.post("/runner/shutdown")
+    def runner_shutdown() -> dict[str, str]:
+        get_runner().shutdown()
+        return {"status": "stopped"}
 
     return app
 
@@ -427,7 +574,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default=os.environ.get("ATLAS_API_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("ATLAS_API_PORT", "8765")))
     args = parser.parse_args(argv)
-    uvicorn.run("atlas_local.api:create_api_app", host=args.host, port=args.port, factory=True)
+    if not 1 <= args.port <= 65535:
+        parser.error("--port must be between 1 and 65535.")
+    if _allow_insecure_localhost() and not os.environ.get("ATLAS_INSTANCE_TOKEN", "").strip():
+        if not _is_loopback_host(args.host):
+            parser.error(
+                "ATLAS_ALLOW_INSECURE_LOCALHOST can only be used with a loopback host."
+            )
+    server: uvicorn.Server | None = None
+
+    def request_server_shutdown() -> None:
+        if server is not None:
+            server.should_exit = True
+
+    app = create_api_app(request_server_shutdown=request_server_shutdown)
+    server = uvicorn.Server(uvicorn.Config(app, host=args.host, port=args.port))
+    server.run()
     return 0
 
 
@@ -441,6 +603,58 @@ def _allowed_origins() -> tuple[str, ...]:
         return DEFAULT_ALLOWED_ORIGINS
     values = tuple(origin.strip() for origin in raw.split(",") if origin.strip())
     return values or DEFAULT_ALLOWED_ORIGINS
+
+
+def _is_loopback_host(host: str) -> bool:
+    resolved = host.strip().strip("[]").lower()
+    if resolved == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(resolved).is_loopback
+    except ValueError:
+        return False
+
+
+def _validate_provider_base_url(base_url: str) -> str:
+    resolved = base_url.strip()
+    if not resolved:
+        return ""
+    parsed = urlsplit(resolved)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Provider URL must be an HTTP(S) base URL without credentials, query, or fragment.",
+        )
+    return resolved.rstrip("/")
+
+
+def _validate_attachment_budget(attachments: list[dict[str, Any]]) -> None:
+    total = 0
+    for attachment in attachments:
+        declared_size = int(attachment.get("byte_size", 0) or 0)
+        data_url = str(attachment.get("data_url", "") or "")
+        text_content = str(attachment.get("text_content", "") or "")
+        estimated_size = declared_size
+        if data_url:
+            encoded = data_url.partition(",")[2] or data_url
+            estimated_size = max(estimated_size, (len(encoded) * 3) // 4)
+        if text_content:
+            estimated_size = max(estimated_size, len(text_content.encode("utf-8")))
+        if estimated_size > MAX_ATTACHMENT_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Attachment '{attachment.get('name', 'attachment')}' exceeds the 10 MiB limit.",
+            )
+        total += estimated_size
+    if total > MAX_TOTAL_ATTACHMENT_BYTES:
+        raise HTTPException(status_code=413, detail="Attachments exceed the 25 MiB request limit.")
 
 
 if __name__ == "__main__":

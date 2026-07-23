@@ -1,15 +1,13 @@
 # Atlas Chat
 
 [![CI](https://github.com/olliedoganay/AtlasChat/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/olliedoganay/AtlasChat/actions/workflows/ci.yml)
-[![Windows release](https://github.com/olliedoganay/AtlasChat/actions/workflows/release-windows.yml/badge.svg)](https://github.com/olliedoganay/AtlasChat/actions/workflows/release-windows.yml)
-[![Linux release](https://github.com/olliedoganay/AtlasChat/actions/workflows/release-linux.yml/badge.svg)](https://github.com/olliedoganay/AtlasChat/actions/workflows/release-linux.yml)
-[![macOS release](https://github.com/olliedoganay/AtlasChat/actions/workflows/release-macos.yml/badge.svg)](https://github.com/olliedoganay/AtlasChat/actions/workflows/release-macos.yml)
+[![Release](https://github.com/olliedoganay/AtlasChat/actions/workflows/release.yml/badge.svg)](https://github.com/olliedoganay/AtlasChat/actions/workflows/release.yml)
 [![Latest release](https://img.shields.io/github/v/release/olliedoganay/AtlasChat?label=latest%20release)](https://github.com/olliedoganay/AtlasChat/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Atlas Chat is a local-first desktop app for working with local AI models. It provides a multi-thread chat workspace, profile-scoped memory, hardware-aware model discovery, run inspection, and a built-in code runner while keeping Atlas-managed state on the local machine.
 
-Current version: `1.1.5`
+Current version: `1.2.0`
 
 <p align="center">
   <img src="docs/assets/atlas-chat-workspace.png" alt="Atlas Chat workspace" style="max-width: 100%; height: auto;">
@@ -24,15 +22,18 @@ For normal desktop usage, install the packaged desktop release instead of runnin
 ## Highlights
 
 - Multi-thread local chat workspace for long-running conversations
-- Hardware-aware Discovery page with local model recommendations and Ollama pull commands
+- Hardware-aware Discovery page with managed Ollama downloads, live progress, cancel/retry controls, and copyable fallback commands
+- In-app local provider and endpoint setup under **Settings > Connections**
 - Per-user profiles with optional password protection
 - Local search across the active profile's chats
 - Thread rename, duplicate, branch, model-lock, and temperature-lock workflows
 - Reasoning traces, token streaming, stop controls, and saved run diagnostics
 - Automatic and manual context compaction for long threads
 - Optional cross-chat memory with manual remember/forget controls
+- Third-party Mem0 telemetry disabled in the Atlas runtime
 - Image and file attachments in the composer
 - One-click execution for generated code snippets in isolated run windows
+- Keyboard-friendly, responsive desktop navigation and dialogs with a lighter route-split frontend
 
 Atlas requires a local model runtime. Ollama is the default path, and Atlas can also connect to local OpenAI-compatible runtimes such as LM Studio, llama.cpp server, vLLM, and LocalAI. Docker is optional for chat, but required for server-side code execution.
 
@@ -42,14 +43,14 @@ Atlas requires a local model runtime. Ollama is the default path, and Atlas can 
 2. Download the installer for your platform:
    - Windows: current x64 MSI installer.
    - Linux: current x64 `.deb`, `.rpm`, or AppImage package.
-   - macOS: current unsigned `.dmg` package for Apple Silicon or Intel.
+   - macOS 14 or newer: current unsigned `.dmg` package for Apple Silicon or Intel.
 3. Install and launch `Atlas Chat`.
 
 Atlas Chat packages community/open-source desktop builds without Apple notarization. On macOS, Gatekeeper may require opening the app manually from Finder the first time.
 
 ## Install a Local Model Provider
 
-Atlas Chat needs a local model provider before sending your first message. Ollama remains the default setup and is still used by Atlas memory features today. Local OpenAI-compatible chat providers can be selected with environment variables.
+Atlas Chat needs a local model provider before sending your first message. Ollama remains the default setup and is still used by Atlas memory features today. In the desktop app, open **Settings > Connections** to select Ollama or a supported local OpenAI-compatible runtime, confirm its local API URL, and choose **Save & restart**. Environment variables remain available for source, CLI, and automated setups.
 
 Official Ollama install docs:
 
@@ -101,17 +102,22 @@ Other local chat providers:
 | LocalAI | `localai` | `http://127.0.0.1:8080/v1` |
 | Generic local OpenAI-compatible server | `openai-compatible` | `http://127.0.0.1:8000/v1` |
 
-For these providers, start the provider's local server, make a chat model available in that runtime, then set `ATLAS_CHAT_PROVIDER`. Set `ATLAS_CHAT_BASE_URL` only if your local server uses a different URL. This is local-provider support only; Atlas does not add hosted cloud providers here.
+For these providers, start the provider's local server, make a chat model available in that runtime, then select it under **Settings > Connections**. A saved provider and API URL take precedence over the matching environment defaults. This is local-provider support only; Atlas does not add hosted cloud providers here.
+
+If a local runtime requires an API key, Atlas stores it only when secure operating-system secret protection is available. The key is protected before it is written, the frontend receives only key-present/key-unavailable status, and Atlas refuses to persist a key instead of silently falling back to plaintext. `ATLAS_CHAT_API_KEY` remains available for intentionally managed headless or development environments.
+
+With Ollama selected, the Discovery page can download recommended models directly. Atlas streams Ollama's download progress, allows the active download to be cancelled, exposes retry after a failure, and refreshes the installed-model list when the pull completes. Only one managed model download runs at a time; the copyable `ollama pull ...` command remains available as a manual fallback.
 
 ## Requirements
 
 - Python 3.14+
-- Node.js 20+
+- Node.js 22.12+
 - Rust stable toolchain with Cargo
 - A local chat runtime: Ollama, LM Studio, llama.cpp server, vLLM, LocalAI, or another local OpenAI-compatible endpoint
 - At least one local chat model of your choice
 - A local embedding model, for example `nomic-embed-text:latest`
 - Tauri prerequisites for your platform: `https://v2.tauri.app/start/prerequisites/`
+- macOS 14+ for packaged macOS builds
 
 ## Source Setup
 
@@ -120,14 +126,14 @@ Windows:
 ```powershell
 python -m venv .venv
 .venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-pip install -e .
+python -m pip install --require-hashes -r requirements.lock
+python -m pip install --no-deps -e .
 Copy-Item .env.example .env
 # Pull any chat model you prefer.
 ollama pull gpt-oss:20b
 ollama pull nomic-embed-text:latest
 Set-Location apps\atlas
-npm install
+npm ci
 Set-Location ..\..
 ```
 
@@ -136,16 +142,18 @@ macOS and Linux:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
-pip install -e .
+python -m pip install --require-hashes -r requirements.lock
+python -m pip install --no-deps -e .
 cp .env.example .env
 # Pull any chat model you prefer.
 ollama pull gpt-oss:20b
 ollama pull nomic-embed-text:latest
 cd apps/atlas
-npm install
+npm ci
 cd ../..
 ```
+
+`requirements.lock` is the cross-platform, hash-locked environment used for reproducible source, CI, and release installs. `requirements.txt` is the smaller direct dependency/tooling input used to regenerate that lock.
 
 ## Run From Source
 
@@ -177,8 +185,9 @@ First launch:
 
 1. Open `Settings`.
 2. Create or select a profile.
-3. Return to `Workspace`.
-4. Pick a model and start a chat.
+3. Under `Connections`, select the local provider and API URL.
+4. For Ollama, use `Discovery` to download a model if needed.
+5. Return to `Workspace`, pick a model, and start a chat.
 
 ## CLI and Backend
 
@@ -214,6 +223,8 @@ python -m atlas_local.api
 
 Copy `.env.example` to `.env` and adjust it if needed.
 
+For desktop use, prefer **Settings > Connections** for the chat provider, local API URL, and optional key. Atlas stores non-secret provider settings under `ATLAS_DATA_DIR`; saved values override the equivalent environment defaults after the managed backend restarts. Environment variables are still useful for initial defaults, direct backend runs, and automation.
+
 | Variable | Purpose | Default |
 | --- | --- | --- |
 | `OLLAMA_URL` | Local Ollama base URL for Ollama chat and current memory embedding | `http://127.0.0.1:11434` |
@@ -245,6 +256,11 @@ Runtime overrides:
 | `ATLAS_RUNNER_NETWORK` | Docker network mode for code runs; `none` or `bridge` | `none` |
 | `ATLAS_RUNNER_TIMEOUT_SECONDS` | Non-GUI code-runner timeout in seconds | `120` |
 | `ATLAS_RUNNER_GUI_TIMEOUT_SECONDS` | GUI code-runner timeout in seconds | `900` |
+| `ATLAS_RUNNER_MAX_CONCURRENT` | Maximum simultaneous Docker-backed code runs, bounded from 1 to 8 | `2` |
+| `ATLAS_RUNNER_HISTORY_LIMIT` | Maximum retained events per code run, bounded to 20,000 | `2000` |
+| `ATLAS_RUNNER_SUBSCRIBER_QUEUE_SIZE` | Maximum queued events per code-run stream subscriber, bounded to 2,048 | `256` |
+| `ATLAS_RUNNER_MAX_OUTPUT_BYTES` | Per-run streamed output budget, bounded to 16 MiB | `1048576` |
+| `ATLAS_RUNNER_STORAGE_LIMIT` | Optional container writable-layer limit when supported by the container engine | unset |
 | `VITE_ATLAS_BACKEND_URL` | Frontend-only direct backend URL for plain browser/Vite development | unset |
 | `VITE_ATLAS_BACKEND_TOKEN` | Optional token paired with `VITE_ATLAS_BACKEND_URL` | unset |
 
@@ -260,10 +276,12 @@ HTML renders in a sandboxed client-side preview and does not require Docker.
 
 Runner behavior:
 
-- Dependencies are installed on demand based on snippet imports when outbound network access is enabled for the run.
+- Outbound access is never enabled implicitly. `ATLAS_RUNNER_NETWORK=none` keeps ordinary runs offline; dependency-aware runs warn instead of silently switching networks. Set `ATLAS_RUNNER_NETWORK=bridge` only when the submitted code may access the network.
+- GUI and web previews use an Atlas-owned internal Docker network when outbound access is disabled, so their loopback preview ports work without internet routing.
+- Dependencies are installed on demand based on snippet imports only when outbound network access is explicitly enabled for the run.
 - Python GUI snippets can open a live embedded noVNC view for supported toolkits. GUI system packages are installed inside the disposable run container only when needed.
-- Docker-backed runs use disposable containers with CPU, memory, PID, timeout, and network controls. Closing the run window stops the container and removes the run-installed dependencies with it; Docker may still keep the base language image.
-- Non-GUI Docker runs default to `--network none`; set `ATLAS_RUNNER_NETWORK=bridge` only when snippets need outbound dependency resolution or downloads.
+- Docker-backed runs use fully qualified, versioned images and disposable containers with CPU, memory, PID, file-size, timeout, output, queue, and concurrency controls. Containers drop capabilities, enable `no-new-privileges`, and use a read-only root filesystem plus an unprivileged user for compatible workloads.
+- Closing the run window stops its owned container and removes the run-installed dependencies with it; Atlas also cleans up owned containers during backend shutdown. Docker may still keep the base language image.
 - `ATLAS_RUNNER_TIMEOUT_SECONDS` controls non-GUI run TTL and `ATLAS_RUNNER_GUI_TIMEOUT_SECONDS` controls GUI run TTL.
 - If Docker is unavailable, Atlas shows a retry path in the run window.
 
@@ -276,6 +294,7 @@ Atlas is built as a local desktop system:
 - The frontend authenticates every request with a per-launch instance token.
 - The backend rejects unexpected origins unless explicitly configured for direct localhost development.
 - The selected model provider is expected to run locally on the same machine.
+- Provider API credentials are never returned through the settings API; Atlas reports only whether a protected key is configured.
 - Local state is stored under Atlas-managed directories, with additional at-rest protection where supported.
 
 For source runs, local data is written under `.data/`. Packaged builds use the app data directory for the current user.
@@ -297,6 +316,8 @@ Optional flags:
 
 Plain `pytest` from the repo root is also safe because test discovery is scoped to `tests/`.
 
+The cross-platform CI gate also runs Ruff, frontend tests and the production Vite build, Cargo formatting/checks/tests/Clippy, Python and npm dependency audits, and CodeQL analysis. Tagged release jobs build each platform package and publish SHA-256 checksum files beside the installers.
+
 Before cutting a release tag, bump every checked manifest together:
 
 ```powershell
@@ -317,11 +338,7 @@ Artifacts are written under:
 apps\atlas\src-tauri\target\release\bundle\
 ```
 
-Atlas builds MSI as the canonical Windows installer. The Windows release workflow publishes MSI artifacts only.
-
-Linux release bundles are built on GitHub Actions with the `release-linux` workflow. It publishes `.deb`, `.rpm`, and AppImage artifacts for tagged releases.
-
-macOS release bundles are built on GitHub Actions with the `release-macos` workflow. It publishes unsigned `.dmg` artifacts for Intel/x64 and Apple Silicon/arm64 Macs.
+Atlas builds MSI as the canonical Windows installer. The consolidated GitHub Actions `release` workflow verifies the release candidate once, builds Windows MSI, Linux `.deb`/`.rpm`/AppImage, and unsigned macOS Intel/x64 and Apple Silicon/arm64 DMG packages, then publishes them together only after every platform succeeds.
 
 ## Repository Layout
 
@@ -343,6 +360,7 @@ For source runs, Atlas writes runtime data under `.data/`:
 - `qdrant/`: local vector storage for semantic memory
 - `runs/index.json`: thread, run, and user index
 - `runs/<run-id>.json`: saved run artifacts
+- `provider-settings.json`: selected local provider, API URL, and protected API-key ciphertext when OS secret protection is available
 - `storage.key.json`: local storage key material for encrypted-at-rest storage where supported
 - `logs/`: backend logs for source runs when launched through the desktop shell
 
@@ -359,9 +377,10 @@ Set-ExecutionPolicy -Scope Process Bypass
 If the desktop app opens but no models appear:
 
 1. Make sure your selected local model provider is running.
-2. Make sure at least one chat model is installed or loaded in that provider.
-3. For Ollama, make sure the models in `.env` have been pulled locally.
-4. Restart Atlas.
+2. Check the provider and local API URL under **Settings > Connections**.
+3. Make sure at least one chat model is installed or loaded in that provider.
+4. For Ollama, open **Discovery** to download a recommended model or copy its manual pull command.
+5. Restart Atlas.
 
 If the backend shows offline after a Python code change, fully close and reopen the app. A frontend refresh is not enough for backend changes.
 

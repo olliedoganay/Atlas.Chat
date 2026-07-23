@@ -1,6 +1,15 @@
+import * as Dialog from "@radix-ui/react-dialog";
 import { useQuery } from "@tanstack/react-query";
 import { Search, X } from "lucide-react";
-import { type ReactNode, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type KeyboardEvent as ReactKeyboardEvent,
+  type ReactNode,
+  useDeferredValue,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 import { searchChats, type ChatSearchResult } from "../lib/api";
 import { displayThreadTitle } from "../lib/threadTitles";
@@ -51,10 +60,7 @@ export function ChatSearchDialog({
     if (!open) {
       setQuery("");
       setActiveResultIndex(0);
-      return;
     }
-    const focusTimer = window.setTimeout(() => inputRef.current?.focus(), 16);
-    return () => window.clearTimeout(focusTimer);
   }, [open]);
 
   const currentResults = data?.current_thread_results ?? [];
@@ -139,40 +145,31 @@ export function ChatSearchDialog({
     onPick(result, normalizedQuery, meta);
   };
 
-  useEffect(() => {
-    if (!open) {
-      return undefined;
+  const handleKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (!flatResults.length || deferredQuery.length < 2) {
+      return;
     }
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        onOpenChange(false);
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      setActiveResultIndex((current) => Math.min(flatResults.length - 1, current + 1));
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      setActiveResultIndex((current) => Math.max(0, current - 1));
+      return;
+    }
+    if (event.key === "Enter") {
+      if (event.target !== inputRef.current || event.nativeEvent.isComposing) {
         return;
       }
-      if (!flatResults.length || deferredQuery.length < 2) {
-        return;
+      event.preventDefault();
+      const selected = flatResults[activeResultIndex];
+      if (selected) {
+        pickResult(selected);
       }
-      if (event.key === "ArrowDown") {
-        event.preventDefault();
-        setActiveResultIndex((current) => Math.min(flatResults.length - 1, current + 1));
-        return;
-      }
-      if (event.key === "ArrowUp") {
-        event.preventDefault();
-        setActiveResultIndex((current) => Math.max(0, current - 1));
-        return;
-      }
-      if (event.key === "Enter") {
-        event.preventDefault();
-        const selected = flatResults[activeResultIndex];
-        if (selected) {
-          pickResult(selected);
-        }
-      }
-    };
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [activeResultIndex, deferredQuery.length, flatResults, onOpenChange, open]);
+    }
+  };
 
   if (!open) {
     return null;
@@ -188,40 +185,43 @@ export function ChatSearchDialog({
       : null;
 
   return (
-    <div
-      className="search-dialog-backdrop"
-      onClick={() => onOpenChange(false)}
-      role="presentation"
-    >
-      <div
-        aria-label="Search chats"
-        aria-modal="true"
-        className="search-dialog"
-        onClick={(event) => event.stopPropagation()}
-        role="dialog"
-      >
+    <Dialog.Root onOpenChange={onOpenChange} open={open}>
+      <Dialog.Portal>
+        <Dialog.Overlay className="search-dialog-backdrop" />
+        <Dialog.Content
+          className="search-dialog"
+          onKeyDown={handleKeyDown}
+          onOpenAutoFocus={(event) => {
+            event.preventDefault();
+            inputRef.current?.focus();
+          }}
+        >
         <div className="search-dialog-header">
           <div>
             <p className="workspace-section-label">Search</p>
-            <h2>Search chats</h2>
+            <Dialog.Title>Search chats</Dialog.Title>
           </div>
-          <button
-            aria-label="Close search"
-            className="ghost-button icon-button"
-            onClick={() => onOpenChange(false)}
-            type="button"
-          >
-            <X size={16} />
-          </button>
+          <Dialog.Close asChild>
+            <button
+              aria-label="Close search"
+              className="ghost-button icon-button"
+              type="button"
+            >
+              <X size={16} />
+            </button>
+          </Dialog.Close>
         </div>
 
         <label className="search-input-shell">
           <Search size={18} />
           <input
+            aria-controls="chat-search-results"
+            aria-label="Search chat history"
             className="search-input"
             onChange={(event) => setQuery(event.currentTarget.value)}
             placeholder="Search this chat and all chats"
             ref={inputRef}
+            role="searchbox"
             value={query}
           />
           {query ? (
@@ -238,7 +238,11 @@ export function ChatSearchDialog({
           )}
         </label>
 
-        <p className="search-status-copy">{statusCopy}</p>
+        <Dialog.Description asChild>
+          <p aria-live="polite" className="search-status-copy" role="status">
+            {statusCopy}
+          </p>
+        </Dialog.Description>
 
         {!deferredQuery && recentSearchQueries.length > 0 ? (
           <div className="search-recent-row">
@@ -258,7 +262,7 @@ export function ChatSearchDialog({
           </div>
         ) : null}
 
-        <div className="search-dialog-sections">
+        <div className="search-dialog-sections" id="chat-search-results">
           <SearchSection
             activeHistoryIndex={activeCurrentHistoryIndex}
             emptyLabel={deferredQuery.length >= 2 ? "No hits in this chat." : "Start typing to search inside this chat."}
@@ -278,8 +282,9 @@ export function ChatSearchDialog({
             sectionTitle="Other conversations"
           />
         </div>
-      </div>
-    </div>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
   );
 }
 

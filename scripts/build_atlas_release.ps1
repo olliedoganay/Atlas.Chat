@@ -33,7 +33,7 @@ if ($CleanBundle -and (Test-Path -LiteralPath $bundleDir)) {
 Write-Host "Building Atlas MSI release bundle for Atlas v$version..." -ForegroundColor Cyan
 Push-Location $atlasDir
 try {
-  npm.cmd run tauri build
+  npm.cmd run tauri build -- --bundles msi
   if ($LASTEXITCODE -ne 0) {
     throw "Atlas release build failed with exit code $LASTEXITCODE."
   }
@@ -55,6 +55,6 @@ foreach ($artifact in $artifacts) {
   Write-Host " - $relative"
 }
 
-if (-not $artifacts) {
-  Write-Warning "No MSI installer artifacts were found under $bundleDir."
+if (@($artifacts).Count -ne 1) {
+  throw "Expected exactly one MSI installer artifact under $bundleDir; found $(@($artifacts).Count)."
 }

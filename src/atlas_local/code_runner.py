@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import ast
 import json
 import os
@@ -14,9 +15,12 @@ import tempfile
 import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
+
+from .run_contract import DEFAULT_SUBSCRIBER_QUEUE_SIZE, put_bounded_queue
 
 
 @dataclass
@@ -931,12 +935,12 @@ LANGUAGES: dict[str, LanguageSpec] = {
         requires_network=True,
     ),
     "c": LanguageSpec(
-        image="docker.io/library/gcc:latest",
+        image="docker.io/library/gcc:14.2",
         filename="main.c",
         command=["sh", "-c", "cp /work/main.c /tmp/main.c && gcc /tmp/main.c -o /tmp/app -lm && /tmp/app"],
     ),
     "cpp": LanguageSpec(
-        image="docker.io/library/gcc:latest",
+        image="docker.io/library/gcc:14.2",
         filename="main.cpp",
         command=["sh", "-c", "cp /work/main.cpp /tmp/main.cpp && g++ /tmp/main.cpp -o /tmp/app -lm && /tmp/app"],
     ),
@@ -971,7 +975,7 @@ LANGUAGES: dict[str, LanguageSpec] = {
         ],
     ),
     "bash": LanguageSpec(
-        image="docker.io/library/bash:latest",
+        image="docker.io/library/bash:5.2",
         filename="main.sh",
         command=["bash", "/work/main.sh"],
     ),
@@ -985,7 +989,7 @@ LANGUAGES: dict[str, LanguageSpec] = {
         ],
     ),
     "kotlin": LanguageSpec(
-        image="docker.io/zenika/kotlin:latest",
+        image="docker.io/zenika/kotlin:1.4.20",
         filename="main.kts",
         command=["sh", "-c", "cp /work/main.kts /tmp/main.kts && kotlinc -script /tmp/main.kts"],
     ),
@@ -1015,7 +1019,7 @@ LANGUAGES: dict[str, LanguageSpec] = {
         command=["lua", "/work/main.lua"],
     ),
     "r": LanguageSpec(
-        image="docker.io/library/r-base:latest",
+        image="docker.io/library/r-base:4.4.3",
         filename="main.R",
         command=[
             "sh",
@@ -1035,7 +1039,7 @@ LANGUAGES: dict[str, LanguageSpec] = {
         command=["elixir", "/work/main.exs"],
     ),
     "dart": LanguageSpec(
-        image="docker.io/library/dart:stable",
+        image="docker.io/library/dart:3.6.2",
         filename="main.dart",
         command=[
             "sh",
@@ -1085,7 +1089,24 @@ DEFAULT_GUI_RUNNER_TIMEOUT_SECONDS = 900
 RUNNER_NETWORK_ENV = "ATLAS_RUNNER_NETWORK"
 RUNNER_TIMEOUT_ENV = "ATLAS_RUNNER_TIMEOUT_SECONDS"
 RUNNER_GUI_TIMEOUT_ENV = "ATLAS_RUNNER_GUI_TIMEOUT_SECONDS"
+RUNNER_MAX_CONCURRENT_ENV = "ATLAS_RUNNER_MAX_CONCURRENT"
+RUNNER_HISTORY_LIMIT_ENV = "ATLAS_RUNNER_HISTORY_LIMIT"
+RUNNER_SUBSCRIBER_QUEUE_SIZE_ENV = "ATLAS_RUNNER_SUBSCRIBER_QUEUE_SIZE"
+RUNNER_MAX_OUTPUT_BYTES_ENV = "ATLAS_RUNNER_MAX_OUTPUT_BYTES"
+RUNNER_STORAGE_LIMIT_ENV = "ATLAS_RUNNER_STORAGE_LIMIT"
 RUNNER_ALLOWED_NETWORKS = {"none", "bridge"}
+RUNNER_INTERNAL_NETWORK = "atlas-runner-internal"
+DEFAULT_RUNNER_MAX_CONCURRENT = 2
+MAX_RUNNER_MAX_CONCURRENT = 8
+DEFAULT_RUNNER_HISTORY_LIMIT = 2_000
+MAX_RUNNER_HISTORY_LIMIT = 20_000
+MAX_RUNNER_SUBSCRIBER_QUEUE_SIZE = 2_048
+DEFAULT_RUNNER_MAX_OUTPUT_BYTES = 1_048_576
+MAX_RUNNER_MAX_OUTPUT_BYTES = 16_777_216
+DEFAULT_RUNNER_TMPFS_SIZE = "512m"
+DEFAULT_RUNNER_MAX_FILE_BYTES = 536_870_912
+RUNNER_STREAM_CHUNK_SIZE = 4_096
+RUNNER_MAX_CODE_BYTES = 1_048_576
 
 
 def resolve_language(language: str) -> str | None:
@@ -1230,13 +1251,157 @@ def resolve_plan(language: str, code: str, progress: "Any | None" = None) -> Run
     )
 
 
-def _runner_network_policy(plan: RunPlan) -> str:
+def _configured_runner_network() -> str:
     configured = os.environ.get(RUNNER_NETWORK_ENV, "none").strip().lower() or "none"
     if configured not in RUNNER_ALLOWED_NETWORKS:
         configured = "none"
-    if (plan.ports or plan.requires_network) and configured == "none":
-        return "bridge"
     return configured
+
+
+def _runner_network_policy(plan: RunPlan) -> str:
+    configured = _configured_runner_network()
+    if configured == "none" and plan.ports:
+        # Docker's built-in "none" network cannot publish preview ports. A
+        # private --internal bridge keeps loopback previews working without
+        # silently granting outbound access.
+        return RUNNER_INTERNAL_NETWORK
+    return configured
+
+
+def _runner_outbound_network_enabled(network: str) -> bool:
+    return network == "bridge"
+
+
+def _bounded_positive_int_env(key: str, default: int, maximum: int) -> int:
+    raw = os.environ.get(key, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return min(maximum, max(1, value))
+
+
+def _runner_max_concurrent() -> int:
+    return _bounded_positive_int_env(
+        RUNNER_MAX_CONCURRENT_ENV,
+        DEFAULT_RUNNER_MAX_CONCURRENT,
+        MAX_RUNNER_MAX_CONCURRENT,
+    )
+
+
+def _runner_history_limit() -> int:
+    return _bounded_positive_int_env(
+        RUNNER_HISTORY_LIMIT_ENV,
+        DEFAULT_RUNNER_HISTORY_LIMIT,
+        MAX_RUNNER_HISTORY_LIMIT,
+    )
+
+
+def _runner_subscriber_queue_size() -> int:
+    return _bounded_positive_int_env(
+        RUNNER_SUBSCRIBER_QUEUE_SIZE_ENV,
+        DEFAULT_SUBSCRIBER_QUEUE_SIZE,
+        MAX_RUNNER_SUBSCRIBER_QUEUE_SIZE,
+    )
+
+
+def _runner_max_output_bytes() -> int:
+    return _bounded_positive_int_env(
+        RUNNER_MAX_OUTPUT_BYTES_ENV,
+        DEFAULT_RUNNER_MAX_OUTPUT_BYTES,
+        MAX_RUNNER_MAX_OUTPUT_BYTES,
+    )
+
+
+def _runner_storage_limit() -> str | None:
+    raw = os.environ.get(RUNNER_STORAGE_LIMIT_ENV, "").strip()
+    if not raw:
+        return None
+    if not re.fullmatch(r"[1-9][0-9]*(?:[kmgtKMGT](?:i?[bB])?|[bB])?", raw):
+        raise RuntimeError(
+            f"{RUNNER_STORAGE_LIMIT_ENV} must be a positive byte count "
+            "with an optional K, M, G, T, KiB, MiB, GiB, or TiB suffix."
+        )
+    return raw
+
+
+def _runner_storage_limit_supported(binary: str) -> bool:
+    try:
+        completed = subprocess.run(
+            [binary, "run", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0 and "--storage-opt" in completed.stdout
+
+
+def _inspect_internal_network(binary: str) -> bool | None:
+    try:
+        completed = subprocess.run(
+            [
+                binary,
+                "network",
+                "inspect",
+                RUNNER_INTERNAL_NETWORK,
+                "--format",
+                "{{.Internal}}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip().lower() == "true"
+
+
+def _ensure_internal_network(binary: str) -> None:
+    internal = _inspect_internal_network(binary)
+    if internal is True:
+        return
+    if internal is False:
+        raise RuntimeError(
+            f"Docker network '{RUNNER_INTERNAL_NETWORK}' already exists but is not internal; "
+            "remove or rename it before running an isolated preview."
+        )
+
+    try:
+        completed = subprocess.run(
+            [
+                binary,
+                "network",
+                "create",
+                "--driver",
+                "bridge",
+                "--internal",
+                "--label",
+                "atlas.runner.network=1",
+                RUNNER_INTERNAL_NETWORK,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Docker timed out while creating the isolated preview network.") from exc
+    except OSError as exc:
+        raise RuntimeError(f"Failed to create the isolated preview network: {exc}") from exc
+
+    if completed.returncode == 0 or _inspect_internal_network(binary) is True:
+        return
+    detail = (completed.stderr or completed.stdout or "").strip()
+    suffix = f" Details: {detail.splitlines()[-1]}" if detail else ""
+    raise RuntimeError(f"Failed to create the isolated preview network.{suffix}")
 
 
 def _runner_timeout_seconds(plan: RunPlan) -> int:
@@ -1280,6 +1445,22 @@ def docker_status() -> dict[str, Any]:
     return {"available": True, "server_version": version}
 
 
+def _process_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
 @dataclass
 class RunnerProcess:
     run_id: str
@@ -1290,18 +1471,58 @@ class RunnerProcess:
     timeout_seconds: int
     network: str
     process: subprocess.Popen
-    events: queue.Queue = field(default_factory=queue.Queue)
-    history: list[dict[str, Any]] = field(default_factory=list)
+    history_limit: int
+    subscriber_queue_size: int
+    max_output_bytes: int
+    history: deque[dict[str, Any]] = field(init=False)
     lock: threading.Lock = field(default_factory=threading.Lock)
     finished: bool = False
     exit_code: int | None = None
-    subscribers: list[queue.Queue] = field(default_factory=list)
+    output_bytes: int = 0
+    output_truncated: bool = False
+    subscribers: list[queue.Queue[dict[str, Any]]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.history = deque(maxlen=max(1, self.history_limit))
 
 
 class CodeRunner:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        max_concurrent: int | None = None,
+        history_limit: int | None = None,
+        subscriber_queue_size: int | None = None,
+        max_output_bytes: int | None = None,
+    ) -> None:
         self._runs: dict[str, RunnerProcess] = {}
+        self._starting_names: set[str] = set()
         self._lock = threading.Lock()
+        self._shutting_down = False
+        self._owner_id = uuid.uuid4().hex
+        self._max_concurrent = min(
+            MAX_RUNNER_MAX_CONCURRENT,
+            max(1, int(max_concurrent if max_concurrent is not None else _runner_max_concurrent())),
+        )
+        self._history_limit = min(
+            MAX_RUNNER_HISTORY_LIMIT,
+            max(1, int(history_limit if history_limit is not None else _runner_history_limit())),
+        )
+        self._subscriber_queue_size = min(
+            MAX_RUNNER_SUBSCRIBER_QUEUE_SIZE,
+            max(
+                1,
+                int(
+                    subscriber_queue_size
+                    if subscriber_queue_size is not None
+                    else _runner_subscriber_queue_size()
+                ),
+            ),
+        )
+        self._max_output_bytes = min(
+            MAX_RUNNER_MAX_OUTPUT_BYTES,
+            max(1, int(max_output_bytes if max_output_bytes is not None else _runner_max_output_bytes())),
+        )
 
     def start(self, language: str, code: str) -> dict[str, Any]:
         resolved = resolve_language(language)
@@ -1309,66 +1530,113 @@ class CodeRunner:
             raise RuntimeError(f"Language '{language}' is not supported.")
         if resolved in CLIENT_LANGUAGES:
             raise RuntimeError("HTML is rendered in the client sandbox, not via Docker.")
+        code_bytes = len(code.encode("utf-8"))
+        if code_bytes > RUNNER_MAX_CODE_BYTES:
+            raise RuntimeError(
+                f"Code is too large to run ({code_bytes} bytes); "
+                f"the limit is {RUNNER_MAX_CODE_BYTES} bytes."
+            )
 
         binary = _docker_binary()
         if not binary:
             raise RuntimeError("Docker CLI was not found on PATH.")
 
         self._cleanup_finished_runs()
-        self._cleanup_stale_containers(binary)
-        _remove_legacy_python_gui_images(binary)
         plan = resolve_plan(resolved, code)
         run_id = uuid.uuid4().hex[:16]
         container_name = f"atlas-run-{run_id}"
-        work_dir = Path(tempfile.mkdtemp(prefix=f"atlas-run-{run_id}-"))
-        source_path = work_dir / plan.filename
-        source_path.write_text(code, encoding="utf-8")
+        configured_network = _configured_runner_network()
         network = _runner_network_policy(plan)
         timeout_seconds = _runner_timeout_seconds(plan)
+        storage_limit = _runner_storage_limit()
+        if storage_limit and not _runner_storage_limit_supported(binary):
+            raise RuntimeError(
+                f"{RUNNER_STORAGE_LIMIT_ENV} is configured, but this container engine "
+                "does not support the docker run --storage-opt flag."
+            )
+        outbound_network = _runner_outbound_network_enabled(network)
+        dependency_network_unmet = plan.requires_network and not outbound_network
+        restricted_rootfs = not plan.uses_apt and not plan.requires_network
+        self._reserve_start(container_name)
 
-        docker_args: list[str] = [
-            binary,
-            "run",
-            "--rm",
-            "-i",
-            "--name",
-            container_name,
-            "--memory",
-            "2g",
-            "--cpus",
-            "2",
-            "--pids-limit",
-            "512",
-            "--network",
-            network,
-            "--security-opt",
-            "no-new-privileges",
-            "--cap-drop",
-            "ALL",
-            "--label",
-            "atlas.runner=1",
-            "--label",
-            f"atlas.runner.run_id={run_id}",
-            "--label",
-            f"atlas.runner.owner_pid={os.getpid()}",
-            "-v",
-            f"{work_dir}:/work:ro",
-            "-w",
-            "/work",
-        ]
-        if plan.uses_apt:
-            for capability in ("CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"):
-                docker_args.extend(["--cap-add", capability])
-        for host_port, container_port in plan.ports.items():
-            docker_args.extend(["-p", f"127.0.0.1:{host_port}:{container_port}"])
-        docker_args.append(plan.image)
-        docker_args.extend(plan.command)
-
-        creation_flags = 0
-        if sys.platform == "win32":
-            creation_flags = 0x08000000  # CREATE_NO_WINDOW
-
+        work_dir: Path | None = None
+        process: subprocess.Popen | None = None
+        registered = False
         try:
+            self._cleanup_stale_containers(binary)
+            _remove_legacy_python_gui_images(binary)
+            if network == RUNNER_INTERNAL_NETWORK:
+                _ensure_internal_network(binary)
+
+            work_dir = Path(tempfile.mkdtemp(prefix=f"atlas-run-{run_id}-"))
+            source_path = work_dir / plan.filename
+            source_path.write_text(code, encoding="utf-8")
+            if restricted_rootfs and os.name != "nt":
+                # The non-root container user must be able to traverse the bind
+                # mount and read the known source file. Keep directory listing
+                # disabled so other local users cannot browse submitted code.
+                work_dir.chmod(0o711)
+                source_path.chmod(0o444)
+
+            docker_args: list[str] = [
+                binary,
+                "run",
+                "--rm",
+                "-i",
+                "--init",
+                "--name",
+                container_name,
+                "--memory",
+                "2g",
+                "--memory-swap",
+                "2g",
+                "--cpus",
+                "2",
+                "--pids-limit",
+                "512",
+                "--ulimit",
+                "nofile=1024:1024",
+                "--ulimit",
+                f"fsize={DEFAULT_RUNNER_MAX_FILE_BYTES}:{DEFAULT_RUNNER_MAX_FILE_BYTES}",
+                "--stop-timeout",
+                "5",
+                "--tmpfs",
+                f"/tmp:rw,exec,nosuid,nodev,size={DEFAULT_RUNNER_TMPFS_SIZE},mode=1777",
+                "--network",
+                network,
+                "--security-opt",
+                "no-new-privileges",
+                "--cap-drop",
+                "ALL",
+                "--label",
+                "atlas.runner=1",
+                "--label",
+                f"atlas.runner.run_id={run_id}",
+                "--label",
+                f"atlas.runner.owner_pid={os.getpid()}",
+                "--label",
+                f"atlas.runner.owner_id={self._owner_id}",
+                "-v",
+                f"{work_dir}:/work:ro",
+                "-w",
+                "/work",
+            ]
+            if storage_limit:
+                docker_args.extend(["--storage-opt", f"size={storage_limit}"])
+            if restricted_rootfs:
+                docker_args.extend(["--read-only", "--user", "65534:65534", "--env", "HOME=/tmp"])
+            if plan.uses_apt:
+                for capability in ("CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"):
+                    docker_args.extend(["--cap-add", capability])
+            for host_port, container_port in plan.ports.items():
+                docker_args.extend(["-p", f"127.0.0.1:{host_port}:{container_port}"])
+            docker_args.append(plan.image)
+            docker_args.extend(plan.command)
+
+            creation_flags = 0
+            if sys.platform == "win32":
+                creation_flags = 0x08000000  # CREATE_NO_WINDOW
+
             process = subprocess.Popen(
                 docker_args,
                 stdout=subprocess.PIPE,
@@ -1380,59 +1648,124 @@ class CodeRunner:
                 errors="replace",
                 creationflags=creation_flags if sys.platform == "win32" else 0,
             )
-        except OSError as exc:
-            shutil.rmtree(work_dir, ignore_errors=True)
-            raise RuntimeError(f"Failed to start Docker: {exc}") from exc
 
-        runner = RunnerProcess(
-            run_id=run_id,
-            language=resolved,
-            container_name=container_name,
-            work_dir=work_dir,
-            started_at=time.time(),
-            timeout_seconds=timeout_seconds,
-            network=network,
-            process=process,
-        )
-        with self._lock:
-            self._runs[run_id] = runner
-
-        threading.Thread(target=self._pump_stream, args=(runner, process.stdout, "stdout"), daemon=True).start()
-        threading.Thread(target=self._pump_stream, args=(runner, process.stderr, "stderr"), daemon=True).start()
-        threading.Thread(target=self._wait_for_exit, args=(runner,), daemon=True).start()
-        threading.Thread(target=self._enforce_timeout, args=(runner,), daemon=True).start()
-
-        response: dict[str, Any] = {
-            "run_id": run_id,
-            "language": resolved,
-            "container": container_name,
-            "network": network,
-            "timeout_seconds": timeout_seconds,
-        }
-        if plan.gui:
-            host_port = next(iter(plan.ports.keys()))
-            response["vnc_url"] = (
-                f"http://127.0.0.1:{host_port}/vnc.html?autoconnect=1&resize=remote&reconnect=1"
+            runner = RunnerProcess(
+                run_id=run_id,
+                language=resolved,
+                container_name=container_name,
+                work_dir=work_dir,
+                started_at=time.time(),
+                timeout_seconds=timeout_seconds,
+                network=network,
+                process=process,
+                history_limit=self._history_limit,
+                subscriber_queue_size=self._subscriber_queue_size,
+                max_output_bytes=self._max_output_bytes,
             )
-        if plan.web_container_port:
-            for host_port, container_port in plan.ports.items():
-                if container_port == plan.web_container_port:
-                    response["web_url"] = f"http://127.0.0.1:{host_port}/"
-                    break
-        return response
+            with self._lock:
+                if self._shutting_down:
+                    raise RuntimeError("The code runner is shutting down and cannot start a new run.")
+                self._runs[run_id] = runner
+                self._starting_names.discard(container_name)
+                registered = True
 
-    def subscribe(self, run_id: str) -> tuple[list[dict[str, Any]], queue.Queue, bool]:
+            if dependency_network_unmet:
+                self._emit(
+                    runner,
+                    {
+                        "type": "output",
+                        "stream": "stderr",
+                        "chunk": (
+                            "[atlas-runner] outbound network is disabled by "
+                            f"{RUNNER_NETWORK_ENV}=none; dependency installation may fail. "
+                            f"Set {RUNNER_NETWORK_ENV}=bridge to explicitly allow outbound access.\n"
+                        ),
+                    },
+                    enforce_output_limit=False,
+                )
+
+            stdout_thread = threading.Thread(
+                target=self._pump_stream,
+                args=(runner, process.stdout, "stdout"),
+                daemon=True,
+            )
+            stderr_thread = threading.Thread(
+                target=self._pump_stream,
+                args=(runner, process.stderr, "stderr"),
+                daemon=True,
+            )
+            stdout_thread.start()
+            stderr_thread.start()
+            threading.Thread(
+                target=self._wait_for_exit,
+                args=(runner, (stdout_thread, stderr_thread)),
+                daemon=True,
+            ).start()
+            threading.Thread(target=self._enforce_timeout, args=(runner,), daemon=True).start()
+
+            response: dict[str, Any] = {
+                "run_id": run_id,
+                "language": resolved,
+                "container": container_name,
+                "configured_network": configured_network,
+                "network": network,
+                "outbound_network": outbound_network,
+                "dependency_network_required": plan.requires_network,
+                "network_requirement_unmet": dependency_network_unmet,
+                "timeout_seconds": timeout_seconds,
+                "filesystem_mode": "read-only" if restricted_rootfs else "writable",
+            }
+            if storage_limit:
+                response["storage_limit"] = storage_limit
+            if dependency_network_unmet:
+                response["network_warning"] = (
+                    f"Dependencies may require outbound access; explicitly set "
+                    f"{RUNNER_NETWORK_ENV}=bridge to allow it."
+                )
+            if plan.gui:
+                host_port = next(iter(plan.ports.keys()))
+                response["vnc_url"] = (
+                    f"http://127.0.0.1:{host_port}/vnc.html?autoconnect=1&resize=remote&reconnect=1"
+                )
+            if plan.web_container_port:
+                for host_port, container_port in plan.ports.items():
+                    if container_port == plan.web_container_port:
+                        response["web_url"] = f"http://127.0.0.1:{host_port}/"
+                        break
+            return response
+        except OSError as exc:
+            raise RuntimeError(f"Failed to start Docker: {exc}") from exc
+        finally:
+            if not registered:
+                with self._lock:
+                    self._starting_names.discard(container_name)
+                if process is not None:
+                    self._remove_container_name(binary, container_name)
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+                if work_dir is not None:
+                    shutil.rmtree(work_dir, ignore_errors=True)
+
+    def subscribe(
+        self,
+        run_id: str,
+    ) -> tuple[list[dict[str, Any]], queue.Queue[dict[str, Any]], bool]:
         runner = self._require(run_id)
         with runner.lock:
             history = list(runner.history)
             if runner.finished:
-                return history, queue.Queue(), True
-            subscriber: queue.Queue = queue.Queue()
+                return history, queue.Queue(maxsize=runner.subscriber_queue_size), True
+            subscriber: queue.Queue[dict[str, Any]] = queue.Queue(
+                maxsize=runner.subscriber_queue_size
+            )
             runner.subscribers.append(subscriber)
             return history, subscriber, False
 
-    def unsubscribe(self, run_id: str, subscriber: queue.Queue) -> None:
-        runner = self._runs.get(run_id)
+    def unsubscribe(self, run_id: str, subscriber: queue.Queue[dict[str, Any]]) -> None:
+        with self._lock:
+            runner = self._runs.get(run_id)
         if not runner:
             return
         with runner.lock:
@@ -1440,7 +1773,8 @@ class CodeRunner:
                 runner.subscribers.remove(subscriber)
 
     def stop(self, run_id: str) -> dict[str, Any]:
-        runner = self._runs.get(run_id)
+        with self._lock:
+            runner = self._runs.get(run_id)
         if not runner:
             return {"run_id": run_id, "status": "unknown"}
         self._kill_container(runner)
@@ -1451,35 +1785,127 @@ class CodeRunner:
         return {"run_id": run_id, "status": "stopping"}
 
     def _require(self, run_id: str) -> RunnerProcess:
-        runner = self._runs.get(run_id)
+        with self._lock:
+            runner = self._runs.get(run_id)
         if not runner:
             raise RuntimeError(f"Runner '{run_id}' is not known.")
         return runner
 
-    def _emit(self, runner: RunnerProcess, event: dict[str, Any]) -> None:
+    def _reserve_start(self, container_name: str) -> None:
+        with self._lock:
+            if self._shutting_down:
+                raise RuntimeError("The code runner is shutting down and cannot start a new run.")
+            active_count = len(self._starting_names) + sum(
+                1 for runner in self._runs.values() if not runner.finished
+            )
+            if active_count >= self._max_concurrent:
+                raise RuntimeError(
+                    f"Runner concurrency limit reached ({self._max_concurrent} active runs). "
+                    "Stop or wait for a run to finish before starting another."
+                )
+            self._starting_names.add(container_name)
+
+    def _emit(
+        self,
+        runner: RunnerProcess,
+        event: dict[str, Any],
+        *,
+        enforce_output_limit: bool = True,
+    ) -> None:
         with runner.lock:
-            runner.history.append(event)
+            events = self._bounded_events_locked(runner, event, enforce_output_limit)
+            for queued_event in events:
+                runner.history.append(queued_event)
             subscribers = list(runner.subscribers)
-        for subscriber in subscribers:
-            subscriber.put(event)
+        for queued_event in events:
+            for subscriber in subscribers:
+                put_bounded_queue(subscriber, queued_event)
+
+    @staticmethod
+    def _bounded_events_locked(
+        runner: RunnerProcess,
+        event: dict[str, Any],
+        enforce_output_limit: bool,
+    ) -> list[dict[str, Any]]:
+        if not enforce_output_limit or event.get("type") != "output":
+            return [event]
+
+        chunk = str(event.get("chunk", ""))
+        encoded = chunk.encode("utf-8")
+        remaining = max(0, runner.max_output_bytes - runner.output_bytes)
+        if len(encoded) <= remaining:
+            runner.output_bytes += len(encoded)
+            return [event]
+
+        bounded: list[dict[str, Any]] = []
+        if remaining:
+            partial = encoded[:remaining].decode("utf-8", errors="ignore")
+            runner.output_bytes += len(partial.encode("utf-8"))
+            if partial:
+                partial_event = dict(event)
+                partial_event["chunk"] = partial
+                bounded.append(partial_event)
+        if not runner.output_truncated:
+            runner.output_truncated = True
+            bounded.append(
+                {
+                    "type": "output",
+                    "stream": "stderr",
+                    "chunk": (
+                        f"[atlas-runner] output truncated after "
+                        f"{runner.max_output_bytes} bytes\n"
+                    ),
+                }
+            )
+        return bounded
 
     def _pump_stream(self, runner: RunnerProcess, stream: Iterable[str] | None, channel: str) -> None:
         if stream is None:
             return
         try:
-            for line in stream:
-                if line is None:
-                    break
-                self._emit(runner, {"type": "output", "stream": channel, "chunk": line})
+            readline = getattr(stream, "readline", None)
+            if callable(readline):
+                while True:
+                    chunk = readline(RUNNER_STREAM_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    self._emit(runner, {"type": "output", "stream": channel, "chunk": chunk})
+            else:
+                for chunk in stream:
+                    if chunk is None:
+                        break
+                    self._emit(runner, {"type": "output", "stream": channel, "chunk": chunk})
         except Exception as exc:  # pragma: no cover - defensive
-            self._emit(runner, {"type": "output", "stream": "stderr", "chunk": f"[atlas-runner] stream error: {exc}\n"})
+            self._emit(
+                runner,
+                {
+                    "type": "output",
+                    "stream": "stderr",
+                    "chunk": f"[atlas-runner] stream error: {exc}\n",
+                },
+                enforce_output_limit=False,
+            )
 
-    def _wait_for_exit(self, runner: RunnerProcess) -> None:
+    def _wait_for_exit(
+        self,
+        runner: RunnerProcess,
+        stream_threads: tuple[threading.Thread, ...] = (),
+    ) -> None:
         try:
             exit_code = runner.process.wait()
         except Exception as exc:  # pragma: no cover - defensive
             exit_code = -1
-            self._emit(runner, {"type": "output", "stream": "stderr", "chunk": f"[atlas-runner] wait error: {exc}\n"})
+            self._emit(
+                runner,
+                {
+                    "type": "output",
+                    "stream": "stderr",
+                    "chunk": f"[atlas-runner] wait error: {exc}\n",
+                },
+                enforce_output_limit=False,
+            )
+        for stream_thread in stream_threads:
+            stream_thread.join(timeout=1)
         duration_ms = int((time.time() - runner.started_at) * 1000)
         event = {
             "type": "exit",
@@ -1493,7 +1919,7 @@ class CodeRunner:
             subscribers = list(runner.subscribers)
             runner.subscribers.clear()
         for subscriber in subscribers:
-            subscriber.put(event)
+            put_bounded_queue(subscriber, event)
         shutil.rmtree(runner.work_dir, ignore_errors=True)
 
     def _enforce_timeout(self, runner: RunnerProcess) -> None:
@@ -1513,6 +1939,7 @@ class CodeRunner:
                 "stream": "stderr",
                 "chunk": f"[atlas-runner] stopped after {runner.timeout_seconds}s timeout\n",
             },
+            enforce_output_limit=False,
         )
         self._kill_container(runner)
         try:
@@ -1524,9 +1951,13 @@ class CodeRunner:
         binary = _docker_binary()
         if not binary:
             return
+        self._remove_container_name(binary, runner.container_name)
+
+    @staticmethod
+    def _remove_container_name(binary: str, container_name: str) -> None:
         try:
             subprocess.run(
-                [binary, "kill", runner.container_name],
+                [binary, "rm", "-f", container_name],
                 capture_output=True,
                 timeout=10,
                 check=False,
@@ -1540,9 +1971,18 @@ class CodeRunner:
             for run_id in finished:
                 self._runs.pop(run_id, None)
 
-    def _cleanup_stale_containers(self, binary: str) -> None:
+    def _cleanup_stale_containers(self, binary: str, *, preserve_active: bool = True) -> None:
         with self._lock:
-            active_names = {runner.container_name for runner in self._runs.values() if not runner.finished}
+            active_names = (
+                {
+                    runner.container_name
+                    for runner in self._runs.values()
+                    if not runner.finished
+                }
+                | set(self._starting_names)
+                if preserve_active
+                else set()
+            )
         try:
             completed = subprocess.run(
                 [
@@ -1569,15 +2009,85 @@ class CodeRunner:
             if line.strip() and line.strip() not in active_names
         ]
         for name in stale_names:
-            try:
-                subprocess.run(
-                    [binary, "rm", "-f", name],
-                    capture_output=True,
-                    timeout=10,
-                    check=False,
-                )
-            except (OSError, subprocess.TimeoutExpired):
+            labels = self._container_labels(binary, name)
+            if labels is None:
                 continue
+            owner_id = labels.get("atlas.runner.owner_id", "").strip()
+            owner_pid_raw = labels.get("atlas.runner.owner_pid", "").strip()
+            try:
+                owner_pid = int(owner_pid_raw)
+            except ValueError:
+                owner_pid = None
+
+            owned_by_this_runner = owner_id == self._owner_id
+            legacy_owned_by_this_process = not owner_id and owner_pid == os.getpid()
+            stale_owner = owner_pid is None or not _process_is_alive(owner_pid)
+            if owned_by_this_runner or legacy_owned_by_this_process or stale_owner:
+                self._remove_container_name(binary, name)
+
+    @staticmethod
+    def _container_labels(binary: str, container_name: str) -> dict[str, str] | None:
+        try:
+            completed = subprocess.run(
+                [
+                    binary,
+                    "inspect",
+                    "--format",
+                    "{{json .Config.Labels}}",
+                    container_name,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if completed.returncode != 0:
+            return None
+        try:
+            labels = json.loads(completed.stdout.strip() or "{}")
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(labels, dict):
+            return None
+        return {
+            str(key): str(value)
+            for key, value in labels.items()
+            if isinstance(key, str) and value is not None
+        }
+
+    def shutdown(self) -> None:
+        with self._lock:
+            if self._shutting_down:
+                return
+            self._shutting_down = True
+            runners = list(self._runs.values())
+            self._runs.clear()
+
+        binary = _docker_binary()
+        for runner in runners:
+            self._emit(
+                runner,
+                {
+                    "type": "output",
+                    "stream": "stderr",
+                    "chunk": "[atlas-runner] shutting down\n",
+                },
+                enforce_output_limit=False,
+            )
+            if binary:
+                self._remove_container_name(binary, runner.container_name)
+            try:
+                runner.process.kill()
+            except OSError:
+                pass
+            shutil.rmtree(runner.work_dir, ignore_errors=True)
+
+        if binary:
+            self._cleanup_stale_containers(binary, preserve_active=False)
+
+    close = shutdown
 
 
 _runner_singleton: CodeRunner | None = None
@@ -1590,3 +2100,17 @@ def get_runner() -> CodeRunner:
         if _runner_singleton is None:
             _runner_singleton = CodeRunner()
         return _runner_singleton
+
+
+def shutdown_runner() -> None:
+    with _runner_lock:
+        runner = _runner_singleton
+    if runner is not None:
+        runner.shutdown()
+
+
+def _shutdown_runner_at_exit() -> None:
+    shutdown_runner()
+
+
+atexit.register(_shutdown_runner_at_exit)

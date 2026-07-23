@@ -16,6 +16,7 @@ from typing import Any
 from .config import AppConfig
 from .run_contract import RunEvent, RunTraceItem, make_run_event, make_trace_item, now_timestamp
 from .security import open_application_sqlite, protect_bytes, unprotect_bytes
+from .session import scoped_thread_id
 
 ACTIVE_RUN_STATUSES = {"queued", "running", "cancelling"}
 PASSWORDLESS_PROTECTION = "passwordless"
@@ -27,6 +28,8 @@ _PASSWORD_KEY_LENGTH = 32
 _INDEX_FORMAT = "atlas-dpapi-index-v1"
 _RUN_FORMAT = "atlas-dpapi-run-v1"
 _SEARCH_INDEX_LIMIT = 500
+_TOKEN_EVENT_BATCH_SIZE = 24
+_TOKEN_EVENT_FLUSH_SECONDS = 0.2
 
 
 class RunStore:
@@ -36,8 +39,10 @@ class RunStore:
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         self._index_path = self.runs_dir / "index.json"
         self._search_index_path = self.runs_dir / "search.sqlite"
-        self._lock = threading.Lock()
-        self._user_keys: dict[str, bytes] = {}
+        self._lock = threading.RLock()
+        self._user_keys: dict[str, bytearray] = {}
+        self._pending_run_events: dict[str, list[RunEvent]] = {}
+        self._pending_run_started_at: dict[str, float] = {}
         if not self._index_path.exists():
             self._write_index({"threads": {}, "runs": {}, "users": {}})
 
@@ -122,16 +127,25 @@ class RunStore:
     def append_event(self, run_id: str, event_type: str, payload: dict[str, Any]) -> RunEvent:
         event = make_run_event(event_type, payload)
         with self._lock:
-            artifact = self.get_run(run_id)
-            artifact["events"].append(event)
-            if event_type == "token":
-                artifact["answer"] = f"{artifact.get('answer', '')}{payload.get('text', '')}"
-            self._write_run_file(run_id, artifact)
+            if not (self.runs_dir / f"{run_id}.json").exists():
+                raise RuntimeError(f"Run not found: {run_id}")
+            pending = self._pending_run_events.setdefault(run_id, [])
+            pending.append(event)
+            self._pending_run_started_at.setdefault(run_id, time.monotonic())
+            should_flush = (
+                event_type != "token"
+                or len(pending) >= _TOKEN_EVENT_BATCH_SIZE
+                or time.monotonic() - self._pending_run_started_at[run_id]
+                >= _TOKEN_EVENT_FLUSH_SECONDS
+            )
+            if should_flush:
+                self._flush_pending_run_locked(run_id)
         return event
 
     def append_trace_item(self, run_id: str, item: dict[str, Any]) -> RunTraceItem:
         enriched = make_trace_item(item)
         with self._lock:
+            self._flush_pending_run_locked(run_id)
             artifact = self.get_run(run_id)
             artifact["trace_items"].append(enriched)
             self._write_run_file(run_id, artifact)
@@ -139,6 +153,7 @@ class RunStore:
 
     def complete_run(self, run_id: str, *, answer: str) -> dict[str, Any]:
         with self._lock:
+            self._flush_pending_run_locked(run_id)
             artifact = self.get_run(run_id)
             artifact["status"] = "completed"
             artifact["completed_at"] = now_timestamp()
@@ -155,6 +170,7 @@ class RunStore:
 
     def mark_run_running(self, run_id: str) -> dict[str, Any]:
         with self._lock:
+            self._flush_pending_run_locked(run_id)
             artifact = self.get_run(run_id)
             artifact["status"] = "running"
             self._write_run_file(run_id, artifact)
@@ -166,6 +182,7 @@ class RunStore:
 
     def mark_run_cancelling(self, run_id: str) -> dict[str, Any]:
         with self._lock:
+            self._flush_pending_run_locked(run_id)
             artifact = self.get_run(run_id)
             if artifact.get("status") not in {"completed", "failed"}:
                 artifact["status"] = "cancelling"
@@ -178,6 +195,7 @@ class RunStore:
 
     def fail_run(self, run_id: str, *, error: str) -> dict[str, Any]:
         with self._lock:
+            self._flush_pending_run_locked(run_id)
             artifact = self.get_run(run_id)
             artifact["status"] = "failed"
             artifact["completed_at"] = now_timestamp()
@@ -235,11 +253,44 @@ class RunStore:
         return recovered
 
     def get_run(self, run_id: str) -> dict[str, Any]:
+        with self._lock:
+            artifact = self._read_run_file(run_id)
+            return self._merge_pending_events(run_id, artifact)
+
+    def flush_pending_events(self) -> None:
+        with self._lock:
+            for run_id in list(self._pending_run_events):
+                self._flush_pending_run_locked(run_id)
+
+    def _read_run_file(self, run_id: str) -> dict[str, Any]:
         path = self.runs_dir / f"{run_id}.json"
         if not path.exists():
             raise RuntimeError(f"Run not found: {run_id}")
         payload = _read_json_with_retry(path)
         return self._decode_run_payload(payload)
+
+    def _merge_pending_events(
+        self,
+        run_id: str,
+        artifact: dict[str, Any],
+    ) -> dict[str, Any]:
+        pending = list(self._pending_run_events.get(run_id, []))
+        if not pending:
+            return artifact
+        artifact.setdefault("events", []).extend(pending)
+        for event in pending:
+            if event.get("type") == "token":
+                payload = event.get("payload", {})
+                artifact["answer"] = (
+                    f"{artifact.get('answer', '')}{payload.get('text', '')}"
+                )
+        return artifact
+
+    def _flush_pending_run_locked(self, run_id: str) -> None:
+        if not self._pending_run_events.get(run_id):
+            return
+        artifact = self._merge_pending_events(run_id, self._read_run_file(run_id))
+        self._write_run_file(run_id, artifact)
 
     def list_threads(self, *, user_id: str | None = None) -> list[dict[str, Any]]:
         index = self._read_index()
@@ -324,6 +375,7 @@ class RunStore:
         user = self.get_user(user_id)
         if not user:
             raise RuntimeError(f"User not found: {user_id}")
+        self._discard_user_key(user_id)
         if user.get("protection") == PASSWORD_PROTECTED:
             resolved_password = (password or "").strip()
             if not resolved_password:
@@ -338,10 +390,13 @@ class RunStore:
             key = unprotect_bytes(
                 base64.b64decode(str(user.get("wrapped_profile_key", "") or "").encode("ascii")),
             )
-        self._user_keys[user_id] = key
+        self._user_keys[user_id] = bytearray(key)
 
     def lock_user_key(self, user_id: str) -> None:
-        self._user_keys.pop(user_id, None)
+        self._discard_user_key(user_id)
+
+    def lock_all_user_keys(self) -> None:
+        self._discard_all_user_keys()
 
     def is_user_key_unlocked(self, user_id: str) -> bool:
         user = self.get_user(user_id)
@@ -465,6 +520,7 @@ class RunStore:
                 index["threads"].pop(key, None)
             for run_id in run_ids:
                 index["runs"].pop(run_id, None)
+                self._discard_pending_run(run_id)
                 path = self.runs_dir / f"{run_id}.json"
                 if path.exists():
                     path.unlink()
@@ -485,15 +541,18 @@ class RunStore:
             index.get("users", {}).pop(user_id, None)
             for run_id in run_ids:
                 index["runs"].pop(run_id, None)
+                self._discard_pending_run(run_id)
                 path = self.runs_dir / f"{run_id}.json"
                 if path.exists():
                     path.unlink()
-            self._user_keys.pop(user_id, None)
+            self._discard_user_key(user_id)
             self._write_index(index)
             self._delete_search_entries(user_id=user_id)
 
     def reset_all(self) -> None:
         with self._lock:
+            self._pending_run_events.clear()
+            self._pending_run_started_at.clear()
             for item in self.runs_dir.iterdir():
                 if item.name == "index.json":
                     continue
@@ -501,7 +560,7 @@ class RunStore:
                     shutil.rmtree(item, ignore_errors=True)
                 else:
                     item.unlink(missing_ok=True)
-            self._user_keys.clear()
+            self._discard_all_user_keys()
             self._write_index({"threads": {}, "runs": {}, "users": {}})
             self._delete_search_index()
 
@@ -567,7 +626,7 @@ class RunStore:
                 if role not in {"user", "assistant"} or not content:
                     continue
                 entry = {
-                    "entry_key": f"thread:{user_id}:{thread_id}:{index}",
+                    "entry_key": f"thread:{scoped_thread_id(user_id, thread_id)}:{index}",
                     "user_id": user_id,
                     "thread_id": thread_id,
                     "run_id": "",
@@ -856,6 +915,15 @@ class RunStore:
         payload.setdefault("threads", {})
         payload.setdefault("runs", {})
         payload.setdefault("users", {})
+        migrated_threads: dict[str, dict[str, Any]] = {}
+        for legacy_key, item in payload["threads"].items():
+            user_id = str(item.get("user_id", "") or "")
+            thread_id = str(item.get("thread_id", "") or "")
+            if not user_id or not thread_id:
+                migrated_threads[str(legacy_key)] = item
+                continue
+            migrated_threads[self._thread_key(user_id, thread_id)] = item
+        payload["threads"] = migrated_threads
         for item in payload["threads"].values():
             item.setdefault("title", item.get("thread_id", ""))
             item.setdefault("temperature", self.config.chat_temperature)
@@ -901,6 +969,7 @@ class RunStore:
         user_id = str(payload.get("user_id", "") or "").strip()
         if not user_id:
             _atomic_write_json(path, payload)
+            self._discard_pending_run(run_id)
             return
         key = self._require_user_key(user_id)
         encrypted = protect_bytes(json.dumps(payload, ensure_ascii=False).encode("utf-8"), entropy=key)
@@ -912,10 +981,15 @@ class RunStore:
                 "payload": base64.b64encode(encrypted).decode("ascii"),
             },
         )
+        self._discard_pending_run(run_id)
+
+    def _discard_pending_run(self, run_id: str) -> None:
+        self._pending_run_events.pop(run_id, None)
+        self._pending_run_started_at.pop(run_id, None)
 
     @staticmethod
     def _thread_key(user_id: str, thread_id: str) -> str:
-        return f"{user_id}::{thread_id}"
+        return scoped_thread_id(user_id, thread_id)
 
     def _build_user_record(
         self,
@@ -970,12 +1044,13 @@ class RunStore:
             key = unprotect_bytes(
                 base64.b64decode(str(user.get("wrapped_profile_key", "") or "").encode("ascii")),
             )
-        self._user_keys[user_id] = key
+        self._discard_user_key(user_id)
+        self._user_keys[user_id] = bytearray(key)
 
     def _require_user_key(self, user_id: str) -> bytes:
         cached = self._user_keys.get(user_id)
         if cached is not None:
-            return cached
+            return bytes(cached)
         user = self.get_user(user_id)
         if not user:
             raise RuntimeError(f"User not found: {user_id}")
@@ -985,7 +1060,18 @@ class RunStore:
         cached = self._user_keys.get(user_id)
         if cached is None:
             raise RuntimeError(f"Profile key is not available for user: {user_id}")
-        return cached
+        return bytes(cached)
+
+    def _discard_user_key(self, user_id: str) -> None:
+        cached = self._user_keys.pop(user_id, None)
+        if cached is None:
+            return
+        for index in range(len(cached)):
+            cached[index] = 0
+
+    def _discard_all_user_keys(self) -> None:
+        for user_id in list(self._user_keys):
+            self._discard_user_key(user_id)
 
     def _decode_run_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         if payload.get("format") != _RUN_FORMAT:
