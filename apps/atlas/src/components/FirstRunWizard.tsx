@@ -1,12 +1,37 @@
-import { useState } from "react";
+import * as Dialog from "@radix-ui/react-dialog";
 import { useMutation } from "@tanstack/react-query";
+import { ArrowRight, Check, ExternalLink, Terminal, X } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { Check, ExternalLink, Terminal } from "lucide-react";
 
 import { createUser, openExternalUrl } from "../lib/api";
 import { detectDesktopPlatform, ollamaInstallCopy, platformShellName } from "../lib/platformCopy";
 
-type StepState = "active" | "pending" | "done";
+export type FirstRunStage = "profile" | "provider" | "model" | "ready";
+
+export function resolveFirstRunStage(
+  profileCreated: boolean,
+  providerOnline: boolean,
+  hasLocalModels: boolean,
+): FirstRunStage {
+  if (!profileCreated) {
+    return "profile";
+  }
+  if (!providerOnline) {
+    return "provider";
+  }
+  if (!hasLocalModels) {
+    return "model";
+  }
+  return "ready";
+}
+
+const setupSteps: Array<{ id: FirstRunStage; label: string }> = [
+  { id: "profile", label: "Profile" },
+  { id: "provider", label: "Provider" },
+  { id: "model", label: "Model" },
+  { id: "ready", label: "First prompt" },
+];
 
 export function FirstRunWizard({
   ollamaOnline,
@@ -30,6 +55,8 @@ export function FirstRunWizard({
   const [profileName, setProfileName] = useState("");
   const [profileError, setProfileError] = useState<string | null>(null);
   const [profileCreated, setProfileCreated] = useState(false);
+  const profileInputRef = useRef<HTMLInputElement | null>(null);
+  const stageHeadingRef = useRef<HTMLHeadingElement | null>(null);
   const navigate = useNavigate();
 
   const createMutation = useMutation({
@@ -44,191 +71,266 @@ export function FirstRunWizard({
     },
   });
 
-  const step1: StepState = profileCreated ? "done" : "active";
-  const step2: StepState = !profileCreated ? "pending" : ollamaOnline ? "done" : "active";
-  const step3: StepState = !profileCreated || !ollamaOnline ? "pending" : hasLocalModels ? "done" : "active";
-
-  const allDone = profileCreated && ollamaOnline && hasLocalModels;
+  const stage = resolveFirstRunStage(profileCreated, ollamaOnline, hasLocalModels);
+  const activeStepIndex = setupSteps.findIndex((step) => step.id === stage);
   const resolvedEmbedModel = embedModel?.trim() || "nomic-embed-text:latest";
   const starterChatModel = "gpt-oss:20b";
   const platform = detectDesktopPlatform();
   const shellName = platformShellName(platform);
   const installCopy = ollamaInstallCopy(platform);
 
-  return (
-    <div className="wizard-overlay" role="dialog" aria-modal="true" aria-labelledby="wizard-title">
-      <div className="wizard-card">
-        <div className="wizard-header">
-          <h2 id="wizard-title">Welcome to Atlas Chat</h2>
-          <p>Three quick steps and you're chatting with a local model.</p>
-        </div>
+  useEffect(() => {
+    if (stage === "profile") {
+      return;
+    }
+    const frame = window.requestAnimationFrame(() => stageHeadingRef.current?.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, [stage]);
 
-        <div className={`wizard-step ${step1}`}>
-          <div className="wizard-step-head">
-            <span className="wizard-step-num">{step1 === "done" ? <Check size={14} /> : "1"}</span>
-            <h3>Create a profile</h3>
+  const dismiss = () => {
+    onDismiss();
+  };
+
+  return (
+    <Dialog.Root
+      onOpenChange={(open) => {
+        if (!open) {
+          dismiss();
+        }
+      }}
+      open
+    >
+      <Dialog.Portal>
+        <Dialog.Overlay className="wizard-overlay" />
+        <Dialog.Content
+          className="wizard-card"
+          onOpenAutoFocus={(event) => {
+            if (profileInputRef.current) {
+              event.preventDefault();
+              profileInputRef.current.focus();
+            }
+          }}
+        >
+          <div className="wizard-header">
+            <div>
+              <p className="workspace-section-label">Local setup</p>
+              <Dialog.Title>Welcome to Atlas Chat</Dialog.Title>
+              <Dialog.Description>
+                Create a local profile, connect a provider, and choose a model.
+              </Dialog.Description>
+            </div>
+            <Dialog.Close asChild>
+              <button aria-label="Skip setup" className="ghost-button icon-button wizard-close" type="button">
+                <X size={16} />
+              </button>
+            </Dialog.Close>
           </div>
-          <div className="wizard-step-body">
-            <span>Profiles separate your chats and memories. You can have several.</span>
-            {!profileCreated ? (
-              <div className="wizard-form">
-                <input
-                  aria-label="Profile name"
-                  className="text-input"
-                  onChange={(event) => setProfileName(event.currentTarget.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" && profileName.trim() && !createMutation.isPending) {
+
+          <ol aria-label="Setup progress" className="wizard-progress">
+            {setupSteps.map((step, index) => {
+              const done = index < activeStepIndex || stage === "ready";
+              const active = step.id === stage;
+              return (
+                <li aria-current={active ? "step" : undefined} className={active ? "active" : done ? "done" : ""} key={step.id}>
+                  <span className="wizard-step-num" aria-hidden="true">
+                    {done ? <Check size={13} /> : index + 1}
+                  </span>
+                  <span>{step.label}</span>
+                </li>
+              );
+            })}
+          </ol>
+
+          <div aria-live="polite" className="wizard-stage">
+            {stage === "profile" ? (
+              <>
+                <div className="wizard-stage-copy">
+                  <span className="wizard-stage-kicker">Step 1</span>
+                  <h3 ref={stageHeadingRef} tabIndex={-1}>Create your profile</h3>
+                  <p>Profiles keep chats, search, and memory separate on this device.</p>
+                </div>
+                <form
+                  className="wizard-form wizard-profile-form"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    if (profileName.trim() && !createMutation.isPending) {
                       createMutation.mutate();
                     }
                   }}
-                  placeholder="my_profile"
-                  value={profileName}
-                />
-                <button
-                  className="primary-button compact-button"
-                  disabled={!profileName.trim() || createMutation.isPending}
-                  onClick={() => createMutation.mutate()}
-                  type="button"
                 >
-                  {createMutation.isPending ? "Creating..." : "Create"}
-                </button>
-              </div>
-            ) : (
-              <span style={{ color: "var(--success)" }}>Profile "{profileName.trim()}" created.</span>
-            )}
-            {profileError ? <span style={{ color: "var(--danger)" }}>{profileError}</span> : null}
-          </div>
-        </div>
+                  <label htmlFor="first-run-profile">Profile name</label>
+                  <div className="wizard-field-row">
+                    <input
+                      autoComplete="username"
+                      className="text-input"
+                      id="first-run-profile"
+                      onChange={(event) => setProfileName(event.currentTarget.value)}
+                      placeholder="my_profile"
+                      ref={profileInputRef}
+                      value={profileName}
+                    />
+                    <button
+                      className="primary-button compact-button"
+                      disabled={!profileName.trim() || createMutation.isPending}
+                      type="submit"
+                    >
+                      {createMutation.isPending ? "Creating…" : "Continue"}
+                      {!createMutation.isPending ? <ArrowRight size={14} /> : null}
+                    </button>
+                  </div>
+                </form>
+                {profileError ? (
+                  <p className="wizard-inline-message error" role="alert">
+                    {profileError}
+                  </p>
+                ) : null}
+              </>
+            ) : null}
 
-        <div className={`wizard-step ${step2}`}>
-          <div className="wizard-step-head">
-            <span className="wizard-step-num">{step2 === "done" ? <Check size={14} /> : "2"}</span>
-            <h3>Connect {providerLabel}</h3>
-          </div>
-          <div className="wizard-step-body">
-            <span>
-              Atlas Chat uses {providerLabel} as the local runtime for chat models on this machine.{" "}
-              <strong style={{ color: ollamaOnline ? "var(--success)" : "var(--danger)" }}>
-                {ollamaOnline ? "Connected" : "Not running"}
-              </strong>
-            </span>
-            {!ollamaOnline ? (
-              <div className="wizard-form">
-                {isOllamaProvider ? (
-                  <a
-                    className="ghost-button compact-button"
-                    href="https://ollama.com/download"
-                    onClick={(event) => {
-                      event.preventDefault();
-                      void openExternalUrl("https://ollama.com/download");
+            {stage === "provider" ? (
+              <>
+                <div className="wizard-stage-copy">
+                  <span className="wizard-stage-kicker">Step 2</span>
+                  <h3 ref={stageHeadingRef} tabIndex={-1}>Connect {providerLabel}</h3>
+                  <p>
+                    Atlas is ready. Start the local provider at <strong>{providerBaseUrl}</strong>; this screen updates automatically.
+                  </p>
+                </div>
+                <div className="wizard-primary-action">
+                  {isOllamaProvider ? (
+                    <a
+                      className="primary-button"
+                      href="https://ollama.com/download"
+                      onClick={(event) => {
+                        event.preventDefault();
+                        void openExternalUrl("https://ollama.com/download");
+                      }}
+                      rel="noreferrer"
+                      target="_blank"
+                    >
+                      Download Ollama
+                      <ExternalLink size={14} />
+                    </a>
+                  ) : (
+                    <span className="status-pill warning">
+                      <span className="status-dot" />
+                      Waiting for {providerLabel}
+                    </span>
+                  )}
+                </div>
+                <ManualSetup
+                  embedModel={resolvedEmbedModel}
+                  installCopy={installCopy}
+                  isOllamaProvider={isOllamaProvider}
+                  providerLabel={providerLabel}
+                  shellName={shellName}
+                  starterChatModel={starterChatModel}
+                />
+              </>
+            ) : null}
+
+            {stage === "model" ? (
+              <>
+                <div className="wizard-stage-copy">
+                  <span className="wizard-stage-kicker">Step 3</span>
+                  <h3 ref={stageHeadingRef} tabIndex={-1}>Add your first model</h3>
+                  <p>Discovery recommends models for this machine and keeps the next action in one place.</p>
+                </div>
+                <div className="wizard-primary-action">
+                  <button
+                    className="primary-button"
+                    onClick={() => {
+                      navigate("/discovery");
+                      dismiss();
                     }}
-                    rel="noreferrer"
-                    target="_blank"
+                    type="button"
                   >
-                    <ExternalLink size={14} />
-                    Download Ollama
-                  </a>
-                ) : (
-                  <span style={{ color: "var(--muted)", fontSize: "var(--text-sm)" }}>
-                    Start the local API at {providerBaseUrl}.
-                  </span>
-                )}
+                    Open Discovery
+                    <ArrowRight size={14} />
+                  </button>
+                </div>
+                <ManualSetup
+                  embedModel={resolvedEmbedModel}
+                  installCopy={installCopy}
+                  isOllamaProvider={isOllamaProvider}
+                  providerLabel={providerLabel}
+                  shellName={shellName}
+                  starterChatModel={starterChatModel}
+                />
+              </>
+            ) : null}
+
+            {stage === "ready" ? (
+              <div className="wizard-ready">
+                <span className="wizard-ready-mark" aria-hidden="true">
+                  <Check size={20} />
+                </span>
+                <div className="wizard-stage-copy">
+                  <span className="wizard-stage-kicker">Setup complete</span>
+                  <h3 ref={stageHeadingRef} tabIndex={-1}>Your local workspace is ready</h3>
+                  <p>Start with a question, a draft, or a file you want to understand.</p>
+                </div>
+                <Dialog.Close asChild>
+                  <button className="primary-button" type="button">
+                    Write your first prompt
+                    <ArrowRight size={14} />
+                  </button>
+                </Dialog.Close>
               </div>
             ) : null}
           </div>
-        </div>
 
-        <div className={`wizard-step ${step3}`}>
-          <div className="wizard-step-head">
-            <span className="wizard-step-num">{step3 === "done" ? <Check size={14} /> : "3"}</span>
-            <h3>Install a model</h3>
-          </div>
-          <div className="wizard-step-body">
-            <span>Download at least one chat model. Discovery can recommend one that fits this computer.</span>
-            <div className="wizard-form">
-              <button
-                className="primary-button compact-button"
-                disabled={!profileCreated || !ollamaOnline}
-                onClick={() => {
-                  navigate("/discovery");
-                  onDismiss();
-                }}
-                type="button"
-              >
-                Open Discovery
+          <div className="wizard-footer">
+            <Dialog.Close asChild>
+              <button className="ghost-button compact-button" type="button">
+                Skip for now
               </button>
-            </div>
-          </div>
-        </div>
-
-        <section className="wizard-help-panel" aria-labelledby="wizard-help-title">
-          <div className="wizard-help-heading">
-            <Terminal size={16} />
-            <div>
-              <h3 id="wizard-help-title">New to local AI?</h3>
-              <p>Connect a local provider first, then make at least one chat model available.</p>
-            </div>
-          </div>
-          <div className="wizard-help-steps">
-            <div>
-              <strong>1. Connect {providerLabel}</strong>
-              <p>{isOllamaProvider ? installCopy : `Start ${providerLabel} and expose its OpenAI-compatible local API at ${providerBaseUrl}.`}</p>
-              {isOllamaProvider ? (
-                <a
-                  className="source-link wizard-help-link"
-                  href="https://ollama.com/download"
-                  onClick={(event) => {
-                    event.preventDefault();
-                    void openExternalUrl("https://ollama.com/download");
-                  }}
-                  rel="noreferrer"
-                  target="_blank"
-                >
-                  Open Ollama download
-                  <ExternalLink size={13} />
-                </a>
-              ) : null}
-            </div>
-            <div>
-              <strong>2. Pull a chat model</strong>
-              <p>
-                {isOllamaProvider
-                  ? `Open ${shellName} and run this example command. You can choose a different model later.`
-                  : `Load or install a chat model inside ${providerLabel}.`}
-              </p>
-              <code>{isOllamaProvider ? `ollama pull ${starterChatModel}` : "Use your provider's local model manager"}</code>
-            </div>
-            <div>
-              <strong>3. Pull the memory model</strong>
-              <p>This embedding model lets Atlas Chat support local memory and retrieval features.</p>
-              <code>{isOllamaProvider ? `ollama pull ${resolvedEmbedModel}` : resolvedEmbedModel}</code>
-            </div>
-            <div>
-              <strong>4. Return to Atlas</strong>
-              <p>When downloads finish, open Discovery or refresh the model list. Installed models appear automatically.</p>
-            </div>
-          </div>
-        </section>
-
-        <div className="wizard-footer">
-          <button className="ghost-button compact-button" onClick={onDismiss} type="button">
-            Skip for now
-          </button>
-          {allDone ? (
-            <button
-              className="primary-button compact-button"
-              onClick={onDismiss}
-              type="button"
-            >
-              Start chatting
-            </button>
-          ) : (
-            <span style={{ color: "var(--muted)", fontSize: "var(--text-sm)" }}>
-              Complete the steps above to begin.
+            </Dialog.Close>
+            <span aria-live="polite">
+              {stage === "ready" ? "Ready to chat" : `Step ${activeStepIndex + 1} of ${setupSteps.length}`}
             </span>
-          )}
-        </div>
+          </div>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
+  );
+}
+
+function ManualSetup({
+  embedModel,
+  installCopy,
+  isOllamaProvider,
+  providerLabel,
+  shellName,
+  starterChatModel,
+}: {
+  embedModel: string;
+  installCopy: string;
+  isOllamaProvider: boolean;
+  providerLabel: string;
+  shellName: string;
+  starterChatModel: string;
+}) {
+  return (
+    <details className="wizard-manual">
+      <summary>
+        <Terminal size={15} />
+        Manual setup
+      </summary>
+      <div className="wizard-manual-body">
+        <p>
+          {isOllamaProvider
+            ? installCopy
+            : `Start ${providerLabel} and load a model with its local model manager.`}
+        </p>
+        {isOllamaProvider ? (
+          <>
+            <span>Run in {shellName}:</span>
+            <code>{`ollama pull ${starterChatModel}`}</code>
+            <code>{`ollama pull ${embedModel}`}</code>
+          </>
+        ) : null}
       </div>
-    </div>
+    </details>
   );
 }

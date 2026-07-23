@@ -1,6 +1,6 @@
 import * as ScrollArea from "@radix-ui/react-scroll-area";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Check, ChevronDown, ChevronLeft, ChevronRight, Copy, CornerUpLeft, Download, Edit3, ExternalLink, FileText, GitBranch, ImagePlus, Lightbulb, Lock, Plus, RotateCcw, Search, Send, Square, Terminal, X } from "lucide-react";
+import { ArrowRight, Check, ChevronDown, ChevronLeft, ChevronRight, Copy, CornerUpLeft, Download, Edit3, FileText, GitBranch, ImagePlus, Lightbulb, Lock, Plus, RotateCcw, Search, Send, Square, X } from "lucide-react";
 import {
   ChangeEvent,
   FormEvent,
@@ -33,6 +33,7 @@ import {
   getUsers,
   openExternalUrl,
   renameThread,
+  restartManagedBackend,
   startCompact,
   startChat,
   unloadOllamaModel,
@@ -46,7 +47,6 @@ import {
 import { useBackendPhase } from "../lib/backendPhase";
 import { buildChatMarkdownExport, chatExportFilename, downloadMarkdownFile } from "../lib/chatExport";
 import { buildContextMeter, type ContextMeter } from "../lib/contextMeter";
-import { detectDesktopPlatform, ollamaInstallCopy, platformShellName } from "../lib/platformCopy";
 import { PROFILE_SETTINGS_PATH } from "../lib/settingsSections";
 import { resolveStartupState } from "../lib/startupState";
 import { displayThreadTitle, editableThreadTitle, requestThreadTitle } from "../lib/threadTitles";
@@ -84,6 +84,7 @@ type StartPromptPayload = {
 
 type WorkspaceComposerHandle = {
   quoteMessage: (content: string) => void;
+  setPrompt: (content: string) => void;
 };
 
 type ConversationPresentationItem = {
@@ -114,6 +115,21 @@ type PendingModelSwitch = {
   clearDraft: () => void;
 };
 
+const STARTER_PROMPTS = [
+  {
+    label: "Condense rough notes",
+    prompt: "Turn these rough notes into a concise summary with decisions, open questions, and next actions:\n\n",
+  },
+  {
+    label: "Plan a project",
+    prompt: "Help me turn this idea into a practical project plan with milestones, risks, and the first three actions:\n\n",
+  },
+  {
+    label: "Explain code",
+    prompt: "Explain what this code does, identify likely failure points, and suggest the smallest useful improvements:\n\n",
+  },
+] as const;
+
 export function WorkspacePage() {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
@@ -137,6 +153,7 @@ export function WorkspacePage() {
   const activeRunUserId = useAtlasStore((state) => state.activeRunUserId);
   const activeRunThreadId = useAtlasStore((state) => state.activeRunThreadId);
   const backendStartupStartedAt = useAtlasStore((state) => state.backendStartupStartedAt);
+  const markBackendBooting = useAtlasStore((state) => state.markBackendBooting);
   const currentStage = useAtlasStore((state) => state.currentStage);
   const pendingPrompt = useAtlasStore((state) => state.pendingPrompt);
   const pendingAttachments = useAtlasStore((state) => state.pendingAttachments);
@@ -335,11 +352,6 @@ export function WorkspacePage() {
   }, [availableModels, draftThreadModel, lockedThreadModel, threadHasHistory]);
   const selectedModel = lockedThreadModel || preferredDraftModel;
   const selectedTemperature = lockedThreadTemperature !== undefined ? lockedThreadTemperature : draftThreadTemperature;
-  const starterChatModel = "gpt-oss:20b";
-  const resolvedEmbedModel = status?.embed_model?.trim() || "nomic-embed-text:latest";
-  const desktopPlatform = detectDesktopPlatform();
-  const platformShell = platformShellName(desktopPlatform);
-  const platformOllamaInstallCopy = ollamaInstallCopy(desktopPlatform);
   const selectedModelDetails = useMemo(
     () => models?.model_details?.find((item) => item.name === selectedModel),
     [models?.model_details, selectedModel],
@@ -371,7 +383,10 @@ export function WorkspacePage() {
     selectedModelSupportsImages,
     threadHasHistory,
   });
-  const headerSummary = startupState.headerSummary;
+  const headerSummary =
+    startupState.key === "ready"
+      ? startupState.headerSummary
+      : "Local-first conversation workspace.";
   const idleTitle = startupState.idleTitle;
   const idleDescription = startupState.idleDescription;
   const composerPlaceholder = startupState.composerPlaceholder;
@@ -671,6 +686,16 @@ export function WorkspacePage() {
     ]);
   };
 
+  const restartBackend = async () => {
+    markBackendBooting();
+    await restartManagedBackend();
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ["status"] }),
+      queryClient.invalidateQueries({ queryKey: ["models"] }),
+      queryClient.invalidateQueries({ queryKey: ["users"] }),
+    ]);
+  };
+
   useEffect(() => {
     if (!currentThreadId && threadItems.length) {
       setCurrentThreadId(threadItems[0].thread_id);
@@ -965,6 +990,7 @@ export function WorkspacePage() {
             {isEditingTitle ? (
               <>
                 <input
+                  aria-label="Chat title"
                   className="text-input workspace-title-input"
                   onChange={(event) => setDraftTitle(event.currentTarget.value)}
                   onKeyDown={(event) => {
@@ -980,15 +1006,23 @@ export function WorkspacePage() {
                   placeholder="Chat title"
                   value={draftTitle}
                 />
-                <button className="ghost-button icon-button" onClick={() => void saveTitle()} type="button">
+                <button
+                  aria-label="Save chat title"
+                  className="ghost-button icon-button"
+                  onClick={() => void saveTitle()}
+                  title="Save title"
+                  type="button"
+                >
                   <Check size={16} />
                 </button>
                 <button
+                  aria-label="Cancel title editing"
                   className="ghost-button icon-button"
                   onClick={() => {
                     setDraftTitle(currentThreadEditableTitle);
                     setIsEditingTitle(false);
                   }}
+                  title="Cancel"
                   type="button"
                 >
                   <X size={16} />
@@ -997,7 +1031,13 @@ export function WorkspacePage() {
             ) : (
               <>
                 <h1>{currentThreadDisplayTitle}</h1>
-                <button className="ghost-button icon-button title-edit-button" onClick={() => setIsEditingTitle(true)} type="button">
+                <button
+                  aria-label="Edit chat title"
+                  className="ghost-button icon-button title-edit-button"
+                  onClick={() => setIsEditingTitle(true)}
+                  title="Edit chat title"
+                  type="button"
+                >
                   <Edit3 size={16} />
                 </button>
               </>
@@ -1049,6 +1089,7 @@ export function WorkspacePage() {
               ) : (
                 <label className="workspace-model-picker">
                   <select
+                    aria-label="Chat model"
                     className="select-input workspace-model-select"
                     disabled={modelControlsDisabled}
                     onChange={(event) => setDraftThreadModel(event.currentTarget.value)}
@@ -1083,6 +1124,7 @@ export function WorkspacePage() {
               ) : (
                 <label className="workspace-model-picker workspace-temperature-picker">
                   <select
+                    aria-label="Chat temperature"
                     className="select-input workspace-model-select"
                     disabled={modelControlsDisabled}
                     onChange={(event) => setDraftThreadTemperature(parseTemperatureValue(event.currentTarget.value))}
@@ -1131,6 +1173,7 @@ export function WorkspacePage() {
             </div>
             <div className="search-inline-actions">
               <button
+                aria-label="Previous search match"
                 className="ghost-button icon-button"
                 disabled={activeSearchNavigator.activePosition <= 0}
                 onClick={() => stepSearchJumpTarget(-1)}
@@ -1139,6 +1182,7 @@ export function WorkspacePage() {
                 <ChevronLeft size={15} />
               </button>
               <button
+                aria-label="Next search match"
                 className="ghost-button icon-button"
                 disabled={activeSearchNavigator.activePosition >= activeSearchNavigator.historyIndices.length - 1}
                 onClick={() => stepSearchJumpTarget(1)}
@@ -1181,6 +1225,16 @@ export function WorkspacePage() {
                           type="button"
                         >
                           Create or pick a profile
+                        </button>
+                      </div>
+                    ) : startupState.key === "backend-offline" ? (
+                      <div className="workspace-idle-actions">
+                        <button
+                          className="primary-button"
+                          onClick={() => void restartBackend()}
+                          type="button"
+                        >
+                          Restart local runtime
                         </button>
                       </div>
                     ) : startupState.key === "ollama-offline" ? (
@@ -1235,56 +1289,20 @@ export function WorkspacePage() {
                           Unlock in Settings
                         </button>
                       </div>
-                    ) : null}
-                    {startupState.key === "no-profile" ? (
-                      <section className="wizard-help-panel workspace-setup-help" aria-labelledby="workspace-setup-title">
-                        <div className="wizard-help-heading">
-                          <Terminal size={16} />
-                          <div>
-                            <h3 id="workspace-setup-title">New to local AI?</h3>
-                            <p>Atlas Chat needs a local model provider plus local models before the first real chat.</p>
-                          </div>
-                        </div>
-                        <div className="wizard-help-steps">
-                          <div>
-                            <strong>1. Connect a local provider</strong>
-                            <p>
-                              {isOllamaProvider
-                                ? platformOllamaInstallCopy
-                                : `Start ${providerLabel} and make sure it exposes its local API at ${providerBaseUrl}.`}
-                            </p>
-                            {isOllamaProvider ? (
-                              <a
-                                className="source-link wizard-help-link"
-                                href="https://ollama.com/download"
-                                onClick={(event) => {
-                                  event.preventDefault();
-                                  void openExternalUrl("https://ollama.com/download");
-                                }}
-                                rel="noreferrer"
-                                target="_blank"
-                              >
-                                Open Ollama download
-                                <ExternalLink size={13} />
-                              </a>
-                            ) : null}
-                          </div>
-                          <div>
-                            <strong>2. Pull a chat model</strong>
-                            <p>
-                              {isOllamaProvider
-                                ? `Open ${platformShell} and download this example chat model.`
-                                : `Install or load a chat model inside ${providerLabel}.`}
-                            </p>
-                            <code>{isOllamaProvider ? `ollama pull ${starterChatModel}` : "Use your provider's local model manager"}</code>
-                          </div>
-                          <div>
-                            <strong>3. Pull the memory model</strong>
-                            <p>This embedding model supports local memory and retrieval.</p>
-                            <code>{isOllamaProvider ? `ollama pull ${resolvedEmbedModel}` : resolvedEmbedModel}</code>
-                          </div>
-                        </div>
-                      </section>
+                    ) : startupState.key === "ready" ? (
+                      <div aria-label="Starter prompts" className="workspace-starter-grid">
+                        {STARTER_PROMPTS.map((starter) => (
+                          <button
+                            className="workspace-starter-action"
+                            key={starter.label}
+                            onClick={() => composerRef.current?.setPrompt(starter.prompt)}
+                            type="button"
+                          >
+                            <span>{starter.label}</span>
+                            <ArrowRight size={15} />
+                          </button>
+                        ))}
+                      </div>
                     ) : null}
                   </div>
                 </div>
@@ -1317,7 +1335,9 @@ export function WorkspacePage() {
                   ) : (
                     <button
                       aria-expanded={isThinkingPanelOpen}
+                      aria-label={isThinkingPanelOpen ? "Hide live thinking" : "Show live thinking"}
                       className={`thinking-toggle ${canToggleThinkingPanel ? "interactive" : ""}`}
+                      disabled={!canToggleThinkingPanel}
                       onClick={() => {
                         if (!canToggleThinkingPanel) {
                           return;
@@ -1335,7 +1355,7 @@ export function WorkspacePage() {
                   )}
                 </article>
               ) : null}
-              {currentThreadHasLiveError ? <div className="error-banner">{liveError}</div> : null}
+              {currentThreadHasLiveError ? <div className="error-banner" role="alert">{liveError}</div> : null}
             </div>
           </ScrollArea.Viewport>
           <ScrollArea.Scrollbar className="scrollbar" orientation="vertical">
@@ -1538,7 +1558,9 @@ const WorkspaceComposer = memo(forwardRef<WorkspaceComposerHandle, WorkspaceComp
   const imageInputRef = useRef<HTMLInputElement | null>(null);
   const attachmentInputRef = useRef<HTMLInputElement | null>(null);
   const attachmentMenuRef = useRef<HTMLDivElement | null>(null);
+  const attachmentMenuTriggerRef = useRef<HTMLButtonElement | null>(null);
   const reasoningMenuRef = useRef<HTMLDivElement | null>(null);
+  const reasoningMenuTriggerRef = useRef<HTMLButtonElement | null>(null);
   const promptInputRef = useRef<HTMLTextAreaElement | null>(null);
   const [prompt, setPrompt] = useState("");
   const [attachments, setAttachments] = useState<ImageAttachment[]>([]);
@@ -1550,6 +1572,10 @@ const WorkspaceComposer = memo(forwardRef<WorkspaceComposerHandle, WorkspaceComp
     quoteMessage(content: string) {
       const quoted = buildQuotedPrompt(content);
       setPrompt((current) => (current.trim() ? `${current.trim()}\n\n${quoted}` : quoted));
+      window.requestAnimationFrame(() => promptInputRef.current?.focus());
+    },
+    setPrompt(content: string) {
+      setPrompt(content);
       window.requestAnimationFrame(() => promptInputRef.current?.focus());
     },
   }), []);
@@ -1619,6 +1645,7 @@ const WorkspaceComposer = memo(forwardRef<WorkspaceComposerHandle, WorkspaceComp
     await appendAttachmentsFromFiles(files);
     event.currentTarget.value = "";
     setIsAttachmentMenuOpen(false);
+    window.requestAnimationFrame(() => attachmentMenuTriggerRef.current?.focus());
   };
 
   const handleAttachmentSelection = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -1626,6 +1653,7 @@ const WorkspaceComposer = memo(forwardRef<WorkspaceComposerHandle, WorkspaceComp
     await appendAttachmentsFromFiles(files);
     event.currentTarget.value = "";
     setIsAttachmentMenuOpen(false);
+    window.requestAnimationFrame(() => attachmentMenuTriggerRef.current?.focus());
   };
 
   const clearDraft = useCallback(() => {
@@ -1695,6 +1723,7 @@ const WorkspaceComposer = memo(forwardRef<WorkspaceComposerHandle, WorkspaceComp
       ) : null}
 
       <textarea
+        aria-label="Message"
         className="prompt-input"
         onChange={(event) => setPrompt(event.currentTarget.value)}
         onKeyDown={handlePromptKeyDown}
@@ -1744,30 +1773,59 @@ const WorkspaceComposer = memo(forwardRef<WorkspaceComposerHandle, WorkspaceComp
         <div className="composer-send-cluster">
           <div className="composer-menu-shell" ref={attachmentMenuRef}>
             <button
+              aria-controls="composer-attachment-menu"
               aria-expanded={isAttachmentMenuOpen}
               aria-haspopup="menu"
+              aria-label="Add an attachment"
               className="ghost-button icon-button"
               disabled={!canStartChat || isStreaming}
               onClick={() => {
                 setIsReasoningMenuOpen(false);
                 setIsAttachmentMenuOpen((current) => !current);
               }}
+              onKeyDown={(event) => {
+                if (event.key === "ArrowDown") {
+                  event.preventDefault();
+                  setIsReasoningMenuOpen(false);
+                  setIsAttachmentMenuOpen(true);
+                  window.requestAnimationFrame(() => focusFirstMenuItem(attachmentMenuRef.current));
+                }
+              }}
+              ref={attachmentMenuTriggerRef}
+              title="Add an attachment"
               type="button"
             >
               <Plus size={16} />
             </button>
             {isAttachmentMenuOpen ? (
-              <div className="composer-menu" role="menu">
+              <div
+                aria-label="Attachment options"
+                className="composer-menu"
+                id="composer-attachment-menu"
+                onKeyDown={(event) =>
+                  handleMenuNavigation(event, attachmentMenuRef.current, () => {
+                    setIsAttachmentMenuOpen(false);
+                    attachmentMenuTriggerRef.current?.focus();
+                  })
+                }
+                role="menu"
+              >
                 <button
                   className="composer-menu-item"
                   disabled={!selectedModelSupportsImages}
                   onClick={() => imageInputRef.current?.click()}
+                  role="menuitem"
                   type="button"
                 >
                   <ImagePlus size={15} />
                   <span>Add image</span>
                 </button>
-                <button className="composer-menu-item" onClick={() => attachmentInputRef.current?.click()} type="button">
+                <button
+                  className="composer-menu-item"
+                  onClick={() => attachmentInputRef.current?.click()}
+                  role="menuitem"
+                  type="button"
+                >
                   <FileText size={15} />
                   <span>Add file</span>
                 </button>
@@ -1777,13 +1835,24 @@ const WorkspaceComposer = memo(forwardRef<WorkspaceComposerHandle, WorkspaceComp
           {selectedModelSupportsReasoning ? (
             <div className="composer-select-shell" ref={reasoningMenuRef}>
               <button
+                aria-controls="composer-reasoning-menu"
                 aria-expanded={isReasoningMenuOpen}
                 aria-haspopup="menu"
+                aria-label={`Reasoning mode: ${activeReasoningOption?.label ?? "Reasoning"}`}
                 className="composer-control-pill composer-control-trigger"
                 onClick={() => {
                   setIsAttachmentMenuOpen(false);
                   setIsReasoningMenuOpen((current) => !current);
                 }}
+                onKeyDown={(event) => {
+                  if (event.key === "ArrowDown") {
+                    event.preventDefault();
+                    setIsAttachmentMenuOpen(false);
+                    setIsReasoningMenuOpen(true);
+                    window.requestAnimationFrame(() => focusFirstMenuItem(reasoningMenuRef.current));
+                  }
+                }}
+                ref={reasoningMenuTriggerRef}
                 title="Reasoning mode"
                 type="button"
               >
@@ -1794,14 +1863,27 @@ const WorkspaceComposer = memo(forwardRef<WorkspaceComposerHandle, WorkspaceComp
                 <ChevronDown className={`composer-control-trigger-chevron${isReasoningMenuOpen ? " open" : ""}`} size={14} />
               </button>
               {isReasoningMenuOpen ? (
-                <div className="composer-select-menu" role="menu">
+                <div
+                  aria-label="Reasoning modes"
+                  className="composer-select-menu"
+                  id="composer-reasoning-menu"
+                  onKeyDown={(event) =>
+                    handleMenuNavigation(event, reasoningMenuRef.current, () => {
+                      setIsReasoningMenuOpen(false);
+                      reasoningMenuTriggerRef.current?.focus();
+                    })
+                  }
+                  role="menu"
+                >
                   {reasoningOptions.map((option) => (
                     <button
+                      aria-checked={option.value === effectiveReasoningMode}
                       className={`composer-select-option${option.value === effectiveReasoningMode ? " active" : ""}`}
                       key={option.value}
                       onClick={() => {
                         setReasoningMode(option.value);
                         setIsReasoningMenuOpen(false);
+                        window.requestAnimationFrame(() => reasoningMenuTriggerRef.current?.focus());
                       }}
                       role="menuitemradio"
                       type="button"
@@ -1834,6 +1916,48 @@ const WorkspaceComposer = memo(forwardRef<WorkspaceComposerHandle, WorkspaceComp
     </form>
   );
 }));
+
+function focusFirstMenuItem(container: HTMLElement | null) {
+  container
+    ?.querySelector<HTMLButtonElement>('[role^="menuitem"]:not(:disabled)')
+    ?.focus();
+}
+
+function handleMenuNavigation(
+  event: KeyboardEvent<HTMLElement>,
+  container: HTMLElement | null,
+  closeMenu: () => void,
+) {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeMenu();
+    return;
+  }
+  if (event.key === "Tab") {
+    closeMenu();
+    return;
+  }
+  if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+    return;
+  }
+  const items = Array.from(
+    container?.querySelectorAll<HTMLButtonElement>('[role^="menuitem"]:not(:disabled)') ?? [],
+  );
+  if (!items.length) {
+    return;
+  }
+  event.preventDefault();
+  const currentIndex = items.findIndex((item) => item === document.activeElement);
+  const nextIndex =
+    event.key === "Home"
+      ? 0
+      : event.key === "End"
+        ? items.length - 1
+        : event.key === "ArrowDown"
+          ? (currentIndex + 1 + items.length) % items.length
+          : (currentIndex - 1 + items.length) % items.length;
+  items[nextIndex]?.focus();
+}
 
 type ConversationTranscriptProps = {
   items: ConversationPresentationItem[];

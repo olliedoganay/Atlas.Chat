@@ -3,9 +3,12 @@ from __future__ import annotations
 import queue
 import threading
 from datetime import UTC, datetime
-from typing import Any, TypedDict
+from typing import Any, TypeVar, TypedDict
 
 TERMINAL_EVENT_TYPES = {"run_completed", "run_failed"}
+DEFAULT_SUBSCRIBER_QUEUE_SIZE = 256
+
+QueueItem = TypeVar("QueueItem")
 
 
 class RunEvent(TypedDict):
@@ -24,12 +27,13 @@ class RunTraceItem(TypedDict, total=False):
 
 
 class RunHub:
-    def __init__(self) -> None:
+    def __init__(self, *, subscriber_queue_size: int = DEFAULT_SUBSCRIBER_QUEUE_SIZE) -> None:
         self._lock = threading.Lock()
         self._queues: dict[str, list[queue.Queue[RunEvent]]] = {}
+        self._subscriber_queue_size = max(1, int(subscriber_queue_size))
 
     def subscribe(self, run_id: str) -> queue.Queue[RunEvent]:
-        subscriber: queue.Queue[RunEvent] = queue.Queue()
+        subscriber: queue.Queue[RunEvent] = queue.Queue(maxsize=self._subscriber_queue_size)
         with self._lock:
             self._queues.setdefault(run_id, []).append(subscriber)
         return subscriber
@@ -45,7 +49,28 @@ class RunHub:
         with self._lock:
             subscribers = list(self._queues.get(run_id, []))
         for subscriber in subscribers:
-            subscriber.put(event)
+            put_bounded_queue(subscriber, event)
+
+
+def put_bounded_queue(target: queue.Queue[QueueItem], item: QueueItem) -> None:
+    """Publish without allowing a slow subscriber to grow memory without bound."""
+    try:
+        target.put_nowait(item)
+        return
+    except queue.Full:
+        pass
+
+    try:
+        target.get_nowait()
+    except queue.Empty:
+        pass
+
+    try:
+        target.put_nowait(item)
+    except queue.Full:
+        # Another producer won the newly freed slot. Dropping this item is
+        # preferable to blocking a model or runner output thread.
+        pass
 
 
 def make_run_event(event_type: str, payload: dict[str, Any], *, timestamp: str | None = None) -> RunEvent:

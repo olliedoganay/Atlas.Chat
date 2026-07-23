@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import io
-import os
 import queue
 import re
 import shutil
@@ -18,7 +17,17 @@ from uuid import uuid4
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from pypdf import PdfReader
 
-from .config import AppConfig, chat_provider_label, is_ollama_chat_provider, load_config
+from .config import (
+    CHAT_PROVIDER_LABELS,
+    DEFAULT_OLLAMA_URL,
+    OPENAI_COMPATIBLE_PROVIDER_DEFAULT_URLS,
+    AppConfig,
+    chat_provider_label,
+    is_ollama_chat_provider,
+    load_config,
+    normalize_chat_provider,
+)
+from .code_runner import shutdown_runner
 from .discovery import build_discovery_report
 from .graph.builder import AgentApplication, build_chat_application
 from .graph.builder import post_synthesis_node_sequence, pre_synthesis_node_sequence
@@ -27,26 +36,32 @@ from .graph.nodes import _build_answer_messages, _finalize_answer_text, _latest_
 from .llm import (
     OLLAMA_CONTEXT_WINDOW_PRESETS,
     OllamaCatalogSnapshot,
-    OllamaModelInfo,
     format_runtime_error,
     inspect_local_models,
 )
 from .memory.models import MemoryRecord
-from .run_contract import RunEvent, RunHub, TERMINAL_EVENT_TYPES
-from .run_store import PASSWORD_PROTECTED, RunStore
+from .model_pulls import get_model_pull_manager
+from .provider_settings import (
+    clear_provider_api_key,
+    load_provider_settings,
+    save_provider_settings,
+)
+from .run_contract import RunEvent, RunHub
+from .run_store import ACTIVE_RUN_STATUSES, PASSWORD_PROTECTED, RunStore
 from .security import (
     application_secret_protection_available,
     local_secret_storage_label,
     open_application_sqlite,
     sqlcipher_enabled,
 )
-from .session import scoped_thread_id
+from .session import legacy_scoped_thread_id, parse_scoped_thread_id, scoped_thread_id
 from .text_normalization import MojibakeRepairStream
 from .version import atlas_version
 
 
 DEFAULT_COMPACTION_TIMEOUT_SECONDS = 25.0
 COMPACTION_PIN_LIMIT = 36
+WORKER_SHUTDOWN_TIMEOUT_SECONDS = 8.0
 
 
 @dataclass
@@ -77,6 +92,9 @@ class AtlasBackendService:
     _worker_wakeup: threading.Event = field(default_factory=threading.Event)
     _worker_thread: threading.Thread | None = field(default=None, init=False, repr=False)
     _shutdown_requested: bool = field(default=False, init=False, repr=False)
+    _close_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _close_complete: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
+    _close_started: bool = field(default=False, init=False, repr=False)
     _model_catalog_cache: tuple[float, OllamaCatalogSnapshot] | None = field(default=None, init=False, repr=False)
     _unlocked_users: set[str] = field(default_factory=set)
     _last_chat_model: str = field(default="", init=False, repr=False)
@@ -97,7 +115,34 @@ class AtlasBackendService:
 
     def close(self) -> None:
         self._ensure_runtime_state()
-        error_message = "Atlas backend restarted while this run was active."
+        with self._close_lock:
+            if self._close_complete.is_set():
+                return
+            if self._close_started:
+                close_complete = self._close_complete
+            else:
+                self._close_started = True
+                close_complete = None
+
+        if close_complete is not None:
+            close_complete.wait()
+            return
+
+        try:
+            self._close_once()
+        finally:
+            self._close_complete.set()
+
+    def _close_once(self) -> None:
+        error_message = "Atlas shut down while this run was active."
+        cleanup_errors: list[Exception] = []
+
+        def attempt(callback) -> None:
+            try:
+                callback()
+            except Exception as exc:  # pragma: no cover - defensive best-effort cleanup
+                cleanup_errors.append(exc)
+
         active_run_id: str | None = None
         pending_run_ids: list[str] = []
         with self._control_lock:
@@ -108,16 +153,50 @@ class AtlasBackendService:
             if active_run_id:
                 self._cancelled_runs.add(active_run_id)
         for run_id in pending_run_ids:
-            self.run_store.fail_run(run_id, error=error_message)
-            self._emit_event(run_id, "run_failed", {"error": error_message})
+            attempt(lambda run_id=run_id: self.run_store.fail_run(run_id, error=error_message))
+            attempt(
+                lambda run_id=run_id: self._emit_event(
+                    run_id,
+                    "run_failed",
+                    {"error": error_message},
+                )
+            )
         if active_run_id:
-            self.run_store.mark_run_cancelling(active_run_id)
-            self.app.llm_provider.abort_active_requests()
+            attempt(lambda: self.run_store.mark_run_cancelling(active_run_id))
+            attempt(self.app.llm_provider.abort_active_requests)
+        attempt(get_model_pull_manager().shutdown)
+        attempt(shutdown_runner)
         self._worker_wakeup.set()
         worker = self._worker_thread
-        if worker is not None and worker.is_alive():
-            worker.join(timeout=2.0)
-        self.app.close()
+        if (
+            worker is not None
+            and worker is not threading.current_thread()
+            and worker.is_alive()
+        ):
+            worker.join(timeout=WORKER_SHUTDOWN_TIMEOUT_SECONDS)
+        if worker is not None and not worker.is_alive():
+            self._worker_thread = None
+        elif active_run_id:
+            attempt(lambda: self.run_store.fail_run(active_run_id, error=error_message))
+            attempt(
+                lambda: self._emit_event(
+                    active_run_id,
+                    "run_failed",
+                    {"error": error_message},
+                )
+            )
+
+        attempt(self.app.close)
+        flush_pending_events = getattr(self.run_store, "flush_pending_events", None)
+        if callable(flush_pending_events):
+            attempt(flush_pending_events)
+        self._unlocked_users.clear()
+        lock_all_user_keys = getattr(self.run_store, "lock_all_user_keys", None)
+        if callable(lock_all_user_keys):
+            attempt(lock_all_user_keys)
+
+        if cleanup_errors:
+            raise RuntimeError("Atlas backend did not close cleanly.") from cleanup_errors[0]
 
     def health(self) -> dict[str, Any]:
         return {"status": "ok", "product": "Atlas Chat"}
@@ -147,13 +226,13 @@ class AtlasBackendService:
                 "run_artifacts_encrypted_at_rest": protected_locally,
                 "run_index_encrypted_at_rest": protected_locally,
                 "packaged_logs_default": "off",
-                "sqlite_encrypted_at_rest": sqlcipher_enabled(),
+                "sqlite_encrypted_at_rest": protected_locally and sqlcipher_enabled(),
                 "sqlite_paths": [
                     str(self.config.langgraph_checkpoint_db),
                     str(self.config.mem0_history_db),
                 ],
                 "vector_store": "local-qdrant",
-                "vector_store_encrypted_at_rest": sqlcipher_enabled(),
+                "vector_store_encrypted_at_rest": protected_locally and sqlcipher_enabled(),
                 "vector_store_path": str(self.config.qdrant_path),
             },
         }
@@ -171,6 +250,12 @@ class AtlasBackendService:
             self._worker_wakeup = threading.Event()
         if not hasattr(self, "_shutdown_requested"):
             self._shutdown_requested = False
+        if not hasattr(self, "_close_lock") or self._close_lock is None:
+            self._close_lock = threading.Lock()
+        if not hasattr(self, "_close_complete") or self._close_complete is None:
+            self._close_complete = threading.Event()
+        if not hasattr(self, "_close_started"):
+            self._close_started = False
         if not hasattr(self, "_model_catalog_cache"):
             self._model_catalog_cache = None
         if not hasattr(self, "_worker_thread"):
@@ -184,6 +269,9 @@ class AtlasBackendService:
 
     def _ensure_worker_started(self) -> None:
         self._ensure_runtime_state()
+        with self._close_lock:
+            if self._close_started:
+                raise RuntimeError("Atlas backend is shutting down.")
         with self._control_lock:
             worker = self._worker_thread
             if worker is not None and worker.is_alive():
@@ -282,6 +370,98 @@ class AtlasBackendService:
             "models": [item.name for item in catalog.models],
             "model_details": [item.to_dict() for item in catalog.models],
         }
+
+    def get_provider_settings(self) -> dict[str, Any]:
+        saved = load_provider_settings(self.config.data_dir)
+        return self._provider_settings_payload(
+            provider=getattr(self.config, "chat_provider", "ollama"),
+            base_url=getattr(self.config, "chat_base_url", self.config.ollama_url),
+            has_api_key=bool(getattr(self.config, "chat_api_key", None)),
+            key_unavailable=saved.get("api_key_unavailable") == "true",
+        )
+
+    def save_provider_settings(
+        self,
+        *,
+        provider: str,
+        base_url: str,
+        api_key: str | None,
+        preserve_existing_key: bool,
+    ) -> dict[str, Any]:
+        resolved_provider = normalize_chat_provider(provider)
+        if provider.strip().lower() not in CHAT_PROVIDER_LABELS:
+            raise RuntimeError("Choose a supported local model provider.")
+        resolved_base_url = base_url.strip() or self._provider_default_base_url(resolved_provider)
+        result = save_provider_settings(
+            self.config.data_dir,
+            provider=resolved_provider,
+            base_url=resolved_base_url,
+            api_key=api_key,
+            preserve_existing_key=preserve_existing_key,
+        )
+        return self._provider_settings_payload(
+            provider=resolved_provider,
+            base_url=resolved_base_url,
+            has_api_key=bool(result.get("has_api_key")),
+            restart_required=True,
+        )
+
+    def clear_provider_api_key(self) -> dict[str, Any]:
+        clear_provider_api_key(self.config.data_dir)
+        payload = self.get_provider_settings()
+        payload["has_api_key"] = False
+        payload["restart_required"] = True
+        return payload
+
+    def start_model_pull(self, *, model: str) -> dict[str, Any]:
+        if not is_ollama_chat_provider(getattr(self.config, "chat_provider", "ollama")):
+            raise RuntimeError("Model downloads are available when Ollama is selected.")
+        return get_model_pull_manager().start(
+            ollama_url=getattr(self.config, "chat_base_url", self.config.ollama_url),
+            model=model,
+        )
+
+    def list_model_pulls(self) -> list[dict[str, Any]]:
+        return get_model_pull_manager().list()
+
+    def get_model_pull(self, pull_id: str) -> dict[str, Any]:
+        return get_model_pull_manager().get(pull_id)
+
+    def cancel_model_pull(self, pull_id: str) -> dict[str, Any]:
+        return get_model_pull_manager().cancel(pull_id)
+
+    def _provider_settings_payload(
+        self,
+        *,
+        provider: str,
+        base_url: str,
+        has_api_key: bool,
+        key_unavailable: bool = False,
+        restart_required: bool = False,
+    ) -> dict[str, Any]:
+        resolved_provider = normalize_chat_provider(provider)
+        return {
+            "provider": resolved_provider,
+            "provider_label": chat_provider_label(resolved_provider),
+            "base_url": base_url,
+            "has_api_key": has_api_key,
+            "api_key_unavailable": key_unavailable,
+            "secure_key_storage_available": application_secret_protection_available(),
+            "restart_required": restart_required,
+            "providers": [
+                {
+                    "id": provider_id,
+                    "label": label,
+                    "default_base_url": self._provider_default_base_url(provider_id),
+                }
+                for provider_id, label in CHAT_PROVIDER_LABELS.items()
+            ],
+        }
+
+    def _provider_default_base_url(self, provider: str) -> str:
+        if is_ollama_chat_provider(provider):
+            return getattr(self.config, "ollama_url", DEFAULT_OLLAMA_URL)
+        return OPENAI_COMPATIBLE_PROVIDER_DEFAULT_URLS[provider]
 
     def set_ollama_context_window(self, *, context_window: int | None) -> dict[str, Any]:
         setter = getattr(self.app.llm_provider, "set_ollama_context_window", None)
@@ -447,8 +627,14 @@ class AtlasBackendService:
             resolved_password = (password or "").strip()
             if not resolved_password:
                 raise RuntimeError("Password is required for this user.")
-            self.run_store.unlock_user_key(resolved, password=resolved_password)
-            self._unlocked_users.add(resolved)
+            try:
+                self.run_store.unlock_user_key(resolved, password=resolved_password)
+            except Exception:
+                self._unlocked_users.discard(resolved)
+                self.run_store.lock_user_key(resolved)
+                raise
+            else:
+                self._unlocked_users.add(resolved)
         else:
             self.run_store.unlock_user_key(resolved)
         return self._sanitize_user_summary(user)
@@ -461,6 +647,7 @@ class AtlasBackendService:
         user = self._lookup_user_record(resolved)
         if not user:
             raise RuntimeError(f"User not found: {resolved}")
+        self._ensure_profile_has_no_active_runs(resolved, action="lock")
         self._unlocked_users.discard(resolved)
         self.run_store.lock_user_key(resolved)
         return self._sanitize_user_summary(user)
@@ -493,26 +680,33 @@ class AtlasBackendService:
         if not resolved_memory_id:
             raise RuntimeError("Memory id is required.")
         self._ensure_user_unlocked(resolved_user_id)
-        self.app.memory_service.delete(resolved_memory_id)
+        self.app.memory_service.delete(resolved_memory_id, user_id=resolved_user_id)
         return {"status": "ok", "user_id": resolved_user_id, "memory_id": resolved_memory_id}
 
     def list_threads(self, *, user_id: str | None = None) -> list[dict[str, Any]]:
-        items = self.run_store.list_threads(user_id=user_id)
+        self._ensure_runtime_state()
         if user_id:
             self._ensure_user_unlocked(user_id)
-            items.sort(key=lambda item: item.get("updated_at", ""), reverse=True)
-            return items
+        items = self.run_store.list_threads(user_id=user_id)
+        if not user_id:
+            items = [
+                item
+                for item in items
+                if self._is_profile_accessible(str(item.get("user_id", "") or ""))
+            ]
         checkpoint_threads = self._list_checkpoint_threads()
         seen = {(item["user_id"], item["thread_id"]) for item in items}
-        for thread_id in checkpoint_threads:
-            key = (user_id or "", thread_id)
-            if user_id and key in seen:
+        for checkpoint_user_id, thread_id in checkpoint_threads:
+            key = (checkpoint_user_id, thread_id)
+            if key in seen:
                 continue
-            if not user_id and any(item["thread_id"] == thread_id for item in items):
+            if user_id and checkpoint_user_id != user_id:
+                continue
+            if not user_id and not self._is_profile_accessible(checkpoint_user_id):
                 continue
             items.append(
                 {
-                    "user_id": user_id or "",
+                    "user_id": checkpoint_user_id,
                     "thread_id": thread_id,
                     "title": thread_id,
                     "chat_model": "",
@@ -523,6 +717,7 @@ class AtlasBackendService:
                     "last_run_id": "",
                 }
             )
+            seen.add(key)
         items.sort(key=lambda item: item.get("updated_at", ""), reverse=True)
         return items
 
@@ -992,30 +1187,61 @@ class AtlasBackendService:
         self._ensure_user_unlocked(user_id)
         return [item.__dict__ for item in self.app.list_memories(user_id=user_id, limit=limit)]
 
-    def reset_thread(self, *, thread_id: str, user_id: str | None = None) -> dict[str, Any]:
-        if user_id:
-            self._ensure_user_unlocked(user_id)
-        runtime_thread_ids = {thread_id}
-        if user_id:
-            runtime_thread_ids.add(scoped_thread_id(user_id, thread_id))
+    def reset_thread(self, *, thread_id: str, user_id: str) -> dict[str, Any]:
+        resolved_user_id = user_id.strip()
+        resolved_thread_id = thread_id.strip()
+        if not resolved_user_id:
+            raise RuntimeError("User id is required.")
+        if not resolved_thread_id:
+            raise RuntimeError("Thread id is required.")
+        self._ensure_user_unlocked(resolved_user_id)
+        self._ensure_profile_has_no_active_runs(resolved_user_id, action="reset a thread")
+        thread = self.run_store.get_thread(
+            user_id=resolved_user_id,
+            thread_id=resolved_thread_id,
+        )
+        if not thread:
+            raise RuntimeError(f"Thread not found: {resolved_thread_id}")
+        runtime_thread_ids = {
+            scoped_thread_id(resolved_user_id, resolved_thread_id),
+            legacy_scoped_thread_id(resolved_user_id, resolved_thread_id),
+        }
+        if self._legacy_raw_thread_is_uniquely_owned(
+            user_id=resolved_user_id,
+            thread_id=resolved_thread_id,
+        ):
+            runtime_thread_ids.add(resolved_thread_id)
         with closing(open_application_sqlite(self.config.langgraph_checkpoint_db, data_dir=self.config.data_dir)) as conn:
             for runtime_thread_id in runtime_thread_ids:
                 conn.execute("DELETE FROM writes WHERE thread_id = ?", (runtime_thread_id,))
                 conn.execute("DELETE FROM checkpoints WHERE thread_id = ?", (runtime_thread_id,))
             conn.commit()
-        self.run_store.delete_thread(user_id=user_id, thread_id=thread_id)
-        return {"status": "ok", "thread_id": thread_id}
+        self.run_store.delete_thread(
+            user_id=resolved_user_id,
+            thread_id=resolved_thread_id,
+        )
+        return {
+            "status": "ok",
+            "user_id": resolved_user_id,
+            "thread_id": resolved_thread_id,
+        }
 
     def reset_user(self, *, user_id: str, confirmation_user_id: str) -> dict[str, Any]:
         if confirmation_user_id != user_id:
             raise RuntimeError("User confirmation did not match the requested user id.")
         self._ensure_user_unlocked(user_id)
-        thread_ids = {item["thread_id"] for item in self.run_store.list_threads(user_id=user_id)}
-        self.app.memory_service.delete_all(user_id=user_id)
-        for thread_id in thread_ids:
-            self.reset_thread(thread_id=thread_id, user_id=user_id)
-        self.run_store.delete_user(user_id)
-        self._unlocked_users.discard(user_id)
+        self._ensure_profile_has_no_active_runs(user_id, action="delete")
+        try:
+            thread_ids = {item["thread_id"] for item in self.run_store.list_threads(user_id=user_id)}
+            self.app.memory_service.delete_all(user_id=user_id)
+            for thread_id in thread_ids:
+                self.reset_thread(thread_id=thread_id, user_id=user_id)
+            self.run_store.delete_user(user_id)
+        finally:
+            self._unlocked_users.discard(user_id)
+            lock_user_key = getattr(self.run_store, "lock_user_key", None)
+            if callable(lock_user_key):
+                lock_user_key(user_id)
         return {"status": "ok", "user_id": user_id}
 
     def _sanitize_user_summary(self, item: dict[str, Any]) -> dict[str, Any]:
@@ -1043,8 +1269,66 @@ class AtlasBackendService:
         user = self._lookup_user_record(resolved)
         if not user:
             raise RuntimeError(f"User not found: {resolved}")
-        if user.get("protection") == PASSWORD_PROTECTED and resolved not in self._unlocked_users:
-            raise RuntimeError("Unlock this user before continuing.")
+        if user.get("protection") == PASSWORD_PROTECTED:
+            is_user_key_unlocked = getattr(self.run_store, "is_user_key_unlocked", None)
+            key_is_unlocked = (
+                bool(is_user_key_unlocked(resolved))
+                if callable(is_user_key_unlocked)
+                else resolved in self._unlocked_users
+            )
+            if resolved not in self._unlocked_users or not key_is_unlocked:
+                self._unlocked_users.discard(resolved)
+                raise RuntimeError("Unlock this user before continuing.")
+
+    def _is_profile_accessible(self, user_id: str) -> bool:
+        resolved = user_id.strip()
+        if not resolved:
+            return False
+        user = self._lookup_user_record(resolved)
+        if not user:
+            return False
+        if user.get("protection") != PASSWORD_PROTECTED:
+            return True
+        is_user_key_unlocked = getattr(self.run_store, "is_user_key_unlocked", None)
+        key_is_unlocked = (
+            bool(is_user_key_unlocked(resolved))
+            if callable(is_user_key_unlocked)
+            else resolved in self._unlocked_users
+        )
+        return resolved in self._unlocked_users and key_is_unlocked
+
+    def _ensure_profile_has_no_active_runs(self, user_id: str, *, action: str) -> None:
+        self._ensure_runtime_state()
+        with self._control_lock:
+            pending_for_user = any(job.user_id == user_id for job in self._pending_runs)
+            active_run_id = self._active_run_id
+        active_for_user = False
+        if active_run_id:
+            get_run = getattr(self.run_store, "get_run", None)
+            if callable(get_run):
+                try:
+                    artifact = get_run(active_run_id)
+                except RuntimeError:
+                    artifact = {}
+                active_for_user = (
+                    str(artifact.get("user_id", "") or "") == user_id
+                    and str(artifact.get("status", "") or "") in ACTIVE_RUN_STATUSES
+                )
+        if pending_for_user or active_for_user:
+            raise RuntimeError(
+                f"Wait for this profile's active runs to finish before you {action} it."
+            )
+
+    def _legacy_raw_thread_is_uniquely_owned(self, *, user_id: str, thread_id: str) -> bool:
+        list_threads = getattr(self.run_store, "list_threads", None)
+        if not callable(list_threads):
+            return False
+        owners = {
+            str(item.get("user_id", "") or "")
+            for item in list_threads(user_id=None)
+            if str(item.get("thread_id", "") or "") == thread_id
+        }
+        return owners == {user_id}
 
     def _get_accessible_run(self, run_id: str) -> dict[str, Any]:
         artifact = self.run_store.get_run(run_id)
@@ -2182,12 +2466,21 @@ class AtlasBackendService:
         self.run_hub.publish(run_id, event)
         return event
 
-    def _list_checkpoint_threads(self) -> list[str]:
-        if not self.config.langgraph_checkpoint_db.exists():
+    def _list_checkpoint_threads(self) -> list[tuple[str, str]]:
+        config = getattr(self, "config", None)
+        checkpoint_db = getattr(config, "langgraph_checkpoint_db", None)
+        if checkpoint_db is None or not checkpoint_db.exists():
             return []
-        with closing(open_application_sqlite(self.config.langgraph_checkpoint_db, data_dir=self.config.data_dir)) as conn:
+        with closing(open_application_sqlite(checkpoint_db, data_dir=config.data_dir)) as conn:
             rows = conn.execute("SELECT DISTINCT thread_id FROM checkpoints ORDER BY thread_id ASC").fetchall()
-        return [str(row[0]) for row in rows if row and row[0]]
+        decoded: list[tuple[str, str]] = []
+        for row in rows:
+            if not row or not row[0]:
+                continue
+            parsed = parse_scoped_thread_id(str(row[0]))
+            if parsed is not None:
+                decoded.append(parsed)
+        return decoded
 
     def _get_snapshot(self, *, user_id: str | None, thread_id: str):
         scoped_id = scoped_thread_id(user_id, thread_id) if user_id else thread_id
@@ -2195,9 +2488,26 @@ class AtlasBackendService:
         if scoped_snapshot.values.get("messages"):
             return scoped_snapshot
         if user_id:
-            legacy_snapshot = self.app.graph.get_state({"configurable": {"thread_id": thread_id}})
-            if legacy_snapshot.values.get("messages"):
-                return legacy_snapshot
+            owned_thread = self.run_store.get_thread(user_id=user_id, thread_id=thread_id)
+            if owned_thread:
+                legacy_scoped_snapshot = self.app.graph.get_state(
+                    {
+                        "configurable": {
+                            "thread_id": legacy_scoped_thread_id(user_id, thread_id)
+                        }
+                    }
+                )
+                if legacy_scoped_snapshot.values.get("messages"):
+                    return legacy_scoped_snapshot
+                if self._legacy_raw_thread_is_uniquely_owned(
+                    user_id=user_id,
+                    thread_id=thread_id,
+                ):
+                    legacy_snapshot = self.app.graph.get_state(
+                        {"configurable": {"thread_id": thread_id}}
+                    )
+                    if legacy_snapshot.values.get("messages"):
+                        return legacy_snapshot
         return scoped_snapshot
 
     def _model_supports_images(self, model_name: str) -> bool:

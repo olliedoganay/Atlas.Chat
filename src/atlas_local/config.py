@@ -7,6 +7,8 @@ from typing import Mapping
 
 from dotenv import load_dotenv
 
+from .provider_settings import load_provider_settings
+
 
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 DEFAULT_CHAT_PROVIDER = "ollama"
@@ -65,6 +67,31 @@ def _path_value(env: Mapping[str, str], key: str, default: Path, *, base: Path |
     if path.is_absolute() or base is None:
         return path
     return base / path
+
+
+def _storage_path_value(
+    env: Mapping[str, str],
+    key: str,
+    *,
+    default: Path,
+    data_dir: Path,
+    project_root: Path,
+    legacy_default: str,
+) -> Path:
+    raw = str(env.get(key, "") or "").strip()
+    if not raw:
+        return default
+    if raw.replace("\\", "/") == legacy_default and data_dir != project_root / ".data":
+        # `.env.example` historically pinned storage back to the repository.
+        # Treat those exact legacy defaults as defaults when ATLAS_DATA_DIR is
+        # intentionally redirected, while preserving existing source installs.
+        return default
+    path = Path(raw)
+    if path.is_absolute():
+        return path
+    if raw.replace("\\", "/") == legacy_default:
+        return project_root / path
+    return data_dir / path
 
 
 def _value(env: Mapping[str, str], key: str, default: str) -> str:
@@ -145,18 +172,30 @@ def load_config(
     root = _path_value(source, "ATLAS_PROJECT_ROOT", fallback_root, base=fallback_root)
     prompt_dir = _path_value(source, "ATLAS_PROMPT_DIR", root / "prompts", base=root)
     data_dir = _path_value(source, "ATLAS_DATA_DIR", root / ".data", base=root)
-    qdrant_path = _path_value(source, "QDRANT_PATH", root / ".data" / "qdrant", base=root)
-    checkpoint_db = _path_value(
+    saved_provider_settings = load_provider_settings(data_dir)
+    qdrant_path = _storage_path_value(
+        source,
+        "QDRANT_PATH",
+        default=data_dir / "qdrant",
+        data_dir=data_dir,
+        project_root=root,
+        legacy_default=".data/qdrant",
+    )
+    checkpoint_db = _storage_path_value(
         source,
         "LANGGRAPH_CHECKPOINT_DB",
-        root / ".data" / "langgraph" / "checkpoints.sqlite",
-        base=root,
+        default=data_dir / "langgraph" / "checkpoints.sqlite",
+        data_dir=data_dir,
+        project_root=root,
+        legacy_default=".data/langgraph/checkpoints.sqlite",
     )
-    mem0_history_db = _path_value(
+    mem0_history_db = _storage_path_value(
         source,
         "MEM0_HISTORY_DB",
-        data_dir / "mem0_history.sqlite",
-        base=data_dir,
+        default=data_dir / "mem0_history.sqlite",
+        data_dir=data_dir,
+        project_root=root,
+        legacy_default=".data/mem0_history.sqlite",
     )
 
     qdrant_path.mkdir(parents=True, exist_ok=True)
@@ -164,9 +203,21 @@ def load_config(
     mem0_history_db.parent.mkdir(parents=True, exist_ok=True)
 
     ollama_url = _value(source, "OLLAMA_URL", DEFAULT_OLLAMA_URL)
-    chat_provider = normalize_chat_provider(_value(source, "ATLAS_CHAT_PROVIDER", DEFAULT_CHAT_PROVIDER))
+    configured_provider = saved_provider_settings.get("provider") or _value(
+        source,
+        "ATLAS_CHAT_PROVIDER",
+        DEFAULT_CHAT_PROVIDER,
+    )
+    chat_provider = normalize_chat_provider(configured_provider)
+    if is_ollama_chat_provider(chat_provider) and saved_provider_settings.get("base_url"):
+        ollama_url = saved_provider_settings["base_url"]
     default_chat_base_url = _default_chat_base_url(chat_provider, ollama_url)
-    chat_base_url = _value(source, "ATLAS_CHAT_BASE_URL", default_chat_base_url) or default_chat_base_url
+    chat_base_url = (
+        saved_provider_settings.get("base_url")
+        or _value(source, "ATLAS_CHAT_BASE_URL", default_chat_base_url)
+        or default_chat_base_url
+    )
+    saved_api_key = saved_provider_settings.get("api_key")
 
     return AppConfig(
         project_root=root,
@@ -178,7 +229,7 @@ def load_config(
         ollama_url=ollama_url,
         chat_provider=chat_provider,
         chat_base_url=chat_base_url,
-        chat_api_key=_optional_secret_value(source, "ATLAS_CHAT_API_KEY"),
+        chat_api_key=saved_api_key or _optional_secret_value(source, "ATLAS_CHAT_API_KEY"),
         chat_temperature=_optional_float_value(source, "CHAT_TEMPERATURE", DEFAULT_CHAT_TEMPERATURE),
         embed_model=_value(source, "EMBED_MODEL", DEFAULT_EMBED_MODEL),
         mem0_collection=_value(source, "MEM0_COLLECTION", DEFAULT_MEM0_COLLECTION),

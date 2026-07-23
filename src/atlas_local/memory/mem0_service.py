@@ -1,32 +1,82 @@
 from __future__ import annotations
 
+import json
+import os
 import shutil
 import sqlite3
+import threading
 from contextlib import closing
 from pathlib import Path
 from typing import Any
-import json
 
-from mem0 import Memory
-from mem0.memory import storage as mem0_storage
 from qdrant_client.local import persistence as qdrant_persistence
 
 from ..config import AppConfig
-from ..security import build_encrypted_sqlite_module, open_application_sqlite, prepare_encrypted_qdrant_storage
+from ..security import (
+    build_encrypted_sqlite_module,
+    open_application_sqlite,
+    prepare_encrypted_qdrant_storage,
+)
 from .models import MemoryCandidate, MemoryRecord, StoredMemory
+
+
+# Mem0 writes an identity file as soon as it is imported, even when telemetry
+# events are disabled. Keep the import lazy so the active Atlas data directory
+# is known before any Mem0 module code can create local state.
+Memory: Any | None = None
+mem0_storage: Any | None = None
+_mem0_setup_module: Any | None = None
+_mem0_main_module: Any | None = None
+_MEM0_RUNTIME_LOCK = threading.RLock()
+
+
+def _load_mem0_runtime(data_dir: Path) -> tuple[Any, Any]:
+    global Memory, mem0_storage, _mem0_main_module, _mem0_setup_module
+
+    mem0_dir = (data_dir / "mem0").resolve()
+    with _MEM0_RUNTIME_LOCK:
+        os.environ["MEM0_TELEMETRY"] = "False"
+        os.environ["MEM0_DIR"] = str(mem0_dir)
+
+        if Memory is None:
+            from mem0 import Memory as imported_memory
+            from mem0.memory import main as imported_mem0_main
+            from mem0.memory import setup as imported_mem0_setup
+            from mem0.memory import storage as imported_mem0_storage
+
+            Memory = imported_memory
+            mem0_storage = imported_mem0_storage
+            _mem0_main_module = imported_mem0_main
+            _mem0_setup_module = imported_mem0_setup
+
+        # A source process can construct sequential AppConfig instances (for
+        # example in tests or automation). Rebind Mem0's cached path before it
+        # reads or writes its identity config so each instance remains inside
+        # the active Atlas data directory.
+        _mem0_setup_module.mem0_dir = str(mem0_dir)
+        _mem0_main_module.mem0_dir = str(mem0_dir)
+        _mem0_setup_module.setup_config()
+        return Memory, mem0_storage
+
 
 class Mem0Service:
     def __init__(self, config: AppConfig):
         self.config = config
-        self._memory: Memory | None = None
+        self._memory: Any | None = None
+        _, runtime_storage = _load_mem0_runtime(config.data_dir)
         sqlite_module = build_encrypted_sqlite_module(data_dir=config.data_dir)
-        mem0_storage.sqlite3 = sqlite_module
+        runtime_storage.sqlite3 = sqlite_module
         qdrant_persistence.sqlite3 = sqlite_module
         prepare_encrypted_qdrant_storage(config.qdrant_path, data_dir=config.data_dir)
         _reconcile_legacy_qdrant_collections(config)
 
     def search(self, query: str, *, user_id: str, limit: int) -> list[StoredMemory]:
-        response = self._require_memory().search(query, user_id=user_id, limit=limit, rerank=False)
+        response = self._require_memory().search(
+            query,
+            filters={"user_id": user_id},
+            top_k=limit,
+            rerank=False,
+        )
         return [StoredMemory.from_dict(item) for item in response.get("results", [])]
 
     def add(
@@ -36,7 +86,11 @@ class Mem0Service:
         user_id: str,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        text = candidate.to_storage_text() if isinstance(candidate, MemoryCandidate) else candidate.text
+        text = (
+            candidate.to_storage_text()
+            if isinstance(candidate, MemoryCandidate)
+            else candidate.text
+        )
         return self._require_memory().add(
             text,
             user_id=user_id,
@@ -44,14 +98,26 @@ class Mem0Service:
             infer=False,
         )
 
-    def update(self, memory_id: str, text: str, *, metadata: dict[str, Any] | None = None) -> None:
+    def update(
+        self, memory_id: str, text: str, *, metadata: dict[str, Any] | None = None
+    ) -> None:
         self._require_memory().update(memory_id, text, metadata=metadata)
 
-    def delete(self, memory_id: str) -> None:
-        self._require_memory().delete(memory_id)
+    def delete(self, memory_id: str, *, user_id: str) -> None:
+        memory = self._require_memory()
+        item = memory.get(memory_id)
+        if not item:
+            raise RuntimeError(f"Memory not found: {memory_id}")
+        owner = str(item.get("user_id", "") or "")
+        if owner != user_id:
+            raise RuntimeError("Memory does not belong to this user.")
+        memory.delete(memory_id)
 
     def list(self, *, user_id: str, limit: int = 20) -> list[StoredMemory]:
-        response = self._require_memory().get_all(user_id=user_id, limit=limit)
+        response = self._require_memory().get_all(
+            filters={"user_id": user_id},
+            top_k=limit,
+        )
         return [StoredMemory.from_dict(item) for item in response.get("results", [])]
 
     def delete_all(self, *, user_id: str) -> None:
@@ -80,11 +146,12 @@ class Mem0Service:
         finally:
             self._memory = None
 
-    def _require_memory(self) -> Memory:
+    def _require_memory(self) -> Any:
         if self._memory is not None:
             return self._memory
+        memory_runtime, _ = _load_mem0_runtime(self.config.data_dir)
         try:
-            self._memory = Memory.from_config(
+            self._memory = memory_runtime.from_config(
                 {
                     "vector_store": {
                         "provider": "qdrant",
@@ -148,7 +215,11 @@ def _reconcile_legacy_qdrant_collections(config: AppConfig) -> None:
     target_points = _local_collection_points(target_dir)
     meta_path = config.qdrant_path / "meta.json"
     metadata = _load_qdrant_metadata(meta_path)
-    sibling_dirs = [path for path in collection_root.iterdir() if path.is_dir() and path != target_dir]
+    sibling_dirs = [
+        path
+        for path in collection_root.iterdir()
+        if path.is_dir() and path != target_dir
+    ]
 
     if target_points is None or target_points > 0:
         _write_qdrant_metadata(meta_path, metadata)
@@ -170,7 +241,9 @@ def _reconcile_legacy_qdrant_collections(config: AppConfig) -> None:
         shutil.rmtree(target_dir, ignore_errors=True)
     target_dir.parent.mkdir(parents=True, exist_ok=True)
     source_dir.replace(target_dir)
-    _move_collection_metadata(metadata, from_name=source_dir.name, to_name=config.mem0_collection)
+    _move_collection_metadata(
+        metadata, from_name=source_dir.name, to_name=config.mem0_collection
+    )
     target_points = source_points
 
     _write_qdrant_metadata(meta_path, metadata)
@@ -185,7 +258,9 @@ def _local_collection_points(collection_dir: Path) -> int | None:
         return 0
 
     try:
-        with closing(open_application_sqlite(database_path, data_dir=collection_dir.parents[2])) as conn:
+        with closing(
+            open_application_sqlite(database_path, data_dir=collection_dir.parents[2])
+        ) as conn:
             has_points_table = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'points'"
             ).fetchone()
@@ -202,7 +277,7 @@ def _load_qdrant_metadata(path: Path) -> dict[str, Any]:
         return {}
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except OSError, json.JSONDecodeError:
         return {}
 
 
@@ -215,7 +290,9 @@ def _write_qdrant_metadata(path: Path, payload: dict[str, Any]) -> None:
         pass
 
 
-def _move_collection_metadata(payload: dict[str, Any], *, from_name: str, to_name: str) -> None:
+def _move_collection_metadata(
+    payload: dict[str, Any], *, from_name: str, to_name: str
+) -> None:
     collections = payload.get("collections")
     if not isinstance(collections, dict):
         return

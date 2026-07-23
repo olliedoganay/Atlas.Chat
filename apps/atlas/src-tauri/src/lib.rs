@@ -1,14 +1,15 @@
 use std::{
     env, fs,
-    net::TcpListener,
+    io::{Read, Write},
+    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::Mutex,
     thread,
-    time::Duration,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
+use rand::RngCore;
 use serde::Serialize;
 use tauri::{webview::PageLoadEvent, AppHandle, Manager, RunEvent, State};
 
@@ -19,7 +20,10 @@ const BACKEND_HOST: &str = "127.0.0.1";
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const BACKEND_START_ATTEMPTS: usize = 5;
-const BACKEND_STARTUP_GRACE_MS: u64 = 250;
+const BACKEND_STARTUP_ATTEMPTS: usize = 80;
+const BACKEND_STARTUP_RETRY_MS: u64 = 250;
+const BACKEND_GRACEFUL_SHUTDOWN_TIMEOUT_MS: u64 = 12_000;
+const BACKEND_SHUTDOWN_POLL_MS: u64 = 100;
 const WINDOW_REVEAL_FALLBACK_MS: u64 = 500;
 
 #[derive(Clone, Serialize)]
@@ -322,11 +326,18 @@ fn start_backend(app: AppHandle, state: &State<'_, BackendState>) -> Result<(), 
         }
 
         let mut child = command.spawn().map_err(|error| error.to_string())?;
-        if backend_exited_during_startup(&mut child)? {
+        if !wait_for_backend_ready(&runtime, &mut child)? {
             last_error = format!(
-                "Atlas backend exited during startup on port {}.",
+                "Atlas backend did not become ready on port {}.",
                 runtime.port
             );
+            if child
+                .try_wait()
+                .map_err(|error| error.to_string())?
+                .is_none()
+            {
+                let _ = child.kill();
+            }
             let _ = child.wait();
             if attempt + 1 < BACKEND_START_ATTEMPTS {
                 continue;
@@ -345,6 +356,15 @@ fn start_backend(app: AppHandle, state: &State<'_, BackendState>) -> Result<(), 
 }
 
 fn stop_backend(state: &State<'_, BackendState>) -> Result<(), String> {
+    let runtime = state
+        .runtime
+        .lock()
+        .map_err(|_| "Backend runtime lock is poisoned.".to_string())?
+        .clone();
+    if let Some(runtime) = runtime.as_ref() {
+        let _ = request_backend_shutdown(runtime);
+    }
+
     let mut guard = state
         .child
         .lock()
@@ -356,8 +376,18 @@ fn stop_backend(state: &State<'_, BackendState>) -> Result<(), String> {
             .map_err(|error| error.to_string())?
             .is_none()
         {
-            child.kill().map_err(|error| error.to_string())?;
-            let _ = child.wait();
+            let exited_gracefully = if runtime.is_some() {
+                wait_for_child_exit(
+                    &mut child,
+                    Duration::from_millis(BACKEND_GRACEFUL_SHUTDOWN_TIMEOUT_MS),
+                )?
+            } else {
+                false
+            };
+            if !exited_gracefully {
+                child.kill().map_err(|error| error.to_string())?;
+                let _ = child.wait();
+            }
         }
     }
     let mut runtime_guard = state
@@ -368,12 +398,95 @@ fn stop_backend(state: &State<'_, BackendState>) -> Result<(), String> {
     Ok(())
 }
 
-fn backend_exited_during_startup(child: &mut Child) -> Result<bool, String> {
-    thread::sleep(Duration::from_millis(BACKEND_STARTUP_GRACE_MS));
-    child
-        .try_wait()
-        .map(|status| status.is_some())
-        .map_err(|error| error.to_string())
+fn wait_for_backend_ready(runtime: &BackendRuntime, child: &mut Child) -> Result<bool, String> {
+    for _ in 0..BACKEND_STARTUP_ATTEMPTS {
+        if child
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        if authenticated_health_check(runtime) {
+            return Ok(true);
+        }
+        thread::sleep(Duration::from_millis(BACKEND_STARTUP_RETRY_MS));
+    }
+    Ok(false)
+}
+
+fn authenticated_health_check(runtime: &BackendRuntime) -> bool {
+    let address = format!("{}:{}", runtime.host, runtime.port);
+    let Ok(socket_address) = address.parse() else {
+        return false;
+    };
+    let Ok(mut stream) = TcpStream::connect_timeout(&socket_address, Duration::from_millis(200))
+    else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+    let request = format!(
+        "GET /health HTTP/1.1\r\nHost: {}\r\nX-Atlas-Instance-Token: {}\r\nConnection: close\r\n\r\n",
+        address, runtime.token
+    );
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut response = [0_u8; 96];
+    match stream.read(&mut response) {
+        Ok(read) if read > 0 => String::from_utf8_lossy(&response[..read]).contains(" 200 "),
+        _ => false,
+    }
+}
+
+fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> Result<bool, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(false);
+        }
+        thread::sleep(
+            Duration::from_millis(BACKEND_SHUTDOWN_POLL_MS)
+                .min(deadline.saturating_duration_since(now)),
+        );
+    }
+}
+
+fn request_backend_shutdown(runtime: &BackendRuntime) -> bool {
+    let address = format!("{}:{}", runtime.host, runtime.port);
+    let Ok(socket_address) = address.parse() else {
+        return false;
+    };
+    let Ok(mut stream) = TcpStream::connect_timeout(&socket_address, Duration::from_millis(350))
+    else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(1500)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+    let request = prepare_shutdown_request(&address, &runtime.token);
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut response = [0_u8; 96];
+    match stream.read(&mut response) {
+        Ok(read) if read > 0 => String::from_utf8_lossy(&response[..read]).contains(" 200 "),
+        _ => false,
+    }
+}
+
+fn prepare_shutdown_request(address: &str, token: &str) -> String {
+    format!(
+        "POST /admin/prepare-shutdown HTTP/1.1\r\nHost: {address}\r\nX-Atlas-Instance-Token: {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
 }
 
 fn backend_command(
@@ -503,11 +616,13 @@ fn reserve_port() -> Result<u16, String> {
 }
 
 fn generate_instance_token() -> String {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    format!("atlas-{}-{}", std::process::id(), timestamp)
+    let mut bytes = [0_u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    let encoded = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("atlas-{encoded}")
 }
 
 fn backend_log_streams(path: &Path) -> Result<(Stdio, Stdio), String> {
@@ -547,4 +662,23 @@ fn playwright_browsers_path() -> Option<PathBuf> {
         .map(PathBuf::from)
         .map(|path| path.join("ms-playwright"))
         .filter(|path| path.exists())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn graceful_shutdown_timeout_stays_within_desktop_exit_budget() {
+        assert!((10_000..=15_000).contains(&BACKEND_GRACEFUL_SHUTDOWN_TIMEOUT_MS));
+    }
+
+    #[test]
+    fn shutdown_request_targets_authenticated_full_backend_endpoint() {
+        let request = prepare_shutdown_request("127.0.0.1:8765", "atlas-test-token");
+
+        assert!(request.starts_with("POST /admin/prepare-shutdown HTTP/1.1\r\n"));
+        assert!(request.contains("\r\nX-Atlas-Instance-Token: atlas-test-token\r\n"));
+        assert!(request.ends_with("\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"));
+    }
 }

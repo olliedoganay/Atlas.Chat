@@ -129,6 +129,33 @@ export type ModelCatalog = {
   }>;
 };
 
+export type ProviderSettings = {
+  provider: string;
+  provider_label: string;
+  base_url: string;
+  has_api_key: boolean;
+  secure_key_storage_available: boolean;
+  restart_required?: boolean;
+  providers: Array<{
+    id: string;
+    label: string;
+    default_base_url: string;
+  }>;
+};
+
+export type ModelPull = {
+  pull_id: string;
+  model: string;
+  status: "queued" | "pulling" | "completed" | "failed" | "cancelled";
+  detail: string;
+  completed: number;
+  total: number;
+  progress: number | null;
+  started_at: string;
+  updated_at: string;
+  error?: string | null;
+};
+
 export type DiscoveryReport = {
   system: {
     os: string;
@@ -293,6 +320,49 @@ export function getStatus() {
 
 export function getModels() {
   return request<ModelCatalog>("/models");
+}
+
+export function getProviderSettings() {
+  return request<ProviderSettings>("/settings/provider");
+}
+
+export function saveProviderSettings(settings: {
+  provider: string;
+  base_url?: string;
+  api_key?: string;
+  preserve_existing_key?: boolean;
+}) {
+  return request<ProviderSettings>("/settings/provider", {
+    method: "PUT",
+    body: JSON.stringify(settings),
+  });
+}
+
+export function clearProviderApiKey() {
+  return request<ProviderSettings>("/settings/provider/api-key", {
+    method: "DELETE",
+  });
+}
+
+export function startModelPull(model: string) {
+  return request<ModelPull>("/models/pulls", {
+    method: "POST",
+    body: JSON.stringify({ model }),
+  });
+}
+
+export function listModelPulls() {
+  return request<ModelPull[]>("/models/pulls");
+}
+
+export function getModelPull(pullId: string) {
+  return request<ModelPull>(`/models/pulls/${encodeURIComponent(pullId)}`);
+}
+
+export function cancelModelPull(pullId: string) {
+  return request<ModelPull>(`/models/pulls/${encodeURIComponent(pullId)}`, {
+    method: "DELETE",
+  });
 }
 
 export function setOllamaContextWindow(contextWindow: number | null) {

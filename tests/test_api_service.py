@@ -36,6 +36,42 @@ class ApiServiceCreateTests(unittest.TestCase):
         self.assertIs(service.app, fake_app)
         self.assertIs(service.run_store, fake_store)
 
+    def test_close_shuts_down_full_runtime_once(self) -> None:
+        calls: list[str] = []
+        service = AtlasBackendService(
+            config=object(),
+            app=SimpleNamespace(
+                llm_provider=SimpleNamespace(
+                    abort_active_requests=lambda: calls.append("abort-provider")
+                ),
+                close=lambda: calls.append("app"),
+            ),
+            run_store=SimpleNamespace(
+                flush_pending_events=lambda: calls.append("flush"),
+                lock_all_user_keys=lambda: calls.append("lock-keys"),
+            ),
+            run_hub=RunHub(),
+        )
+        model_pulls = SimpleNamespace(shutdown=lambda: calls.append("model-pulls"))
+
+        with (
+            patch(
+                "atlas_local.api_service.get_model_pull_manager",
+                return_value=model_pulls,
+            ),
+            patch(
+                "atlas_local.api_service.shutdown_runner",
+                side_effect=lambda: calls.append("runner"),
+            ),
+        ):
+            service.close()
+            service.close()
+
+        self.assertEqual(
+            calls,
+            ["model-pulls", "runner", "app", "flush", "lock-keys"],
+        )
+
     def test_list_users_returns_store_entries_without_synthetic_default_user(self) -> None:
         service = AtlasBackendService.__new__(AtlasBackendService)
         service.run_store = SimpleNamespace(
@@ -72,9 +108,15 @@ class ApiServiceCreateTests(unittest.TestCase):
             self.assertEqual(payload["security"]["profile_key_protection"], local_secret_storage_label())
             self.assertEqual(payload["security"]["run_artifacts_encrypted_at_rest"], application_secret_protection_available())
             self.assertEqual(payload["security"]["run_index_encrypted_at_rest"], application_secret_protection_available())
-            self.assertEqual(payload["security"]["sqlite_encrypted_at_rest"], sqlcipher_enabled())
+            self.assertEqual(
+                payload["security"]["sqlite_encrypted_at_rest"],
+                application_secret_protection_available() and sqlcipher_enabled(),
+            )
             self.assertEqual(payload["security"]["vector_store"], "local-qdrant")
-            self.assertEqual(payload["security"]["vector_store_encrypted_at_rest"], sqlcipher_enabled())
+            self.assertEqual(
+                payload["security"]["vector_store_encrypted_at_rest"],
+                application_secret_protection_available() and sqlcipher_enabled(),
+            )
 
 
 class UserProtectionTests(unittest.TestCase):
@@ -140,6 +182,142 @@ class UserProtectionTests(unittest.TestCase):
             threads = service.list_threads(user_id="protected_user")
 
             self.assertEqual(threads[0]["thread_id"], "main")
+
+    def test_global_thread_listing_omits_locked_profile_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = load_config(project_root=Path(temp_dir), env={})
+            store = RunStore(config)
+            store.create_user("public_user")
+            store.upsert_thread(
+                user_id="public_user",
+                thread_id="public",
+                title="Public notes",
+                chat_model="gpt-oss:20b",
+                temperature=0.2,
+                last_prompt="safe preview",
+            )
+            store.create_user("protected_user", password="atlas-secret")
+            store.upsert_thread(
+                user_id="protected_user",
+                thread_id="private",
+                title="Private notes",
+                chat_model="gpt-oss:20b",
+                temperature=0.2,
+                last_prompt="locked secret prompt",
+            )
+            service = AtlasBackendService(
+                config=config,
+                app=SimpleNamespace(close=lambda: None),
+                run_store=store,
+                run_hub=RunHub(),
+            )
+
+            locked_view = service.list_threads()
+            service.unlock_user(user_id="protected_user", password="atlas-secret")
+            unlocked_view = service.list_threads()
+
+            self.assertEqual(
+                [(item["user_id"], item["last_prompt"]) for item in locked_view],
+                [("public_user", "safe preview")],
+            )
+            self.assertCountEqual(
+                [item["user_id"] for item in unlocked_view],
+                ["public_user", "protected_user"],
+            )
+
+    def test_lock_refuses_active_profile_run_then_clears_cached_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = load_config(project_root=Path(temp_dir), env={})
+            store = RunStore(config)
+            store.create_user("protected_user", password="atlas-secret")
+            store.unlock_user_key("protected_user", password="atlas-secret")
+            artifact = store.create_run(
+                mode="chat",
+                user_id="protected_user",
+                thread_id="main",
+                chat_model="gpt-oss:20b",
+                temperature=0.2,
+                prompt="hello",
+            )
+            service = AtlasBackendService(
+                config=config,
+                app=SimpleNamespace(close=lambda: None),
+                run_store=store,
+                run_hub=RunHub(),
+            )
+            service._unlocked_users.add("protected_user")
+            service._active_run_id = artifact["run_id"]
+
+            with self.assertRaisesRegex(RuntimeError, "active runs"):
+                service.lock_user(user_id="protected_user")
+            self.assertTrue(store.is_user_key_unlocked("protected_user"))
+
+            store.complete_run(artifact["run_id"], answer="done")
+            locked = service.lock_user(user_id="protected_user")
+
+            self.assertTrue(locked["locked"])
+            self.assertFalse(store.is_user_key_unlocked("protected_user"))
+
+    def test_service_close_clears_all_cached_profile_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = load_config(project_root=Path(temp_dir), env={})
+            store = RunStore(config)
+            store.create_user("protected_user", password="atlas-secret")
+            store.unlock_user_key("protected_user", password="atlas-secret")
+            service = AtlasBackendService(
+                config=config,
+                app=SimpleNamespace(close=lambda: None),
+                run_store=store,
+                run_hub=RunHub(),
+            )
+            service._unlocked_users.add("protected_user")
+
+            service.close()
+
+            self.assertEqual(service._unlocked_users, set())
+            self.assertFalse(store.is_user_key_unlocked("protected_user"))
+
+    def test_delete_memory_passes_claimed_owner_to_memory_service(self) -> None:
+        service = AtlasBackendService.__new__(AtlasBackendService)
+        deleted: list[tuple[str, str]] = []
+        service._ensure_user_unlocked = lambda _user_id: None
+        service.app = SimpleNamespace(
+            memory_service=SimpleNamespace(
+                delete=lambda memory_id, *, user_id: deleted.append((memory_id, user_id))
+            )
+        )
+
+        result = AtlasBackendService.delete_memory(
+            service,
+            user_id="research_user",
+            memory_id="memory-1",
+        )
+
+        self.assertEqual(deleted, [("memory-1", "research_user")])
+        self.assertEqual(result["memory_id"], "memory-1")
+
+    def test_reset_thread_rejects_thread_owned_by_another_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = load_config(project_root=Path(temp_dir), env={})
+            store = RunStore(config)
+            store.create_user("owner")
+            store.create_user("other")
+            store.upsert_thread(
+                user_id="owner",
+                thread_id="main",
+                title="Owner thread",
+                chat_model="gpt-oss:20b",
+                temperature=0.2,
+            )
+            service = AtlasBackendService(
+                config=config,
+                app=SimpleNamespace(close=lambda: None),
+                run_store=store,
+                run_hub=RunHub(),
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "Thread not found"):
+                service.reset_thread(user_id="other", thread_id="main")
 
 
 class GraphExecutionSequenceTests(unittest.TestCase):

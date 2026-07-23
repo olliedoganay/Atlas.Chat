@@ -1,4 +1,4 @@
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Check,
   Copy,
@@ -6,13 +6,29 @@ import {
   Download,
   HardDrive,
   Info,
+  LoaderCircle,
   RefreshCcw,
   Server,
+  X,
   Zap,
 } from "lucide-react";
-import { type ReactNode, useMemo, useState } from "react";
+import {
+  type KeyboardEvent as ReactKeyboardEvent,
+  type ReactNode,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
-import { getDiscovery, type DiscoveryReport } from "../lib/api";
+import {
+  cancelModelPull,
+  getDiscovery,
+  listModelPulls,
+  startModelPull,
+  type DiscoveryReport,
+  type ModelPull,
+} from "../lib/api";
 import {
   discoveryStatusLabel,
   discoveryStatusTone,
@@ -35,6 +51,7 @@ export function DiscoveryPage() {
   const queryClient = useQueryClient();
   const [copiedCommand, setCopiedCommand] = useState("");
   const [activeFilter, setActiveFilter] = useState<DiscoveryFilter>("needs-pull");
+  const refreshedCompletedPulls = useRef(new Set<string>());
   const { data, isPending, isFetching, isError, error } = useQuery({
     queryKey: ["discovery"],
     queryFn: getDiscovery,
@@ -42,11 +59,41 @@ export function DiscoveryPage() {
     retry: 1,
     refetchOnWindowFocus: false,
   });
+  const { data: modelPulls = [] } = useQuery({
+    queryKey: ["model-pulls"],
+    queryFn: listModelPulls,
+    refetchInterval: (query) => {
+      const pulls = (query.state.data as ModelPull[] | undefined) ?? [];
+      return pulls.some((pull) => pull.status === "queued" || pull.status === "pulling")
+        ? 750
+        : false;
+    },
+    retry: 1,
+    refetchOnWindowFocus: false,
+  });
+  const startPullMutation = useMutation({
+    mutationFn: startModelPull,
+    onSuccess: (pull) => {
+      queryClient.setQueryData<ModelPull[]>(["model-pulls"], (current = []) => [
+        pull,
+        ...current.filter((item) => item.pull_id !== pull.pull_id),
+      ]);
+    },
+  });
+  const cancelPullMutation = useMutation({
+    mutationFn: cancelModelPull,
+    onSuccess: (pull) => {
+      queryClient.setQueryData<ModelPull[]>(["model-pulls"], (current = []) =>
+        current.map((item) => (item.pull_id === pull.pull_id ? pull : item)),
+      );
+    },
+  });
 
   const recommendedModels = data?.recommended_models ?? [];
   const primaryGpu = data ? selectPrimaryGpu(data.system.gpus) : null;
   const nextStep = data ? selectNextStep(recommendedModels) : null;
   const providerLabel = data?.atlas.provider_label || "Ollama";
+  const supportsManagedPulls = (data?.atlas.provider || "ollama") === "ollama";
   const providerOnline = Boolean(data?.atlas.provider_online ?? data?.atlas.ollama_online);
   const installedCount = recommendedModels.filter((item) => item.installed).length;
   const needsPullCount = recommendedModels.length - installedCount;
@@ -66,6 +113,32 @@ export function DiscoveryPage() {
     () => sortedRecommendations.filter((item) => matchesDiscoveryFilter(item, activeFilter)),
     [activeFilter, sortedRecommendations],
   );
+  const pullsByModel = useMemo(
+    () =>
+      new Map(
+        modelPulls.map((pull) => [pull.model.toLocaleLowerCase(), pull] as const),
+      ),
+    [modelPulls],
+  );
+
+  useEffect(() => {
+    let shouldRefresh = false;
+    for (const pull of modelPulls) {
+      if (
+        pull.status === "completed" &&
+        !refreshedCompletedPulls.current.has(pull.pull_id)
+      ) {
+        refreshedCompletedPulls.current.add(pull.pull_id);
+        shouldRefresh = true;
+      }
+    }
+    if (shouldRefresh) {
+      void Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["models"] }),
+        queryClient.invalidateQueries({ queryKey: ["discovery"] }),
+      ]);
+    }
+  }, [modelPulls, queryClient]);
 
   const refreshDiscovery = async () => {
     await Promise.all([
@@ -85,6 +158,26 @@ export function DiscoveryPage() {
     } catch {
       setCopiedCommand("");
     }
+  };
+
+  const handleFilterKeyDown = (event: ReactKeyboardEvent<HTMLButtonElement>, index: number) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
+      return;
+    }
+    event.preventDefault();
+    const nextIndex =
+      event.key === "Home"
+        ? 0
+        : event.key === "End"
+          ? FILTER_OPTIONS.length - 1
+          : event.key === "ArrowRight"
+            ? (index + 1) % FILTER_OPTIONS.length
+            : (index - 1 + FILTER_OPTIONS.length) % FILTER_OPTIONS.length;
+    const nextFilter = FILTER_OPTIONS[nextIndex];
+    setActiveFilter(nextFilter.key);
+    window.requestAnimationFrame(() => {
+      document.getElementById(`discovery-filter-${nextFilter.key}`)?.focus();
+    });
   };
 
   return (
@@ -108,14 +201,14 @@ export function DiscoveryPage() {
       </div>
 
       {isError ? (
-        <div className="error-banner">
+        <div className="error-banner" role="alert">
           Discovery is unavailable right now.{" "}
           {error instanceof Error ? error.message : "Atlas could not load the discovery report."}
         </div>
       ) : null}
 
       {!data && isPending ? (
-        <div className="discovery-loading-line">
+        <div aria-live="polite" className="discovery-loading-line" role="status">
           <span className="status-pill starting">
             <span className="status-dot" />
             Loading
@@ -188,17 +281,33 @@ export function DiscoveryPage() {
                     </span>
                   ) : (
                     <div className="discovery-command-block">
-                      <span>Ollama pull</span>
-                      <code>{nextStep.pull_command}</code>
-                      <button
-                        aria-label={`Copy ${nextStep.name} pull command`}
-                        className="ghost-button icon-button discovery-copy-action"
-                        onClick={() => void copyCommand(nextStep.pull_command)}
-                        title={copiedCommand === nextStep.pull_command ? "Copied" : nextStep.pull_command}
-                        type="button"
-                      >
-                        {copiedCommand === nextStep.pull_command ? <Check size={14} /> : <Copy size={14} />}
-                      </button>
+                      <span>
+                        {formatPullStatus(
+                          pullsByModel.get(nextStep.name.toLocaleLowerCase()),
+                        )}
+                      </span>
+                      <PullProgress
+                        command={nextStep.pull_command}
+                        pull={pullsByModel.get(nextStep.name.toLocaleLowerCase())}
+                      />
+                      <PullButtons
+                        canPull={supportsManagedPulls}
+                        copied={copiedCommand === nextStep.pull_command}
+                        isCancelling={
+                          cancelPullMutation.isPending &&
+                          cancelPullMutation.variables ===
+                            pullsByModel.get(nextStep.name.toLocaleLowerCase())?.pull_id
+                        }
+                        isStarting={
+                          startPullMutation.isPending &&
+                          startPullMutation.variables === nextStep.name
+                        }
+                        item={nextStep}
+                        onCancel={(pullId) => cancelPullMutation.mutate(pullId)}
+                        onCopy={copyCommand}
+                        onPull={(model) => startPullMutation.mutate(model)}
+                        pull={pullsByModel.get(nextStep.name.toLocaleLowerCase())}
+                      />
                     </div>
                   )}
                 </div>
@@ -233,17 +342,21 @@ export function DiscoveryPage() {
             </div>
 
             <div className="discovery-filter-tabs" role="tablist" aria-label="Recommendation filters">
-              {FILTER_OPTIONS.map((filter) => {
+              {FILTER_OPTIONS.map((filter, index) => {
                 const count = recommendedModels.filter((item) =>
                   matchesDiscoveryFilter(item, filter.key),
                 ).length;
                 return (
                   <button
+                    aria-controls="discovery-model-results"
                     aria-selected={activeFilter === filter.key}
                     className={`discovery-filter-tab${activeFilter === filter.key ? " active" : ""}`}
+                    id={`discovery-filter-${filter.key}`}
                     key={filter.key}
                     onClick={() => setActiveFilter(filter.key)}
+                    onKeyDown={(event) => handleFilterKeyDown(event, index)}
                     role="tab"
+                    tabIndex={activeFilter === filter.key ? 0 : -1}
                     type="button"
                   >
                     <span>{filter.label}</span>
@@ -254,7 +367,12 @@ export function DiscoveryPage() {
             </div>
 
             {filteredRecommendations.length ? (
-              <div className="discovery-model-list">
+              <div
+                aria-labelledby={`discovery-filter-${activeFilter}`}
+                className="discovery-model-list"
+                id="discovery-model-results"
+                role="tabpanel"
+              >
                 <div className="discovery-model-table-head" aria-hidden="true">
                   <span>Model</span>
                   <span>Fit</span>
@@ -264,15 +382,30 @@ export function DiscoveryPage() {
                 </div>
                 {filteredRecommendations.map((item) => (
                   <RecommendationRow
+                    canPull={supportsManagedPulls}
                     copiedCommand={copiedCommand}
                     item={item}
                     key={item.name}
+                    onCancel={(pullId) => cancelPullMutation.mutate(pullId)}
                     onCopy={copyCommand}
+                    onPull={(model) => startPullMutation.mutate(model)}
+                    pendingCancelId={
+                      cancelPullMutation.isPending ? cancelPullMutation.variables : undefined
+                    }
+                    pendingModel={
+                      startPullMutation.isPending ? startPullMutation.variables : undefined
+                    }
+                    pull={pullsByModel.get(item.name.toLocaleLowerCase())}
                   />
                 ))}
               </div>
             ) : (
-              <div className="discovery-empty-state">
+              <div
+                aria-labelledby={`discovery-filter-${activeFilter}`}
+                className="discovery-empty-state"
+                id="discovery-model-results"
+                role="tabpanel"
+              >
                 <strong>No models in this view</strong>
               </div>
             )}
@@ -310,12 +443,24 @@ function DiscoveryMetric({
 
 function RecommendationRow({
   item,
+  canPull,
   copiedCommand,
+  onCancel,
   onCopy,
+  onPull,
+  pendingCancelId,
+  pendingModel,
+  pull,
 }: {
   item: DiscoveryReport["recommended_models"][number];
+  canPull: boolean;
   copiedCommand: string;
+  onCancel: (pullId: string) => void;
   onCopy: (command: string) => Promise<void>;
+  onPull: (model: string) => void;
+  pendingCancelId?: string;
+  pendingModel?: string;
+  pull?: ModelPull;
 }) {
   return (
     <article className="discovery-model-row">
@@ -350,20 +495,149 @@ function RecommendationRow({
             Installed
           </span>
         ) : (
-          <button
-            aria-label={`Copy ${item.name} pull command`}
-            className="ghost-button compact-button discovery-row-copy-action"
-            onClick={() => void onCopy(item.pull_command)}
-            title={copiedCommand === item.pull_command ? "Copied" : item.pull_command}
-            type="button"
-          >
-            {copiedCommand === item.pull_command ? <Check size={14} /> : <Copy size={14} />}
-            Pull
-          </button>
+          <div className="discovery-row-pull">
+            <PullProgress command={item.pull_command} compact pull={pull} />
+            <PullButtons
+              canPull={canPull}
+              compact
+              copied={copiedCommand === item.pull_command}
+              isCancelling={pendingCancelId === pull?.pull_id}
+              isStarting={pendingModel === item.name}
+              item={item}
+              onCancel={onCancel}
+              onCopy={onCopy}
+              onPull={onPull}
+              pull={pull}
+            />
+          </div>
         )}
       </div>
     </article>
   );
+}
+
+function PullProgress({
+  command,
+  compact = false,
+  pull,
+}: {
+  command: string;
+  compact?: boolean;
+  pull?: ModelPull;
+}) {
+  if (pull?.status === "queued" || pull?.status === "pulling") {
+    const percentage =
+      pull.progress === null ? null : Math.round(Math.max(0, Math.min(1, pull.progress)) * 100);
+    return (
+      <div
+        aria-label={`${pull.model} download progress`}
+        className={`discovery-pull-progress${compact ? " compact" : ""}`}
+        role="status"
+      >
+        <progress max={1} value={pull.progress ?? undefined} />
+        <span>{percentage === null ? pull.detail : `${percentage}% · ${pull.detail}`}</span>
+      </div>
+    );
+  }
+  if (pull?.status === "failed") {
+    return (
+      <span className="discovery-pull-error" role="alert" title={pull.error || pull.detail}>
+        {compact ? "Download failed" : pull.error || pull.detail}
+      </span>
+    );
+  }
+  if (pull?.status === "completed") {
+    return (
+      <span className="discovery-ready-text" role="status">
+        <Check size={14} />
+        Model ready
+      </span>
+    );
+  }
+  return compact ? null : <code>{command}</code>;
+}
+
+function PullButtons({
+  canPull,
+  compact = false,
+  copied,
+  isCancelling,
+  isStarting,
+  item,
+  onCancel,
+  onCopy,
+  onPull,
+  pull,
+}: {
+  canPull: boolean;
+  compact?: boolean;
+  copied: boolean;
+  isCancelling: boolean;
+  isStarting: boolean;
+  item: DiscoveryReport["recommended_models"][number];
+  onCancel: (pullId: string) => void;
+  onCopy: (command: string) => Promise<void>;
+  onPull: (model: string) => void;
+  pull?: ModelPull;
+}) {
+  const active = pull?.status === "queued" || pull?.status === "pulling";
+  if (pull?.status === "completed") {
+    return null;
+  }
+  if (active && pull) {
+    return (
+      <button
+        aria-label={`Cancel ${item.name} download`}
+        className="ghost-button compact-button"
+        disabled={isCancelling}
+        onClick={() => onCancel(pull.pull_id)}
+        type="button"
+      >
+        <X size={14} />
+        {compact ? "" : isCancelling ? "Cancelling..." : "Cancel"}
+      </button>
+    );
+  }
+  return (
+    <div className="inline-actions discovery-pull-actions">
+      <button
+        aria-label={`${pull?.status === "failed" ? "Retry" : "Download"} ${item.name}`}
+        className={compact ? "ghost-button compact-button" : "primary-button compact-button"}
+        disabled={!canPull || isStarting}
+        onClick={() => onPull(item.name)}
+        title={canPull ? undefined : "Managed downloads require Ollama."}
+        type="button"
+      >
+        {isStarting ? <LoaderCircle className="spin" size={14} /> : <Download size={14} />}
+        {isStarting ? "Starting..." : pull?.status === "failed" ? "Retry" : "Download"}
+      </button>
+      <button
+        aria-label={`Copy ${item.name} pull command`}
+        className="ghost-button icon-button discovery-copy-action"
+        onClick={() => void onCopy(item.pull_command)}
+        title={copied ? "Copied" : item.pull_command}
+        type="button"
+      >
+        {copied ? <Check size={14} /> : <Copy size={14} />}
+      </button>
+    </div>
+  );
+}
+
+function formatPullStatus(pull?: ModelPull) {
+  if (!pull || pull.status === "cancelled") {
+    return "Ollama model";
+  }
+  if (pull.status === "queued") {
+    return "Queued";
+  }
+  if (pull.status === "pulling") {
+    return "Downloading";
+  }
+  if (pull.status === "completed") {
+    return "Ready";
+  }
+  return "Download failed";
 }
 
 function matchesDiscoveryFilter(

@@ -8,7 +8,10 @@ import json
 import os
 import shutil
 import sqlite3
+import stat
 import time
+import uuid
+from contextlib import closing
 from ctypes import wintypes
 from pathlib import Path
 from typing import Any
@@ -35,6 +38,7 @@ _SQLITE_HEADER = b"SQLite format 3\x00"
 _NON_WINDOWS_FORMAT = b"atlas-aesgcm-v1\0"
 _KEYRING_SERVICE = "Atlas"
 _KEYRING_ACCOUNT = "atlas-storage-master-key-v1"
+_MIGRATION_BACKUP_DIR = "migration-backups"
 
 
 class _DataBlob(ctypes.Structure):
@@ -130,6 +134,7 @@ def get_or_create_storage_key(data_dir: Path) -> bytes:
         payload = json.loads(key_path.read_text(encoding="utf-8"))
         if payload.get("format") == _STORAGE_KEY_FORMAT:
             wrapped = base64.b64decode(str(payload.get("wrapped_key", "") or "").encode("ascii"))
+            _restrict_permissions(key_path, directory=False)
             return unprotect_bytes(wrapped)
 
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -139,6 +144,7 @@ def get_or_create_storage_key(data_dir: Path) -> bytes:
         "wrapped_key": base64.b64encode(protect_bytes(key, description="Atlas storage key")).decode("ascii"),
     }
     key_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    _restrict_permissions(key_path, directory=False)
     return key
 
 
@@ -183,7 +189,7 @@ def prepare_encrypted_sqlite(path: Path, *, data_dir: Path, reset_legacy: bool =
     if not sqlcipher_enabled():
         return
     if reset_legacy and _looks_like_plaintext_sqlite(path):
-        _unlink_with_retry(path)
+        _migrate_plaintext_sqlite(path, data_dir=data_dir, keep_backup=True)
 
 
 def prepare_encrypted_qdrant_storage(path: Path, *, data_dir: Path, reset_legacy: bool = True) -> None:
@@ -192,11 +198,14 @@ def prepare_encrypted_qdrant_storage(path: Path, *, data_dir: Path, reset_legacy
         return
     if not sqlcipher_enabled():
         return
-    for storage_path in path.rglob("storage.sqlite"):
-        if _looks_like_plaintext_sqlite(storage_path):
-            _rmtree_with_retry(path)
-            path.mkdir(parents=True, exist_ok=True)
-            return
+    plaintext_paths = [
+        storage_path
+        for storage_path in path.rglob("storage.sqlite")
+        if _looks_like_plaintext_sqlite(storage_path)
+    ]
+    if not plaintext_paths:
+        return
+    _migrate_plaintext_qdrant_storage(path, data_dir=data_dir)
 
 
 def open_application_sqlite(
@@ -248,6 +257,235 @@ def _looks_like_plaintext_sqlite(path: Path) -> bool:
             return handle.read(len(_SQLITE_HEADER)) == _SQLITE_HEADER
     except OSError:
         return False
+
+
+def _migrate_plaintext_sqlite(path: Path, *, data_dir: Path, keep_backup: bool) -> Path | None:
+    if sqlcipher_dbapi is None or not _looks_like_plaintext_sqlite(path):
+        return None
+
+    backup_path = _migration_backup_path(
+        data_dir=data_dir,
+        source=path,
+        suffix=".plaintext.sqlite",
+    )
+    staged_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.encrypted.tmp")
+    backup_path.parent.mkdir(parents=True, exist_ok=True)
+    _restrict_permissions(backup_path.parent, directory=True)
+    try:
+        _snapshot_plaintext_sqlite(path, backup_path)
+        _encrypt_sqlite_snapshot(
+            backup_path,
+            staged_path,
+            key=get_or_create_storage_key(data_dir),
+        )
+        _verify_encrypted_sqlite(staged_path, key=get_or_create_storage_key(data_dir))
+        try:
+            staged_path.chmod(stat.S_IMODE(path.stat().st_mode))
+        except OSError:
+            pass
+        moved_sidecars: list[tuple[Path, Path]] = []
+        try:
+            for suffix in ("-wal", "-shm", "-journal"):
+                sidecar_path = path.with_name(f"{path.name}{suffix}")
+                if not sidecar_path.exists():
+                    continue
+                backup_sidecar_path = backup_path.with_name(f"{backup_path.name}{suffix}")
+                os.replace(sidecar_path, backup_sidecar_path)
+                moved_sidecars.append((sidecar_path, backup_sidecar_path))
+            os.replace(staged_path, path)
+        except Exception:
+            for sidecar_path, backup_sidecar_path in reversed(moved_sidecars):
+                if backup_sidecar_path.exists() and not sidecar_path.exists():
+                    os.replace(backup_sidecar_path, sidecar_path)
+            raise
+        _fsync_directory(path.parent)
+    except Exception as exc:
+        staged_path.unlink(missing_ok=True)
+        if not keep_backup:
+            backup_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"Atlas could not safely migrate plaintext SQLite storage at {path}. "
+            f"The original database was left in place and a recovery copy is available at {backup_path}."
+        ) from exc
+
+    if not keep_backup:
+        backup_path.unlink(missing_ok=True)
+        return None
+    return backup_path
+
+
+def _migrate_plaintext_qdrant_storage(path: Path, *, data_dir: Path) -> Path:
+    backup_path = _migration_backup_path(
+        data_dir=data_dir,
+        source=path,
+        suffix=".plaintext.qdrant",
+    )
+    staged_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.encrypted.tmp")
+    rollback_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.rollback")
+    migration_committed = False
+    backup_path.parent.mkdir(parents=True, exist_ok=True)
+    _restrict_permissions(backup_path.parent, directory=True)
+    try:
+        shutil.copytree(path, backup_path)
+        for source_storage_path in path.rglob("storage.sqlite"):
+            if not _looks_like_plaintext_sqlite(source_storage_path):
+                continue
+            backup_storage_path = backup_path / source_storage_path.relative_to(path)
+            snapshot_path = backup_storage_path.with_name(
+                f".{backup_storage_path.name}.{uuid.uuid4().hex}.snapshot.tmp"
+            )
+            _snapshot_plaintext_sqlite(source_storage_path, snapshot_path)
+            os.replace(snapshot_path, backup_storage_path)
+            for suffix in ("-wal", "-shm"):
+                backup_storage_path.with_name(f"{backup_storage_path.name}{suffix}").unlink(
+                    missing_ok=True
+                )
+        _restrict_tree_permissions(backup_path)
+        shutil.copytree(backup_path, staged_path)
+        for storage_path in staged_path.rglob("storage.sqlite"):
+            if _looks_like_plaintext_sqlite(storage_path):
+                _migrate_plaintext_sqlite(
+                    storage_path,
+                    data_dir=data_dir,
+                    keep_backup=False,
+                )
+        remaining_plaintext = [
+            storage_path
+            for storage_path in staged_path.rglob("storage.sqlite")
+            if _looks_like_plaintext_sqlite(storage_path)
+        ]
+        if remaining_plaintext:
+            raise RuntimeError(
+                "One or more staged Qdrant databases remained plaintext after migration."
+            )
+
+        os.replace(path, rollback_path)
+        try:
+            os.replace(staged_path, path)
+        except Exception:
+            os.replace(rollback_path, path)
+            raise
+        migration_committed = True
+        try:
+            _rmtree_with_retry(rollback_path)
+        except PermissionError:
+            archived_original = backup_path / "pre-migration-original"
+            os.replace(rollback_path, archived_original)
+            _restrict_tree_permissions(archived_original)
+        _fsync_directory(path.parent)
+        return backup_path
+    except Exception as exc:
+        if staged_path.exists():
+            _rmtree_with_retry(staged_path)
+        if migration_committed:
+            raise RuntimeError(
+                f"Atlas migrated Qdrant storage at {path}, but could not finish securing "
+                f"the rollback copy. Recovery data remains at {backup_path}."
+            ) from exc
+        if rollback_path.exists() and not path.exists():
+            os.replace(rollback_path, path)
+        elif rollback_path.exists():
+            _rmtree_with_retry(rollback_path)
+        raise RuntimeError(
+            f"Atlas could not safely migrate plaintext Qdrant storage at {path}. "
+            f"The original store was restored and a recovery copy is available at {backup_path}."
+        ) from exc
+
+
+def _snapshot_plaintext_sqlite(source: Path, destination: Path) -> None:
+    destination.unlink(missing_ok=True)
+    source_uri = f"file:{source.resolve().as_posix()}?mode=ro"
+    with closing(sqlite3.connect(source_uri, uri=True)) as source_conn:
+        with closing(sqlite3.connect(destination)) as destination_conn:
+            source_conn.backup(destination_conn)
+            destination_conn.commit()
+    _restrict_permissions(destination, directory=False)
+    _fsync_file(destination)
+
+
+def _encrypt_sqlite_snapshot(source: Path, destination: Path, *, key: bytes) -> None:
+    if sqlcipher_dbapi is None:
+        raise RuntimeError("SQLCipher is not available.")
+    destination.unlink(missing_ok=True)
+    connection = sqlcipher_dbapi.connect(str(source))
+    try:
+        connection.execute(
+            f"ATTACH DATABASE {_sqlite_literal(str(destination))} AS encrypted "
+            f"KEY \"x'{key.hex()}'\""
+        )
+        connection.execute("SELECT sqlcipher_export('encrypted')")
+        connection.execute("DETACH DATABASE encrypted")
+        connection.commit()
+    finally:
+        connection.close()
+    _fsync_file(destination)
+
+
+def _verify_encrypted_sqlite(path: Path, *, key: bytes) -> None:
+    if _looks_like_plaintext_sqlite(path):
+        raise RuntimeError("The migrated SQLite database is still plaintext.")
+    if sqlcipher_dbapi is None:
+        raise RuntimeError("SQLCipher is not available.")
+    connection = sqlcipher_dbapi.connect(str(path))
+    try:
+        _apply_sqlcipher_key(connection, key)
+        row = connection.execute("PRAGMA integrity_check").fetchone()
+        if not row or str(row[0]).lower() != "ok":
+            raise RuntimeError("The migrated SQLite database did not pass its integrity check.")
+    finally:
+        connection.close()
+
+
+def _migration_backup_path(*, data_dir: Path, source: Path, suffix: str) -> Path:
+    backup_root = data_dir / _MIGRATION_BACKUP_DIR
+    try:
+        if backup_root.resolve().is_relative_to(source.resolve()):
+            backup_root = source.parent / ".atlas-migration-backups"
+    except (OSError, ValueError):
+        pass
+    source_fingerprint = hashlib.sha256(str(source.resolve()).encode("utf-8")).hexdigest()[:12]
+    timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    return backup_root / f"{source.name}.{source_fingerprint}.{timestamp}.{uuid.uuid4().hex}{suffix}"
+
+
+def _sqlite_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _fsync_file(path: Path) -> None:
+    with path.open("rb") as handle:
+        os.fsync(handle.fileno())
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError:
+            pass
+    finally:
+        os.close(descriptor)
+
+
+def _restrict_tree_permissions(path: Path) -> None:
+    _restrict_permissions(path, directory=True)
+    for item in path.rglob("*"):
+        _restrict_permissions(item, directory=item.is_dir())
+
+
+def _restrict_permissions(path: Path, *, directory: bool) -> None:
+    if os.name == "nt":
+        return
+    try:
+        path.chmod(0o700 if directory else 0o600)
+    except OSError:
+        pass
 
 
 def _unlink_with_retry(path: Path) -> None:

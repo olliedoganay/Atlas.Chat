@@ -1,18 +1,29 @@
+import queue
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from atlas_local.code_runner import (
     CodeRunner,
+    DEFAULT_RUNNER_MAX_FILE_BYTES,
     LANGUAGES,
     LEGACY_PYTHON_GUI_IMAGES,
     PYTHON_GUI_IMAGE,
+    RUNNER_INTERNAL_NETWORK,
+    RUNNER_MAX_CODE_BYTES,
     RunPlan,
+    RunnerProcess,
+    _ensure_internal_network,
     resolve_plan,
     _remove_legacy_python_gui_images,
     _runner_network_policy,
+    _runner_storage_limit,
+    _runner_storage_limit_supported,
     _runner_timeout_seconds,
 )
 
@@ -24,7 +35,7 @@ class CodeRunnerPolicyTests(unittest.TestCase):
         with patch.dict("os.environ", {}, clear=False):
             self.assertEqual(_runner_network_policy(plan), "none")
 
-    def test_gui_runs_force_bridge_network_for_vnc_port(self) -> None:
+    def test_gui_runs_use_an_internal_network_for_vnc_without_outbound_access(self) -> None:
         plan = RunPlan(
             image=PYTHON_GUI_IMAGE,
             filename="main.py",
@@ -34,6 +45,19 @@ class CodeRunnerPolicyTests(unittest.TestCase):
         )
 
         with patch.dict("os.environ", {"ATLAS_RUNNER_NETWORK": "none"}):
+            self.assertEqual(_runner_network_policy(plan), RUNNER_INTERNAL_NETWORK)
+
+    def test_bridge_network_requires_explicit_configuration(self) -> None:
+        plan = RunPlan(
+            image=PYTHON_GUI_IMAGE,
+            filename="main.py",
+            command=["python", "/work/main.py"],
+            ports={12345: 6080},
+            gui=True,
+            requires_network=True,
+        )
+
+        with patch.dict("os.environ", {"ATLAS_RUNNER_NETWORK": "bridge"}):
             self.assertEqual(_runner_network_policy(plan), "bridge")
 
     def test_timeout_policy_uses_env_override(self) -> None:
@@ -76,12 +100,27 @@ class CodeRunnerPolicyTests(unittest.TestCase):
         args = captured["args"]
         self.assertIn("--network", args)
         self.assertEqual(args[args.index("--network") + 1], "none")
+        self.assertIn("--init", args)
+        self.assertIn("--memory-swap", args)
+        self.assertIn("--tmpfs", args)
+        self.assertIn("--ulimit", args)
+        self.assertIn(
+            f"fsize={DEFAULT_RUNNER_MAX_FILE_BYTES}:{DEFAULT_RUNNER_MAX_FILE_BYTES}",
+            args,
+        )
+        self.assertIn("--read-only", args)
+        self.assertIn("--user", args)
+        self.assertEqual(args[args.index("--user") + 1], "65534:65534")
         self.assertIn("--security-opt", args)
         self.assertIn("no-new-privileges", args)
         self.assertIn("--cap-drop", args)
         self.assertIn("ALL", args)
         self.assertIn("atlas.runner=1", args)
+        self.assertTrue(any(value.startswith("atlas.runner.owner_id=") for value in args))
+        self.assertEqual(response["configured_network"], "none")
         self.assertEqual(response["network"], "none")
+        self.assertFalse(response["outbound_network"])
+        self.assertEqual(response["filesystem_mode"], "read-only")
         self.assertEqual(response["timeout_seconds"], 120)
 
     def test_start_returns_web_url_for_web_plan(self) -> None:
@@ -112,6 +151,7 @@ class CodeRunnerPolicyTests(unittest.TestCase):
             with (
                 patch("atlas_local.code_runner._docker_binary", return_value="docker"),
                 patch("atlas_local.code_runner.resolve_plan", return_value=plan),
+                patch("atlas_local.code_runner._ensure_internal_network"),
                 patch("atlas_local.code_runner.subprocess.Popen", side_effect=fake_popen),
                 patch(
                     "atlas_local.code_runner.subprocess.run",
@@ -122,9 +162,14 @@ class CodeRunnerPolicyTests(unittest.TestCase):
                 response = CodeRunner().start("python", "print('hello')")
 
         args = captured["args"]
+        self.assertEqual(
+            args[args.index("--network") + 1],
+            RUNNER_INTERNAL_NETWORK,
+        )
         self.assertIn("-p", args)
         self.assertIn("127.0.0.1:12345:5000", args)
         self.assertEqual(response["web_url"], "http://127.0.0.1:12345/")
+        self.assertFalse(response["outbound_network"])
 
     def test_gui_start_keeps_only_package_install_capabilities(self) -> None:
         captured: dict[str, list[str]] = {}
@@ -155,6 +200,7 @@ class CodeRunnerPolicyTests(unittest.TestCase):
             with (
                 patch("atlas_local.code_runner._docker_binary", return_value="docker"),
                 patch("atlas_local.code_runner.resolve_plan", return_value=plan),
+                patch("atlas_local.code_runner._ensure_internal_network"),
                 patch("atlas_local.code_runner.subprocess.Popen", side_effect=fake_popen),
                 patch(
                     "atlas_local.code_runner.subprocess.run",
@@ -171,6 +217,8 @@ class CodeRunnerPolicyTests(unittest.TestCase):
             if value == "--cap-add" and index + 1 < len(args)
         ]
         self.assertEqual(added_caps, ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"])
+        self.assertNotIn("--read-only", args)
+        self.assertNotIn("--user", args)
 
     def test_docker_commands_do_not_use_login_shells(self) -> None:
         for language, spec in LANGUAGES.items():
@@ -183,13 +231,306 @@ class CodeRunnerPolicyTests(unittest.TestCase):
             with self.subTest(language=language):
                 self.assertRegex(spec.image, r"^(docker\.io|mcr\.microsoft\.com)/")
 
-    def test_package_manager_runners_use_bridge_network(self) -> None:
+    def test_package_manager_runners_remain_offline_by_default(self) -> None:
         for language in ("javascript", "typescript", "go", "rust", "ruby", "perl", "r", "dart"):
             with self.subTest(language=language):
                 plan = resolve_plan(language, "print('ok')")
                 self.assertTrue(plan.requires_network)
                 with patch.dict("os.environ", {}, clear=False):
-                    self.assertEqual(_runner_network_policy(plan), "bridge")
+                    self.assertEqual(_runner_network_policy(plan), "none")
+
+    def test_mutable_latest_and_stable_image_tags_are_not_used(self) -> None:
+        for language, spec in LANGUAGES.items():
+            with self.subTest(language=language):
+                self.assertNotRegex(spec.image, r":(?:latest|stable)$")
+
+    def test_internal_preview_network_is_created_without_outbound_routing(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run(args, **_kwargs):
+            calls.append(args)
+            if args[1:3] == ["network", "inspect"]:
+                return SimpleNamespace(returncode=1, stdout="", stderr="not found")
+            return SimpleNamespace(returncode=0, stdout=RUNNER_INTERNAL_NETWORK, stderr="")
+
+        with patch("atlas_local.code_runner.subprocess.run", side_effect=fake_run):
+            _ensure_internal_network("docker")
+
+        create_call = next(args for args in calls if args[1:3] == ["network", "create"])
+        self.assertIn("--internal", create_call)
+        self.assertIn("--driver", create_call)
+        self.assertIn("atlas.runner.network=1", create_call)
+
+    def test_existing_non_internal_preview_network_is_rejected(self) -> None:
+        with patch(
+            "atlas_local.code_runner.subprocess.run",
+            return_value=SimpleNamespace(returncode=0, stdout="false\n", stderr=""),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "already exists but is not internal"):
+                _ensure_internal_network("docker")
+
+    def test_dependency_run_reports_offline_requirement_instead_of_upgrading_network(self) -> None:
+        class FakeProcess:
+            stdout: list[str] = []
+            stderr: list[str] = []
+
+            def wait(self) -> int:
+                return 0
+
+            def kill(self) -> None:
+                return None
+
+        plan = RunPlan(
+            image="docker.io/library/node:20-alpine",
+            filename="main.js",
+            command=["node", "/work/main.js"],
+            requires_network=True,
+        )
+        with (
+            patch.dict("os.environ", {"ATLAS_RUNNER_NETWORK": "none"}),
+            patch("atlas_local.code_runner._docker_binary", return_value="docker"),
+            patch("atlas_local.code_runner.resolve_plan", return_value=plan),
+            patch("atlas_local.code_runner.subprocess.Popen", return_value=FakeProcess()),
+            patch(
+                "atlas_local.code_runner.subprocess.run",
+                return_value=SimpleNamespace(returncode=0, stdout="", stderr=""),
+            ),
+        ):
+            runner = CodeRunner()
+            response = runner.start("javascript", "console.log('hello')")
+            history, _, _ = runner.subscribe(response["run_id"])
+
+        self.assertEqual(response["configured_network"], "none")
+        self.assertEqual(response["network"], "none")
+        self.assertFalse(response["outbound_network"])
+        self.assertTrue(response["dependency_network_required"])
+        self.assertTrue(response["network_requirement_unmet"])
+        self.assertIn("network_warning", response)
+        self.assertTrue(
+            any("explicitly allow outbound access" in event.get("chunk", "") for event in history)
+        )
+
+    def test_explicit_bridge_reports_outbound_network_available(self) -> None:
+        captured: dict[str, list[str]] = {}
+
+        class FakeProcess:
+            stdout: list[str] = []
+            stderr: list[str] = []
+
+            def wait(self) -> int:
+                return 0
+
+            def kill(self) -> None:
+                return None
+
+        def fake_popen(args, **_kwargs):
+            captured["args"] = args
+            return FakeProcess()
+
+        plan = RunPlan(
+            image="docker.io/library/node:20-alpine",
+            filename="main.js",
+            command=["node", "/work/main.js"],
+            requires_network=True,
+        )
+        with (
+            patch.dict("os.environ", {"ATLAS_RUNNER_NETWORK": "bridge"}),
+            patch("atlas_local.code_runner._docker_binary", return_value="docker"),
+            patch("atlas_local.code_runner.resolve_plan", return_value=plan),
+            patch("atlas_local.code_runner.subprocess.Popen", side_effect=fake_popen),
+            patch(
+                "atlas_local.code_runner.subprocess.run",
+                return_value=SimpleNamespace(returncode=0, stdout="", stderr=""),
+            ),
+        ):
+            response = CodeRunner().start("javascript", "console.log('hello')")
+
+        self.assertEqual(captured["args"][captured["args"].index("--network") + 1], "bridge")
+        self.assertTrue(response["outbound_network"])
+        self.assertFalse(response["network_requirement_unmet"])
+        self.assertNotIn("network_warning", response)
+
+    def test_storage_limit_is_strictly_validated(self) -> None:
+        with patch.dict("os.environ", {"ATLAS_RUNNER_STORAGE_LIMIT": "2GiB"}):
+            self.assertEqual(_runner_storage_limit(), "2GiB")
+
+        with patch.dict("os.environ", {"ATLAS_RUNNER_STORAGE_LIMIT": "2G;--privileged"}):
+            with self.assertRaisesRegex(RuntimeError, "must be a positive byte count"):
+                _runner_storage_limit()
+
+    def test_storage_limit_support_is_detected_from_engine_help(self) -> None:
+        with patch(
+            "atlas_local.code_runner.subprocess.run",
+            return_value=SimpleNamespace(
+                returncode=0,
+                stdout="Usage: docker run [OPTIONS]\n  --storage-opt list\n",
+                stderr="",
+            ),
+        ):
+            self.assertTrue(_runner_storage_limit_supported("docker"))
+
+        with patch(
+            "atlas_local.code_runner.subprocess.run",
+            return_value=SimpleNamespace(returncode=0, stdout="Usage: podman run\n", stderr=""),
+        ):
+            self.assertFalse(_runner_storage_limit_supported("docker"))
+
+    def test_code_size_is_bounded_before_docker_is_invoked(self) -> None:
+        runner = CodeRunner()
+        with (
+            patch("atlas_local.code_runner._docker_binary") as docker_binary,
+            self.assertRaisesRegex(RuntimeError, "Code is too large"),
+        ):
+            runner.start("python", "x" * (RUNNER_MAX_CODE_BYTES + 1))
+        docker_binary.assert_not_called()
+
+    def test_global_run_concurrency_limit_rejects_excess_runs_and_shutdown_cleans_up(self) -> None:
+        class BlockingProcess:
+            stdout: list[str] = []
+            stderr: list[str] = []
+
+            def __init__(self) -> None:
+                self.done = threading.Event()
+                self.killed = False
+
+            def wait(self) -> int:
+                self.done.wait()
+                return 137 if self.killed else 0
+
+            def kill(self) -> None:
+                self.killed = True
+                self.done.set()
+
+        process = BlockingProcess()
+        calls: list[list[str]] = []
+
+        def fake_run(args, **_kwargs):
+            calls.append(args)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        plan = RunPlan(
+            image="docker.io/library/python:3.12-slim",
+            filename="main.py",
+            command=["python", "/work/main.py"],
+        )
+        runner = CodeRunner(max_concurrent=1)
+        with (
+            patch("atlas_local.code_runner._docker_binary", return_value="docker"),
+            patch("atlas_local.code_runner.resolve_plan", return_value=plan),
+            patch("atlas_local.code_runner.subprocess.Popen", return_value=process) as popen,
+            patch("atlas_local.code_runner.subprocess.run", side_effect=fake_run),
+        ):
+            response = runner.start("python", "print('one')")
+            with self.assertRaisesRegex(RuntimeError, "concurrency limit reached"):
+                runner.start("python", "print('two')")
+            runner.shutdown()
+            runner.shutdown()
+            with self.assertRaisesRegex(RuntimeError, "shutting down"):
+                runner.start("python", "print('three')")
+
+        self.assertEqual(popen.call_count, 1)
+        self.assertTrue(process.killed)
+        self.assertIn(
+            ["docker", "rm", "-f", response["container"]],
+            calls,
+        )
+
+    def test_history_output_and_subscriber_queues_are_bounded(self) -> None:
+        code_runner = CodeRunner(
+            history_limit=3,
+            subscriber_queue_size=2,
+            max_output_bytes=4,
+        )
+        runner = RunnerProcess(
+            run_id="bounded",
+            language="python",
+            container_name="atlas-run-bounded",
+            work_dir=Path(tempfile.gettempdir()) / "atlas-run-bounded-test",
+            started_at=time.time(),
+            timeout_seconds=120,
+            network="none",
+            process=SimpleNamespace(),
+            history_limit=3,
+            subscriber_queue_size=2,
+            max_output_bytes=4,
+        )
+        subscriber: queue.Queue[dict[str, object]] = queue.Queue(maxsize=2)
+        runner.subscribers.append(subscriber)
+
+        for value in range(5):
+            code_runner._emit(runner, {"type": "marker", "value": value})
+
+        self.assertEqual([event["value"] for event in runner.history], [2, 3, 4])
+        self.assertEqual(subscriber.qsize(), 2)
+        self.assertEqual(subscriber.get_nowait()["value"], 3)
+        self.assertEqual(subscriber.get_nowait()["value"], 4)
+
+        output_runner = RunnerProcess(
+            run_id="output",
+            language="python",
+            container_name="atlas-run-output",
+            work_dir=Path(tempfile.gettempdir()) / "atlas-run-output-test",
+            started_at=time.time(),
+            timeout_seconds=120,
+            network="none",
+            process=SimpleNamespace(),
+            history_limit=10,
+            subscriber_queue_size=2,
+            max_output_bytes=4,
+        )
+        code_runner._emit(
+            output_runner,
+            {"type": "output", "stream": "stdout", "chunk": "abcdef"},
+        )
+        code_runner._emit(
+            output_runner,
+            {"type": "output", "stream": "stdout", "chunk": "ignored"},
+        )
+
+        chunks = [event["chunk"] for event in output_runner.history]
+        self.assertEqual(chunks[0], "abcd")
+        self.assertEqual(sum("output truncated" in chunk for chunk in chunks), 1)
+        self.assertEqual(output_runner.output_bytes, 4)
+
+    def test_cleanup_removes_current_and_dead_owner_containers_but_preserves_live_owners(self) -> None:
+        runner = CodeRunner()
+        removed: list[str] = []
+
+        def fake_run(args, **_kwargs):
+            if args[1] == "ps":
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="owned-current\nowned-dead\nowned-live\n",
+                    stderr="",
+                )
+            if args[1] == "inspect":
+                name = args[-1]
+                labels = {
+                    "owned-current": (
+                        '{"atlas.runner.owner_id":"'
+                        + runner._owner_id
+                        + '","atlas.runner.owner_pid":"1"}'
+                    ),
+                    "owned-dead": (
+                        '{"atlas.runner.owner_id":"other","atlas.runner.owner_pid":"222"}'
+                    ),
+                    "owned-live": (
+                        '{"atlas.runner.owner_id":"other","atlas.runner.owner_pid":"333"}'
+                    ),
+                }
+                return SimpleNamespace(returncode=0, stdout=labels[name], stderr="")
+            if args[1:3] == ["rm", "-f"]:
+                removed.append(args[-1])
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            raise AssertionError(f"Unexpected command: {args}")
+
+        with (
+            patch("atlas_local.code_runner.subprocess.run", side_effect=fake_run),
+            patch("atlas_local.code_runner._process_is_alive", side_effect=lambda pid: pid == 333),
+        ):
+            runner._cleanup_stale_containers("docker")
+
+        self.assertEqual(set(removed), {"owned-current", "owned-dead"})
 
     def test_python_generated_runner_script_is_valid_shell_syntax(self) -> None:
         plan = resolve_plan("python", "name = 'requests'\nmodule = __import__(name)\nprint(module)")
@@ -304,7 +645,7 @@ class CodeRunnerPolicyTests(unittest.TestCase):
         self.assertIn("opencv-python", plan.command[-1])
         self.assertIn("libgl1", plan.command[-1])
         with patch.dict("os.environ", {}, clear=False):
-            self.assertEqual(_runner_network_policy(plan), "bridge")
+            self.assertEqual(_runner_network_policy(plan), "none")
 
     def test_python_dependency_hints_are_installed_without_running_shell_text(self) -> None:
         plan = resolve_plan(
@@ -402,7 +743,7 @@ class CodeRunnerPolicyTests(unittest.TestCase):
         self.assertIn("HOST=0.0.0.0", plan.command[-1])
         self.assertIn("web preview will use container port 5000", plan.command[-1])
         with patch.dict("os.environ", {}, clear=False):
-            self.assertEqual(_runner_network_policy(plan), "bridge")
+            self.assertEqual(_runner_network_policy(plan), RUNNER_INTERNAL_NETWORK)
 
     def test_python_fastapi_definition_launches_with_uvicorn(self) -> None:
         plan = resolve_plan("python", "from fastapi import FastAPI\napi = FastAPI()\n")

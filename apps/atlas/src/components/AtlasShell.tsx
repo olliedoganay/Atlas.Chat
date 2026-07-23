@@ -102,6 +102,9 @@ export function AtlasShell() {
   const [isSearchOpen, setIsSearchOpen] = useState(false);
   const [isNavResizing, setIsNavResizing] = useState(false);
   const [isWindowMaximized, setIsWindowMaximized] = useState(true);
+  const [isCompactViewport, setIsCompactViewport] = useState(false);
+  const [isResponsiveNavOpen, setIsResponsiveNavOpen] = useState(false);
+  const [isFirstRunActive, setIsFirstRunActive] = useState(false);
 
   const {
     data: status,
@@ -119,6 +122,7 @@ export function AtlasShell() {
     queryFn: getModels,
     enabled: Boolean(status),
     staleTime: 10000,
+    refetchInterval: 5000,
     retry: 1,
     refetchOnWindowFocus: false,
   });
@@ -293,6 +297,33 @@ export function AtlasShell() {
   }, [currentUserLocked]);
 
   useEffect(() => {
+    if (
+      !firstRunDismissed &&
+      usersFetched &&
+      users.length === 0 &&
+      backendPhase !== "starting"
+    ) {
+      setIsFirstRunActive(true);
+    }
+  }, [backendPhase, firstRunDismissed, users.length, usersFetched]);
+
+  useEffect(() => {
+    if (typeof window.matchMedia !== "function") {
+      return undefined;
+    }
+    const media = window.matchMedia("(max-width: 1100px)");
+    const syncViewport = () => {
+      setIsCompactViewport(media.matches);
+      if (!media.matches) {
+        setIsResponsiveNavOpen(false);
+      }
+    };
+    syncViewport();
+    media.addEventListener("change", syncViewport);
+    return () => media.removeEventListener("change", syncViewport);
+  }, []);
+
+  useEffect(() => {
     let mounted = true;
     let unlistenResize: (() => void) | undefined;
     let unlistenMove: (() => void) | undefined;
@@ -382,6 +413,9 @@ export function AtlasShell() {
     setCurrentThreadTitle(editableThreadTitle(thread.title, thread.thread_id));
     setDraftThreadModel(thread.chat_model || "");
     setDraftThreadTemperature(resolveThreadTemperature(thread, defaultTemperature));
+    if (isCompactViewport) {
+      setIsResponsiveNavOpen(false);
+    }
   };
 
   const createThread = () => {
@@ -396,7 +430,7 @@ export function AtlasShell() {
   };
 
   const startNavResize = (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (navCollapsed) {
+    if (navCollapsed || isCompactViewport) {
       return;
     }
     event.preventDefault();
@@ -442,9 +476,18 @@ export function AtlasShell() {
     }
   };
 
-  const shellStyle = navCollapsed
+  const effectiveNavCollapsed = isCompactViewport ? !isResponsiveNavOpen : navCollapsed;
+  const shellStyle = effectiveNavCollapsed
     ? undefined
     : ({ "--atlas-nav-width": `${clamp(navWidth, NAV_WIDTH_MIN, NAV_WIDTH_MAX)}px` } as CSSProperties);
+
+  const handleNavToggle = () => {
+    if (isCompactViewport) {
+      setIsResponsiveNavOpen((open) => !open);
+      return;
+    }
+    toggleNavCollapsed();
+  };
 
   const handleProfilePick = async (userId: string) => {
     setCurrentUserId(userId);
@@ -465,11 +508,7 @@ export function AtlasShell() {
     navigate(PROFILE_SETTINGS_PATH);
   };
 
-  const showFirstRun =
-    !firstRunDismissed &&
-    usersFetched &&
-    users.length === 0 &&
-    backendPhase !== "starting";
+  const showFirstRun = !firstRunDismissed && isFirstRunActive;
   const activeNavigationLabel = navigation.find((item) => item.to === location.pathname)?.label ?? "Atlas";
   const titlebarLocation = isWorkspaceRoute
     ? `Workspace / ${displayThreadTitle(currentThreadTitle, currentThreadId, "Main")}`
@@ -503,7 +542,13 @@ export function AtlasShell() {
           <button aria-label="Minimize window" className="atlas-window-button" onClick={() => runWindowAction("minimize")} title="Minimize" type="button">
             <Minus size={14} strokeWidth={1.8} />
           </button>
-          <button aria-label="Maximize window" className="atlas-window-button" onClick={() => runWindowAction("toggle-maximize")} title="Maximize" type="button">
+          <button
+            aria-label={isWindowMaximized ? "Restore window" : "Maximize window"}
+            className="atlas-window-button"
+            onClick={() => runWindowAction("toggle-maximize")}
+            title={isWindowMaximized ? "Restore" : "Maximize"}
+            type="button"
+          >
             <Maximize2 size={13} strokeWidth={1.8} />
           </button>
           <button aria-label="Close window" className="atlas-window-button atlas-window-button-close" onClick={() => runWindowAction("close")} title="Close" type="button">
@@ -511,19 +556,29 @@ export function AtlasShell() {
           </button>
         </div>
       </header>
-      <div className={`app-shell ${navCollapsed ? "nav-collapsed" : ""}${isNavResizing ? " nav-resizing" : ""}`} style={shellStyle}>
+      <div
+        className={`app-shell ${effectiveNavCollapsed ? "nav-collapsed" : ""}${isCompactViewport ? " compact-viewport" : ""}${isResponsiveNavOpen ? " responsive-nav-open" : ""}${isNavResizing ? " nav-resizing" : ""}`}
+        style={shellStyle}
+      >
         <RunStreamCoordinator />
-        <aside className={`global-nav ${navCollapsed ? "collapsed" : ""}`}>
+        <aside aria-label="Primary navigation" className={`global-nav ${effectiveNavCollapsed ? "collapsed" : ""}`}>
         <div className="brand-lockup">
           <div className="brand-lockup-main">
-            {navCollapsed ? <img alt="Atlas Chat" className="brand-logo" src="/AtlasLogo.png" /> : null}
+            {effectiveNavCollapsed ? <img alt="Atlas Chat" className="brand-logo" src="/AtlasLogo.png" /> : null}
             <div className="brand-copy">
               <strong>Atlas Chat</strong>
               <span>Local AI workspace</span>
             </div>
           </div>
-          <button className="ghost-button icon-button nav-toggle" onClick={toggleNavCollapsed} type="button">
-            {navCollapsed ? <ChevronRight size={18} /> : <ChevronLeft size={18} />}
+          <button
+            aria-expanded={!effectiveNavCollapsed}
+            aria-label={effectiveNavCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+            className="ghost-button icon-button nav-toggle"
+            onClick={handleNavToggle}
+            title={effectiveNavCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+            type="button"
+          >
+            {effectiveNavCollapsed ? <ChevronRight size={18} /> : <ChevronLeft size={18} />}
           </button>
         </div>
 
@@ -533,6 +588,11 @@ export function AtlasShell() {
               <NavLink
                 className={({ isActive }) => `nav-link${isActive ? " active" : ""}`}
                 key={to}
+                onClick={() => {
+                  if (isCompactViewport) {
+                    setIsResponsiveNavOpen(false);
+                  }
+                }}
                 to={to}
               >
                 <Icon size={18} />
@@ -543,9 +603,10 @@ export function AtlasShell() {
 
           {isWorkspaceRoute ? (
             <section className="shell-threads">
-              {navCollapsed ? (
+              {effectiveNavCollapsed ? (
                 <div className="collapsed-thread-list">
                   <button
+                    aria-label="Search chats"
                     className="ghost-button icon-button"
                     disabled={!currentUserId || currentUserLocked}
                     onClick={() => setIsSearchOpen(true)}
@@ -554,11 +615,20 @@ export function AtlasShell() {
                   >
                     <Search size={16} />
                   </button>
-                  <button className="primary-button icon-button" disabled={!currentUserId || currentUserLocked} onClick={createThread} type="button">
+                  <button
+                    aria-label="Create new chat"
+                    className="primary-button icon-button"
+                    disabled={!currentUserId || currentUserLocked}
+                    onClick={createThread}
+                    title="Create new chat"
+                    type="button"
+                  >
                     <Plus size={16} />
                   </button>
                   {displayThreadItems.map((thread) => (
                     <button
+                      aria-current={thread.thread_id === currentThreadId ? "page" : undefined}
+                      aria-label={`Open ${displayThreadTitle(thread)}`}
                       className={`collapsed-thread-button ${thread.thread_id === currentThreadId ? "active" : ""}`}
                       key={thread.thread_id}
                       onClick={() => selectThread(thread)}
@@ -576,7 +646,14 @@ export function AtlasShell() {
                       <p className="workspace-section-label">Chats</p>
                       <p className="muted-text">{formatChatCount(displayThreadItems.length)}</p>
                     </div>
-                    <button className="primary-button icon-button" disabled={!currentUserId || currentUserLocked} onClick={createThread} type="button">
+                    <button
+                      aria-label="Create new chat"
+                      className="primary-button icon-button"
+                      disabled={!currentUserId || currentUserLocked}
+                      onClick={createThread}
+                      title="Create new chat"
+                      type="button"
+                    >
                       <Plus size={16} />
                     </button>
                   </div>
@@ -635,6 +712,7 @@ export function AtlasShell() {
                               </button>
                             ) : null}
                             <button
+                              aria-current={thread.thread_id === currentThreadId ? "page" : undefined}
                               className="thread-card-main"
                               onClick={() => selectThread(thread)}
                               type="button"
@@ -673,7 +751,7 @@ export function AtlasShell() {
         </div>
 
         <div className="nav-footer">
-          {!navCollapsed ? (
+          {!effectiveNavCollapsed ? (
             <ProfileMenu
               currentUserId={currentUserId}
               onPick={(userId) => {
@@ -683,8 +761,13 @@ export function AtlasShell() {
               users={users}
             />
           ) : null}
-          <div className={`status-pill ${startupState.tone}`}>
-            <span className="status-dot" />
+          <div
+            aria-live="polite"
+            className={`status-pill ${startupState.tone}`}
+            role="status"
+            title={startupState.shellLabel}
+          >
+            <span aria-hidden="true" className="status-dot" />
             <span>{startupState.shellLabel}</span>
           </div>
           {startupState.key === "backend-offline" ? (
@@ -694,7 +777,7 @@ export function AtlasShell() {
             </button>
           ) : null}
         </div>
-        {!navCollapsed ? (
+        {!effectiveNavCollapsed && !isCompactViewport ? (
           <div
             aria-label="Resize sidebar"
             aria-orientation="vertical"
@@ -736,7 +819,10 @@ export function AtlasShell() {
           hasLocalModels={hasChatModels}
           isOllamaProvider={isOllamaProvider}
           ollamaOnline={providerOnline}
-          onDismiss={() => setFirstRunDismissed(true)}
+          onDismiss={() => {
+            setIsFirstRunActive(false);
+            setFirstRunDismissed(true);
+          }}
           onProfileCreated={async (userId) => {
             queryClient.setQueryData<UserSummary[]>(["users"], (current = []) => {
               if (current.some((user) => user.user_id === userId)) {

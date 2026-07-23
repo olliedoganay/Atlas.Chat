@@ -9,6 +9,7 @@ from atlas_local.config import load_config
 from atlas_local.run_store import RunStore
 from atlas_local.run_store import _atomic_write_json
 from atlas_local.run_store import _read_json_with_retry
+from atlas_local.session import legacy_scoped_thread_id, scoped_thread_id
 
 
 class RunStoreTests(unittest.TestCase):
@@ -67,6 +68,106 @@ class RunStoreTests(unittest.TestCase):
             self.assertIsNone(artifact["temperature"])
             self.assertIsNone(store.get_run(artifact["run_id"])["temperature"])
             self.assertIsNone(store.get_thread(user_id="research_user", thread_id="main")["temperature"])
+
+    def test_streamed_tokens_are_visible_immediately_but_persisted_in_batches(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = load_config(project_root=Path(temp_dir), env={})
+            store = RunStore(config)
+            artifact = store.create_run(
+                mode="chat",
+                user_id="research_user",
+                thread_id="main",
+                chat_model="gpt-oss:20b",
+                temperature=0.2,
+                prompt="hello",
+            )
+            run_id = artifact["run_id"]
+
+            with mock.patch.object(
+                store,
+                "_write_run_file",
+                wraps=store._write_run_file,
+            ) as write_run:
+                for token in ("Atlas", " ", "streams", " ", "smoothly"):
+                    store.append_event(run_id, "token", {"text": token})
+
+                live = store.get_run(run_id)
+                self.assertEqual(live["answer"], "Atlas streams smoothly")
+                self.assertEqual(len(live["events"]), 5)
+                self.assertEqual(write_run.call_count, 0)
+
+                store.append_event(run_id, "stage_changed", {"stage": "finalize"})
+                self.assertEqual(write_run.call_count, 1)
+
+            persisted = store.get_run(run_id)
+            self.assertEqual(persisted["answer"], "Atlas streams smoothly")
+            self.assertEqual(persisted["events"][-1]["type"], "stage_changed")
+
+    def test_thread_index_keys_do_not_collide_on_delimiter_values(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = load_config(project_root=Path(temp_dir), env={})
+            store = RunStore(config)
+
+            store.upsert_thread(
+                user_id="a",
+                thread_id="b::c",
+                title="first",
+                chat_model="model-a",
+                temperature=0.2,
+            )
+            store.upsert_thread(
+                user_id="a::b",
+                thread_id="c",
+                title="second",
+                chat_model="model-b",
+                temperature=0.3,
+            )
+
+            self.assertEqual(store.get_thread(user_id="a", thread_id="b::c")["title"], "first")
+            self.assertEqual(store.get_thread(user_id="a::b", thread_id="c")["title"], "second")
+            self.assertNotEqual(
+                scoped_thread_id("a", "b::c"),
+                scoped_thread_id("a::b", "c"),
+            )
+
+    def test_legacy_thread_index_key_is_read_and_migrated_on_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = load_config(project_root=Path(temp_dir), env={})
+            store = RunStore(config)
+            legacy_key = legacy_scoped_thread_id("research_user", "main")
+            store._write_index(
+                {
+                    "threads": {
+                        legacy_key: {
+                            "user_id": "research_user",
+                            "thread_id": "main",
+                            "title": "legacy title",
+                            "chat_model": "model-a",
+                            "temperature": 0.2,
+                            "last_mode": "chat",
+                            "updated_at": "2026-01-01T00:00:00Z",
+                            "last_prompt": "legacy prompt",
+                            "last_run_id": "",
+                        }
+                    },
+                    "runs": {},
+                    "users": {},
+                }
+            )
+
+            self.assertEqual(
+                store.get_thread(user_id="research_user", thread_id="main")["title"],
+                "legacy title",
+            )
+            store.rename_thread(user_id="research_user", thread_id="main", title="migrated title")
+            migrated = store._read_index()
+
+            self.assertNotIn(legacy_key, migrated["threads"])
+            self.assertIn(scoped_thread_id("research_user", "main"), migrated["threads"])
+            self.assertEqual(
+                migrated["threads"][scoped_thread_id("research_user", "main")]["title"],
+                "migrated title",
+            )
 
     def test_concurrent_create_run_preserves_every_index_entry(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -212,6 +313,26 @@ class RunStoreTests(unittest.TestCase):
             self.assertIsNotNone(user["password_salt"])
             self.assertTrue(store.verify_user_password("protected_user", "atlas-secret"))
             self.assertFalse(store.verify_user_password("protected_user", "wrong-secret"))
+
+    def test_lock_and_failed_unlock_zeroize_cached_profile_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = load_config(project_root=Path(temp_dir), env={})
+            store = RunStore(config)
+            store.create_user("protected_user", password="atlas-secret")
+            store.unlock_user_key("protected_user", password="atlas-secret")
+            cached = store._user_keys["protected_user"]
+
+            store.lock_user_key("protected_user")
+
+            self.assertNotIn("protected_user", store._user_keys)
+            self.assertEqual(bytes(cached), b"\x00" * len(cached))
+
+            store.unlock_user_key("protected_user", password="atlas-secret")
+            cached_again = store._user_keys["protected_user"]
+            with self.assertRaisesRegex(RuntimeError, "Password did not match"):
+                store.unlock_user_key("protected_user", password="wrong-secret")
+            self.assertNotIn("protected_user", store._user_keys)
+            self.assertEqual(bytes(cached_again), b"\x00" * len(cached_again))
 
     def test_delete_thread_preserves_user_record(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
