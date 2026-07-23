@@ -28,6 +28,14 @@ from atlas_local.code_runner import (
 )
 
 
+def _wait_for_runner_cleanup(path: Path, *, timeout: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout
+    while path.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if path.exists():
+        raise AssertionError(f"Runner work directory was not cleaned up: {path}")
+
+
 class CodeRunnerPolicyTests(unittest.TestCase):
     def test_default_network_is_isolated_for_non_gui_runs(self) -> None:
         plan = RunPlan(image="python:3.12-slim", filename="main.py", command=["python", "/work/main.py"])
@@ -96,6 +104,7 @@ class CodeRunnerPolicyTests(unittest.TestCase):
                 patch("atlas_local.code_runner.tempfile.mkdtemp", return_value=tmp),
             ):
                 response = CodeRunner().start("python", "print('hello')")
+                _wait_for_runner_cleanup(Path(tmp))
 
         args = captured["args"]
         self.assertIn("--network", args)
@@ -160,6 +169,7 @@ class CodeRunnerPolicyTests(unittest.TestCase):
                 patch("atlas_local.code_runner.tempfile.mkdtemp", return_value=tmp),
             ):
                 response = CodeRunner().start("python", "print('hello')")
+                _wait_for_runner_cleanup(Path(tmp))
 
         args = captured["args"]
         self.assertEqual(
@@ -209,6 +219,7 @@ class CodeRunnerPolicyTests(unittest.TestCase):
                 patch("atlas_local.code_runner.tempfile.mkdtemp", return_value=tmp),
             ):
                 CodeRunner().start("python", "print('hello')")
+                _wait_for_runner_cleanup(Path(tmp))
 
         args = captured["args"]
         added_caps = [

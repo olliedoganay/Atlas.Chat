@@ -453,7 +453,11 @@ def _sqlite_literal(value: str) -> str:
 
 
 def _fsync_file(path: Path) -> None:
-    with path.open("rb") as handle:
+    # Windows requires a writable descriptor for FlushFileBuffers, which is
+    # what Python's os.fsync delegates to there. Opening an existing migration
+    # artifact read/write does not alter its contents and keeps the durability
+    # guarantee consistent across platforms.
+    with path.open("rb+") as handle:
         os.fsync(handle.fileno())
 
 
