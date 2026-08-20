@@ -35,6 +35,7 @@ from atlas_local.code_runner import (
     _runner_storage_limit,
     _runner_storage_limit_supported,
     _runner_timeout_seconds,
+    docker_status,
 )
 
 
@@ -47,6 +48,59 @@ def _wait_for_runner_cleanup(path: Path, *, timeout: float = 2.0) -> None:
 
 
 class CodeRunnerPolicyTests(unittest.TestCase):
+    def test_docker_status_hides_invocation_errors_and_logs_them_server_side(self) -> None:
+        secret_detail = "private docker socket path"
+
+        with (
+            patch("atlas_local.code_runner._docker_binary", return_value="docker"),
+            patch(
+                "atlas_local.code_runner.subprocess.run",
+                side_effect=OSError(secret_detail),
+            ),
+            self.assertLogs("atlas_local.code_runner", level="WARNING") as captured,
+        ):
+            status = docker_status()
+
+        self.assertEqual(
+            status,
+            {
+                "available": False,
+                "reason": "Docker could not be checked. Verify Docker Desktop is installed and try again.",
+            },
+        )
+        self.assertNotIn(secret_detail, json.dumps(status))
+        self.assertIn(secret_detail, "\n".join(captured.output))
+
+    def test_docker_status_hides_process_output_and_logs_it_server_side(self) -> None:
+        public_reason = (
+            "Docker Desktop is installed but not running. Start Docker Desktop and try again."
+        )
+        cases = (
+            {"stderr": "private stderr detail", "stdout": ""},
+            {"stderr": "", "stdout": "private stdout detail"},
+        )
+
+        for completed_output in cases:
+            with self.subTest(completed_output=completed_output):
+                with (
+                    patch("atlas_local.code_runner._docker_binary", return_value="docker"),
+                    patch(
+                        "atlas_local.code_runner.subprocess.run",
+                        return_value=SimpleNamespace(
+                            returncode=1,
+                            **completed_output,
+                        ),
+                    ),
+                    self.assertLogs("atlas_local.code_runner", level="WARNING") as captured,
+                ):
+                    status = docker_status()
+
+                self.assertEqual(status, {"available": False, "reason": public_reason})
+                serialized = json.dumps(status)
+                private_detail = completed_output["stderr"] or completed_output["stdout"]
+                self.assertNotIn(private_detail, serialized)
+                self.assertIn(private_detail, "\n".join(captured.output))
+
     def test_default_network_is_isolated_for_non_gui_runs(self) -> None:
         plan = RunPlan(image="python:3.12-slim", filename="main.py", command=["python", "/work/main.py"])
 

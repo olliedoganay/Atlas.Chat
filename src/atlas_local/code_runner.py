@@ -2280,16 +2280,32 @@ def docker_status() -> dict[str, Any]:
             timeout=10,
         )
     except subprocess.TimeoutExpired:
+        logger.warning("Docker status probe timed out.")
         return {"available": False, "reason": "Docker is installed but the daemon did not respond in time."}
-    except OSError as exc:
-        return {"available": False, "reason": f"Failed to invoke docker: {exc}"}
+    except OSError:
+        logger.warning("Docker status probe could not invoke Docker.", exc_info=True)
+        return {
+            "available": False,
+            "reason": "Docker could not be checked. Verify Docker Desktop is installed and try again.",
+        }
 
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or "").strip()
-        reason = "Docker Desktop is installed but not running. Start Docker Desktop and try again."
         if detail:
-            reason = f"{reason} Details: {detail.splitlines()[-1]}"
-        return {"available": False, "reason": reason}
+            logger.warning(
+                "Docker status probe exited with code %s: %r",
+                completed.returncode,
+                detail[-2048:],
+            )
+        else:
+            logger.warning(
+                "Docker status probe exited with code %s without diagnostic output.",
+                completed.returncode,
+            )
+        return {
+            "available": False,
+            "reason": "Docker Desktop is installed but not running. Start Docker Desktop and try again.",
+        }
     version = completed.stdout.strip() or "unknown"
     return {"available": True, "server_version": version}
 

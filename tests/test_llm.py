@@ -529,39 +529,80 @@ class LLMProviderTemperatureTests(unittest.TestCase):
     def test_inspect_models_has_a_global_probe_deadline_and_uses_tag_fallbacks(
         self,
     ) -> None:
+        class PendingProbe:
+            def __init__(self) -> None:
+                self.cancel_called = False
+
+            def cancel(self) -> bool:
+                self.cancel_called = True
+                return True
+
         payload = {
             "models": [
                 {
                     "name": f"model-{index}",
+                    "size": 4096 + index,
                     "details": {"family": "test"},
                 }
                 for index in range(16)
             ]
         }
+        submitted_calls = []
+        pending_probes: list[PendingProbe] = []
+        executor_settings = []
+        shutdown_calls = []
+        wait_calls = []
 
-        def slow_show(*_args, **_kwargs):
-            time.sleep(0.2)
-            return {"capabilities": ["completion"]}
+        class RecordingExecutor:
+            def __init__(self, *, max_workers, thread_name_prefix):
+                executor_settings.append((max_workers, thread_name_prefix))
 
-        started_at = time.monotonic()
+            def submit(self, function, *args, **kwargs):
+                probe = PendingProbe()
+                pending_probes.append(probe)
+                submitted_calls.append((function, args, kwargs))
+                return probe
+
+            def shutdown(self, *, wait, cancel_futures):
+                shutdown_calls.append((wait, cancel_futures))
+
+        def record_wait(futures, *, timeout):
+            pending = set(futures)
+            wait_calls.append((pending, timeout))
+            return set(), pending
+
         with (
             patch(
                 "atlas_local.llm.provider_urlopen",
                 return_value=_FakeResponse(json.dumps(payload).encode("utf-8")),
             ),
             patch(
-                "atlas_local.llm._ollama_json_request",
-                side_effect=slow_show,
+                "atlas_local.llm.concurrent.futures.ThreadPoolExecutor",
+                RecordingExecutor,
+            ),
+            patch(
+                "atlas_local.llm.concurrent.futures.wait",
+                side_effect=record_wait,
             ),
         ):
             catalog = inspect_local_ollama_models(
                 self.config,
                 timeout_seconds=0.05,
             )
-        elapsed = time.monotonic() - started_at
 
-        self.assertLess(elapsed, 0.15)
+        self.assertEqual(executor_settings, [(8, "atlas-model-inspect")])
+        self.assertEqual(len(submitted_calls), 16)
+        self.assertTrue(
+            all(call_kwargs["timeout_seconds"] == 0.05 for _, _, call_kwargs in submitted_calls)
+        )
+        self.assertEqual(len(wait_calls), 1)
+        self.assertEqual(wait_calls[0][0], set(pending_probes))
+        self.assertEqual(wait_calls[0][1], 0.05)
+        self.assertTrue(all(probe.cancel_called for probe in pending_probes))
+        self.assertEqual(shutdown_calls, [(False, True)])
         self.assertEqual(len(catalog.models), 16)
+        self.assertEqual(catalog.models[0].family, "test")
+        self.assertEqual(catalog.models[0].size_bytes, 4096)
 
     def test_ollama_json_reader_rejects_oversized_response(self) -> None:
         with patch(

@@ -225,7 +225,15 @@ jobs:
               echo "Expected exactly one $pattern bundle; found ${#files[@]}."
               exit 1
             fi
-            cp "${files[0]}" dist/linux/
+            source_path="${files[0]}"
+            source_name="$(basename -- "$source_path")"
+            normalized_name="${source_name// /.}"
+            destination_path="dist/linux/$normalized_name"
+            if [[ -e "$destination_path" ]]; then
+              echo "Normalized Linux bundle name collides with an existing artifact: $normalized_name"
+              exit 1
+            fi
+            cp -- "$source_path" "$destination_path"
           done
           (
             cd dist/linux
@@ -303,9 +311,14 @@ jobs:
             throw "Expected exactly one MSI installer artifact; found $($artifacts.Count)."
           }
           $checksums = foreach ($artifact in $artifacts) {
-            Copy-Item $artifact.FullName -Destination $destination.FullName
-            $hash = Get-FileHash $artifact.FullName -Algorithm SHA256
-            "$($hash.Hash.ToLowerInvariant())  $($artifact.Name)"
+            $normalizedName = $artifact.Name.Replace(" ", ".")
+            $destinationPath = Join-Path $destination.FullName $normalizedName
+            if (Test-Path -LiteralPath $destinationPath) {
+              throw "Normalized Windows installer name collides with an existing artifact: $normalizedName"
+            }
+            Copy-Item -LiteralPath $artifact.FullName -Destination $destinationPath
+            $hash = Get-FileHash -LiteralPath $destinationPath -Algorithm SHA256
+            "$($hash.Hash.ToLowerInvariant())  $normalizedName"
           }
           $checksums | Set-Content dist\windows\SHA256SUMS-windows.txt -Encoding utf8
 
