@@ -3,7 +3,7 @@ from __future__ import annotations
 import queue
 import threading
 from datetime import UTC, datetime
-from typing import Any, TypeVar, TypedDict
+from typing import Any, NotRequired, TypeVar, TypedDict
 
 TERMINAL_EVENT_TYPES = {"run_completed", "run_failed"}
 DEFAULT_SUBSCRIBER_QUEUE_SIZE = 256
@@ -15,6 +15,7 @@ class RunEvent(TypedDict):
     type: str
     timestamp: str
     payload: dict[str, Any]
+    sequence: NotRequired[int]
 
 
 class RunTraceItem(TypedDict, total=False):
@@ -73,12 +74,21 @@ def put_bounded_queue(target: queue.Queue[QueueItem], item: QueueItem) -> None:
         pass
 
 
-def make_run_event(event_type: str, payload: dict[str, Any], *, timestamp: str | None = None) -> RunEvent:
-    return {
+def make_run_event(
+    event_type: str,
+    payload: dict[str, Any],
+    *,
+    timestamp: str | None = None,
+    sequence: int | None = None,
+) -> RunEvent:
+    event: RunEvent = {
         "type": event_type,
         "timestamp": timestamp or now_timestamp(),
         "payload": payload,
     }
+    if sequence is not None:
+        event["sequence"] = max(1, int(sequence))
+    return event
 
 
 def make_trace_item(item: dict[str, Any], *, timestamp: str | None = None) -> RunTraceItem:

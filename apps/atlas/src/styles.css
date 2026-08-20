@@ -2950,6 +2950,47 @@ pre {
   font-weight: 500;
 }
 
+.run-progress-copy {
+  display: grid;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.stream-waiting-detail {
+  color: var(--muted-strong);
+  font-size: 0.86rem;
+  font-weight: 400;
+  line-height: 1.45;
+}
+
+.run-progress-inline {
+  display: inline-flex;
+  align-items: center;
+  justify-self: start;
+  gap: 8px;
+  width: fit-content;
+  min-height: 30px;
+  margin-right: clamp(48px, 9%, 140px);
+  padding: 0 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--message-waiting-bg) 82%, transparent);
+  color: var(--muted-strong);
+  font: inherit;
+  font-size: 0.82rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.run-progress-inline:hover {
+  border-color: color-mix(in srgb, var(--accent) 44%, var(--border));
+  color: var(--text);
+}
+
+.run-progress-inline .status-dot {
+  color: var(--accent);
+}
+
 .stream-waiting-text {
   display: inline;
   color: var(--text);
@@ -3094,6 +3135,37 @@ pre {
   color: var(--text);
   font-family: "IBM Plex Mono", "Cascadia Code", monospace;
   font-size: 0.92em;
+}
+
+.markdown-external-link {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+  text-align: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.markdown-external-link svg {
+  flex: 0 0 auto;
+  align-self: center;
+}
+
+.markdown-link-disabled {
+  color: var(--muted-strong);
+  text-decoration: line-through;
+  text-decoration-color: var(--danger);
+}
+
+.markdown-link-error {
+  display: block;
+  margin-top: 8px;
 }
 
 .message-content table {
@@ -3266,6 +3338,28 @@ pre {
 .runner-stop {
   border-color: rgba(230, 118, 118, 0.35);
   background: rgba(230, 118, 118, 0.12);
+  color: #f0b3b3;
+}
+
+.runner-fix {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 32px;
+  padding: 0 11px;
+}
+
+.runner-repair-message {
+  padding: 9px 18px;
+  border-bottom: 1px solid rgba(110, 168, 254, 0.2);
+  background: rgba(110, 168, 254, 0.09);
+  color: #cfe0ff;
+  font-size: 0.82rem;
+}
+
+.runner-repair-message.error {
+  border-bottom-color: rgba(230, 118, 118, 0.24);
+  background: rgba(230, 118, 118, 0.1);
   color: #f0b3b3;
 }
 

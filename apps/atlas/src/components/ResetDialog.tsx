@@ -23,36 +23,53 @@ export function ResetDialog({
   onConfirm,
 }: ResetDialogProps) {
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
 
   useEffect(() => {
     if (!open) {
       setBusy(false);
+      setError("");
     }
   }, [open]);
+
+  const handleOpenChange = (nextOpen: boolean) => {
+    if (!nextOpen && busy) {
+      return;
+    }
+    onOpenChange(nextOpen);
+  };
 
   const handleConfirm = async () => {
     if (busy) {
       return;
     }
+    setError("");
     setBusy(true);
     try {
       await onConfirm();
       onOpenChange(false);
+    } catch (confirmError) {
+      setError(confirmError instanceof Error ? confirmError.message : "The action could not be completed.");
     } finally {
       setBusy(false);
     }
   };
 
   return (
-    <Dialog.Root open={open} onOpenChange={onOpenChange}>
+    <Dialog.Root open={open} onOpenChange={handleOpenChange}>
       <Dialog.Portal>
         <Dialog.Overlay className="dialog-overlay" />
-        <Dialog.Content className="dialog-content">
+        <Dialog.Content aria-busy={busy} className="dialog-content">
           <Dialog.Title className="dialog-title">{title}</Dialog.Title>
           <Dialog.Description className="dialog-description">{description}</Dialog.Description>
+          {error ? (
+            <p className="error-inline" role="alert">
+              {error}
+            </p>
+          ) : null}
           <div className="dialog-actions">
             <Dialog.Close asChild>
-              <button className="ghost-button" type="button">
+              <button className="ghost-button" disabled={busy} type="button">
                 Cancel
               </button>
             </Dialog.Close>

@@ -15,4 +15,5 @@ class AgentState(TypedDict, total=False):
     retrieved_memories: list[str]
     update_candidates: list[dict[str, Any]]
     persisted_memories: list[dict[str, Any]]
+    memory_persistence_warnings: list[dict[str, Any]]
     answer: str

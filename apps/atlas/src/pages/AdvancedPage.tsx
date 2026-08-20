@@ -4,7 +4,7 @@ import { type ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
 
 import { EmptyState } from "../components/ui/EmptyState";
-import { getModels, getRun, getStatus, getThreads } from "../lib/api";
+import { getModels, getRun, getStatus, getThreads, getUsers } from "../lib/api";
 import { displayThreadTitle } from "../lib/threadTitles";
 import { useAtlasStore } from "../store/useAtlasStore";
 
@@ -13,24 +13,54 @@ export function AdvancedPage() {
   const currentUserId = useAtlasStore((state) => state.currentUserId);
   const currentThreadId = useAtlasStore((state) => state.currentThreadId);
 
-  const { data: status } = useQuery({
+  const {
+    data: users = [],
+    isFetched: usersFetched,
+    isError: usersError,
+    error: usersQueryError,
+  } = useQuery({
+    queryKey: ["users"],
+    queryFn: getUsers,
+    staleTime: 5000,
+  });
+  const currentProfile = users.find((user) => user.user_id === currentUserId);
+  const currentUserLocked = Boolean(currentProfile?.locked);
+  const profileAccessConfirmed =
+    Boolean(currentUserId) && usersFetched && Boolean(currentProfile) && !currentUserLocked;
+
+  const {
+    data: status,
+    isPending: statusPending,
+    isError: statusError,
+    error: statusQueryError,
+  } = useQuery({
     queryKey: ["status"],
     queryFn: getStatus,
     staleTime: 5000,
   });
-  const { data: models } = useQuery({
+  const {
+    data: models,
+    isError: modelsError,
+    error: modelsQueryError,
+  } = useQuery({
     queryKey: ["models"],
     queryFn: getModels,
     staleTime: 10000,
   });
-  const { data: threads = [] } = useQuery({
+  const {
+    data: threads = [],
+    isError: threadsError,
+    error: threadsQueryError,
+  } = useQuery({
     queryKey: ["threads", currentUserId],
     queryFn: () => getThreads(currentUserId),
-    enabled: Boolean(currentUserId),
+    enabled: profileAccessConfirmed,
     staleTime: 2000,
   });
 
-  const recentRunIds = threads
+  const visibleThreads = profileAccessConfirmed ? threads : [];
+
+  const recentRunIds = visibleThreads
     .map((thread) => thread.last_run_id)
     .filter((value, index, items): value is string => Boolean(value) && items.indexOf(value) === index)
     .slice(0, 6);
@@ -44,14 +74,20 @@ export function AdvancedPage() {
   const recentRuns = recentRunQueries
     .map((query) => query.data)
     .filter((item): item is NonNullable<(typeof recentRunQueries)[number]["data"]> => Boolean(item));
-  const currentThread = threads.find((thread) => thread.thread_id === currentThreadId) ?? null;
+  const currentThread = visibleThreads.find((thread) => thread.thread_id === currentThreadId) ?? null;
   const currentRun = recentRuns.find((run) => run.thread_id === currentThreadId) ?? recentRuns[0] ?? null;
   const storageHardened =
     Boolean(status?.security.sqlite_encrypted_at_rest) &&
     Boolean(status?.security.vector_store_encrypted_at_rest);
+  const backendOnline = Boolean(status) && !statusError;
   const providerLabel = models?.provider_label || status?.chat_provider_label || "Local provider";
-  const providerOnline = Boolean(models?.provider_online ?? models?.ollama_online);
-  const hasChatModels = Boolean(models?.has_chat_models ?? models?.has_local_models);
+  const providerOnline = !modelsError && Boolean(models?.provider_online ?? models?.ollama_online);
+  const hasChatModels = !modelsError && Boolean(models?.has_chat_models ?? models?.has_local_models);
+  const runQueryError = recentRunQueries.find((query) => query.isError)?.error;
+  const diagnosticsError =
+    statusError || modelsError || usersError || (profileAccessConfirmed && (threadsError || runQueryError))
+      ? statusQueryError ?? modelsQueryError ?? usersQueryError ?? threadsQueryError ?? runQueryError
+      : null;
 
   return (
     <section className="advanced-page">
@@ -62,13 +98,24 @@ export function AdvancedPage() {
         </div>
       </div>
 
+      {diagnosticsError ? (
+        <div className="error-banner" role="alert">
+          {diagnosticsError instanceof Error
+            ? diagnosticsError.message
+            : "Some local diagnostics could not be loaded."}
+        </div>
+      ) : null}
+
       <section className="advanced-health-grid" aria-label="Runtime health">
         <AdvancedHealthCard
-          detail={status?.backend || "Backend has not reported yet"}
+          detail={
+            (backendOnline ? status?.backend : undefined) ||
+            (statusPending ? "Waiting for the local runtime" : "Backend has not reported")
+          }
           icon={<Server size={16} />}
           label="Backend"
-          tone={status ? "online" : "offline"}
-          value={status ? "Online" : "Offline"}
+          tone={backendOnline ? "online" : statusPending ? "warning" : "offline"}
+          value={backendOnline ? "Online" : statusPending ? "Checking" : "Offline"}
         />
         <AdvancedHealthCard
           detail={providerOnline ? `${providerLabel} reachable` : `Start ${providerLabel} to chat locally`}
@@ -78,11 +125,17 @@ export function AdvancedPage() {
           value={providerOnline ? "Connected" : "Unavailable"}
         />
         <AdvancedHealthCard
-          detail={models?.catalog_source ? `Live ${providerLabel} inventory` : "Fallback catalog"}
+          detail={
+            modelsError
+              ? "Model inventory unavailable"
+              : models?.catalog_source
+                ? `Live ${providerLabel} inventory`
+                : "Fallback catalog"
+          }
           icon={<Database size={16} />}
           label="Models"
           tone={hasChatModels ? "online" : "warning"}
-          value={`${models?.models.length ?? 0} installed`}
+          value={modelsError ? "Unavailable" : `${models?.models.length ?? 0} installed`}
         />
         <AdvancedHealthCard
           detail={status?.security.profile_key_protection || "Profile key status unknown"}
@@ -93,6 +146,8 @@ export function AdvancedPage() {
         />
       </section>
 
+      {profileAccessConfirmed ? (
+        <>
       <section className="advanced-thread-panel" aria-label="Current thread diagnostics">
         <div className="advanced-thread-copy">
           <p className="workspace-section-label">Current thread</p>
@@ -200,6 +255,29 @@ export function AdvancedPage() {
           />
         )}
       </div>
+        </>
+      ) : (
+        <section className="advanced-thread-panel" aria-label="Profile diagnostics unavailable">
+          <EmptyState
+            icon={<ShieldCheck size={18} />}
+            title={currentUserLocked ? "Profile locked" : "Profile access required"}
+            description={
+              currentUserLocked
+                ? "Unlock this profile in Settings before Atlas displays its thread or run details."
+                : "Select an unlocked profile before Atlas displays private thread or run details."
+            }
+            actions={
+              <button
+                className="primary-button compact-button"
+                onClick={() => navigate("/settings/profiles")}
+                type="button"
+              >
+                Open profiles
+              </button>
+            }
+          />
+        </section>
+      )}
     </section>
   );
 }

@@ -111,6 +111,22 @@ jobs:
         working-directory: apps/atlas
         run: npm ci
 
+      - name: Audit Python dependencies
+        run: |
+          python -m pip install pip-audit==2.10.1
+          python -m pip_audit -r requirements.lock
+
+      - name: Audit frontend dependencies
+        working-directory: apps/atlas
+        run: npm run audit:dependencies
+
+      - name: Install RustSec audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+
+      - name: Audit Rust dependencies
+        working-directory: apps/atlas/src-tauri
+        run: cargo audit
+
       - name: Verify version manifests
         run: python scripts/check_atlas_version.py
 

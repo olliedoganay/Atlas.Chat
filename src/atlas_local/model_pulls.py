@@ -7,10 +7,19 @@ from datetime import UTC, datetime
 from typing import Any, BinaryIO
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
-from urllib.request import Request, urlopen
+from urllib.request import Request
 from uuid import uuid4
 
+from .local_provider import (
+    normalize_local_provider_base_url,
+    provider_urlopen,
+)
+
 MAX_PULL_HISTORY = 50
+MAX_PULL_EVENT_BYTES = 64 * 1024
+MAX_PULL_DETAIL_LENGTH = 500
+MAX_PULL_ERROR_LENGTH = 2000
+MAX_PULL_PROGRESS_VALUE = (1 << 63) - 1
 
 
 def _timestamp() -> str:
@@ -57,8 +66,16 @@ class ModelPullManager:
 
     def start(self, *, ollama_url: str, model: str) -> dict[str, Any]:
         resolved_model = model.strip()
-        if not resolved_model or len(resolved_model) > 200:
+        if (
+            not resolved_model
+            or len(resolved_model) > 200
+            or any(character.isspace() or ord(character) < 0x20 for character in resolved_model)
+        ):
             raise RuntimeError("Choose a valid local model name.")
+        try:
+            resolved_ollama_url = normalize_local_provider_base_url(ollama_url)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
         with self._lock:
             self._prune_history()
             for pull in self._pulls.values():
@@ -71,7 +88,7 @@ class ModelPullManager:
             self._pulls[pull.pull_id] = pull
         threading.Thread(
             target=self._run,
-            args=(pull, ollama_url.rstrip("/") + "/"),
+            args=(pull, f"{resolved_ollama_url}/"),
             daemon=True,
             name=f"atlas-model-pull-{pull.pull_id[:8]}",
         ).start()
@@ -112,14 +129,17 @@ class ModelPullManager:
             if pull.status not in {"queued", "pulling"}:
                 return pull.public()
             pull._cancel.set()
+            pull.status = "cancelled"
+            pull.detail = "Download cancelled"
+            pull.updated_at = _timestamp()
             response = pull._response
+            result = pull.public()
         if response is not None:
             try:
                 response.close()
-            except OSError:
+            except (OSError, ValueError):
                 pass
-        self._update(pull, status="cancelled", detail="Download cancelled")
-        return pull.public()
+        return result
 
     def shutdown(self) -> None:
         with self._lock:
@@ -130,7 +150,12 @@ class ModelPullManager:
             self.cancel(pull_id)
 
     def _run(self, pull: ModelPull, ollama_url: str) -> None:
-        self._update(pull, status="pulling", detail="Connecting to Ollama")
+        with self._lock:
+            if pull._cancel.is_set() or pull.status != "queued":
+                return
+            pull.status = "pulling"
+            pull.detail = "Connecting to Ollama"
+            pull.updated_at = _timestamp()
         body = json.dumps({"name": pull.model, "stream": True}).encode("utf-8")
         request = Request(
             urljoin(ollama_url, "api/pull"),
@@ -139,11 +164,16 @@ class ModelPullManager:
             headers={"Content-Type": "application/json", "Accept": "application/x-ndjson"},
         )
         try:
-            response = urlopen(request, timeout=30)
+            response = provider_urlopen(request, timeout=30)
             with self._lock:
-                pull._response = response
+                cancelled = pull._cancel.is_set() or pull.status == "cancelled"
+                if not cancelled:
+                    pull._response = response
+            if cancelled:
+                response.close()
+                return
             with response:
-                for raw_line in response:
+                for raw_line in _bounded_response_lines(response):
                     if pull._cancel.is_set():
                         return
                     line = raw_line.decode("utf-8", errors="replace").strip()
@@ -154,28 +184,69 @@ class ModelPullManager:
                         continue
                     error = str(payload.get("error", "") or "").strip()
                     if error:
-                        raise RuntimeError(error)
+                        raise RuntimeError(error[:MAX_PULL_ERROR_LENGTH])
                     self._update(
                         pull,
-                        detail=str(payload.get("status", "") or "Downloading"),
-                        completed=int(payload.get("completed", 0) or 0),
-                        total=int(payload.get("total", 0) or 0),
+                        detail=str(payload.get("status", "") or "Downloading")[
+                            :MAX_PULL_DETAIL_LENGTH
+                        ],
+                        completed=_bounded_progress_value(payload.get("completed")),
+                        total=_bounded_progress_value(payload.get("total")),
                     )
             if not pull._cancel.is_set():
                 self._update(pull, status="completed", detail="Model ready")
         except (HTTPError, URLError, TimeoutError, OSError, ValueError, RuntimeError) as exc:
             if not pull._cancel.is_set():
                 message = str(getattr(exc, "reason", "") or exc).strip() or "Model download failed."
-                self._update(pull, status="failed", detail="Download failed", error=message)
+                self._update(
+                    pull,
+                    status="failed",
+                    detail="Download failed",
+                    error=message[:MAX_PULL_ERROR_LENGTH],
+                )
         finally:
             with self._lock:
                 pull._response = None
 
     def _update(self, pull: ModelPull, **changes: Any) -> None:
         with self._lock:
+            requested_status = str(changes.get("status", "") or "")
+            if pull._cancel.is_set() and requested_status != "cancelled":
+                return
+            if (
+                pull.status in {"completed", "failed", "cancelled"}
+                and requested_status != pull.status
+            ):
+                return
             for key, value in changes.items():
                 setattr(pull, key, value)
             pull.updated_at = _timestamp()
+
+
+def _bounded_response_lines(response: BinaryIO):
+    readline = getattr(response, "readline", None)
+    if callable(readline):
+        while True:
+            raw_line = readline(MAX_PULL_EVENT_BYTES + 1)
+            if not raw_line:
+                return
+            if len(raw_line) > MAX_PULL_EVENT_BYTES:
+                raise ValueError("Ollama returned an oversized model-download event.")
+            yield raw_line
+        return
+
+    for raw_line in response:
+        if len(raw_line) > MAX_PULL_EVENT_BYTES:
+            raise ValueError("Ollama returned an oversized model-download event.")
+        yield raw_line
+
+
+def _bounded_progress_value(value: Any) -> int:
+    try:
+        parsed = int(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return min(MAX_PULL_PROGRESS_VALUE, max(0, parsed))
 
 
 _MODEL_PULL_MANAGER = ModelPullManager()

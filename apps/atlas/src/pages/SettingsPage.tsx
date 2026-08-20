@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { useSearchParams } from "react-router-dom";
 import {
@@ -38,6 +38,7 @@ import {
   getMemories,
   getModels,
   getProviderSettings,
+  getRunnerStatus,
   getStatus,
   getUsers,
   lockUser,
@@ -47,14 +48,27 @@ import {
   restartManagedBackend,
   saveProviderSettings,
   setOllamaContextWindow,
+  type RunnerStatus,
   unlockUser,
 } from "../lib/api";
 import { normalizeSettingsSection, type SettingsSection } from "../lib/settingsSections";
+import {
+  PROVIDER_BUSY_MESSAGE,
+  PROVIDER_RUNNER_BUSY_MESSAGE,
+  providerControlState,
+  providerSelectionDraft,
+  shouldPreserveExistingProviderKey,
+} from "../lib/providerSettingsSafety";
+import { removeAllProfileCaches, removeLockedProfileCaches } from "../lib/profileCache";
 import { useAtlasStore } from "../store/useAtlasStore";
 
 type UserProtectionMode = "passwordless" | "password";
 
 const DEFAULT_CONTEXT_WINDOW_PRESETS = [4096, 8192, 16384, 32768, 65536, 131072, 262144];
+
+function runnerHasActiveWork(status: RunnerStatus | undefined) {
+  return Boolean(status?.busy || status?.runtime_preparing || (status?.active_runs ?? 0) > 0);
+}
 
 export function SettingsPage() {
   const queryClient = useQueryClient();
@@ -65,6 +79,7 @@ export function SettingsPage() {
   const crossChatMemoryEnabled = useAtlasStore((state) => state.crossChatMemoryEnabled);
   const autoCompactLongChats = useAtlasStore((state) => state.autoCompactLongChats);
   const crtScanlines = useAtlasStore((state) => state.crtScanlines);
+  const isStreaming = useAtlasStore((state) => state.isStreaming);
   const setCrtScanlines = useAtlasStore((state) => state.setCrtScanlines);
   const setCurrentUserId = useAtlasStore((state) => state.setCurrentUserId);
   const setCurrentThreadId = useAtlasStore((state) => state.setCurrentThreadId);
@@ -73,6 +88,9 @@ export function SettingsPage() {
   const setDraftThreadTemperature = useAtlasStore((state) => state.setDraftThreadTemperature);
   const setCrossChatMemoryEnabled = useAtlasStore((state) => state.setCrossChatMemoryEnabled);
   const setAutoCompactLongChats = useAtlasStore((state) => state.setAutoCompactLongChats);
+  const clearRecentSearchQueries = useAtlasStore((state) => state.clearRecentSearchQueries);
+  const clearProfileState = useAtlasStore((state) => state.clearProfileState);
+  const resetAfterDataWipe = useAtlasStore((state) => state.resetAfterDataWipe);
   const [dialog, setDialog] = useState<"all" | "user" | null>(null);
   const requestedSection = normalizeSettingsSection(searchParams.get("section"));
   const [section, setSection] = useState<SettingsSection>(requestedSection);
@@ -89,12 +107,24 @@ export function SettingsPage() {
   const [providerUrlDraft, setProviderUrlDraft] = useState("");
   const [providerApiKeyDraft, setProviderApiKeyDraft] = useState("");
   const [providerFormDirty, setProviderFormDirty] = useState(false);
+  const [settingsActionError, setSettingsActionError] = useState("");
+  const lastContextWindowCommitRef = useRef<number | null | "auto">("auto");
   const { data: status } = useQuery({
     queryKey: ["status"],
     queryFn: getStatus,
     staleTime: 5000,
     retry: 1,
     refetchOnWindowFocus: false,
+  });
+  const { data: runnerStatus } = useQuery({
+    queryKey: ["runner-status"],
+    queryFn: getRunnerStatus,
+    enabled: section === "connections",
+    staleTime: 0,
+    refetchInterval: 1500,
+    refetchIntervalInBackground: true,
+    retry: 1,
+    refetchOnWindowFocus: "always",
   });
   const { data: models } = useQuery({
     queryKey: ["models"],
@@ -144,6 +174,9 @@ export function SettingsPage() {
   const providerLabel = models?.provider_label || status?.chat_provider_label || "Ollama";
   const providerBaseUrl = models?.provider_base_url || status?.chat_base_url || status?.ollama_url || "http://127.0.0.1:11434";
   const providerOnline = Boolean(models?.provider_online ?? models?.ollama_online);
+  const runnerBusy = runnerHasActiveWork(runnerStatus);
+  const providerBusy = isStreaming || Boolean(status?.busy) || runnerBusy;
+  const providerBusyMessage = runnerBusy ? PROVIDER_RUNNER_BUSY_MESSAGE : PROVIDER_BUSY_MESSAGE;
   const hasChatModels = Boolean(models?.has_chat_models ?? models?.has_local_models);
   const supportsContextWindow = Boolean(models?.supports_context_window ?? true);
   const modelNames = models?.models ?? [];
@@ -219,6 +252,7 @@ export function SettingsPage() {
   useEffect(() => {
     const index = configuredContextWindow ? contextWindowChoices.indexOf(configuredContextWindow) : 0;
     setContextWindowIndex(index >= 0 ? index : 0);
+    lastContextWindowCommitRef.current = configuredContextWindow ?? "auto";
   }, [configuredContextWindow, contextWindowChoices]);
 
   useEffect(() => {
@@ -247,27 +281,52 @@ export function SettingsPage() {
     };
   }, []);
 
+  const assertProviderRestartIdle = async () => {
+    if (isStreaming) {
+      throw new Error(PROVIDER_BUSY_MESSAGE);
+    }
+    const [latestStatus, latestRunnerStatus] = await Promise.all([
+      getStatus(),
+      getRunnerStatus(),
+    ]);
+    queryClient.setQueryData(["status"], latestStatus);
+    queryClient.setQueryData(["runner-status"], latestRunnerStatus);
+    if (runnerHasActiveWork(latestRunnerStatus)) {
+      throw new Error(PROVIDER_RUNNER_BUSY_MESSAGE);
+    }
+    if (latestStatus.busy) {
+      throw new Error(PROVIDER_BUSY_MESSAGE);
+    }
+  };
+
   const allReset = useMutation({
     mutationFn: resetAll,
-    onSuccess: async () => {
-      setCurrentThreadId("main");
-      setCurrentThreadTitle("main");
-      await queryClient.invalidateQueries();
+    onSuccess: () => {
+      removeAllProfileCaches(queryClient);
+      queryClient.setQueryData(["users"], []);
+      resetAfterDataWipe();
     },
   });
 
   const switchToUser = async (userId: string) => {
+    setSettingsActionError("");
     setCurrentUserId(userId);
     setCurrentThreadId("main");
-    setCurrentThreadTitle("main");
+    setCurrentThreadTitle("Main");
     setDraftThreadModel("");
     setDraftThreadTemperature(null);
-    await Promise.all([
-      queryClient.invalidateQueries({ queryKey: ["users"] }),
-      queryClient.invalidateQueries({ queryKey: ["threads"] }),
-      queryClient.invalidateQueries({ queryKey: ["thread-history"] }),
-      queryClient.invalidateQueries({ queryKey: ["memories"] }),
-    ]);
+    try {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["users"] }),
+        queryClient.invalidateQueries({ queryKey: ["threads"] }),
+        queryClient.invalidateQueries({ queryKey: ["thread-history"] }),
+        queryClient.invalidateQueries({ queryKey: ["memories"] }),
+      ]);
+    } catch (error) {
+      setSettingsActionError(
+        error instanceof Error ? error.message : "Atlas could not refresh the selected profile.",
+      );
+    }
   };
 
   const createUserMutation = useMutation({
@@ -296,13 +355,11 @@ export function SettingsPage() {
   });
   const lockUserMutation = useMutation({
     mutationFn: async (userId: string) => lockUser(userId),
-    onSuccess: async () => {
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["users"] }),
-        queryClient.invalidateQueries({ queryKey: ["threads"] }),
-        queryClient.invalidateQueries({ queryKey: ["thread-history"] }),
-        queryClient.invalidateQueries({ queryKey: ["memories"] }),
-      ]);
+    onSuccess: async (_user, userId) => {
+      removeLockedProfileCaches(queryClient, userId);
+      clearRecentSearchQueries();
+      clearProfileState(userId);
+      await queryClient.invalidateQueries({ queryKey: ["users"] });
     },
   });
   const createMemoryMutation = useMutation({
@@ -334,17 +391,9 @@ export function SettingsPage() {
       queryClient.setQueryData(["users"], (existing: Array<{ user_id: string; updated_at?: string }> | undefined) =>
         (existing ?? []).filter((user) => user.user_id !== deletedUserId),
       );
-      queryClient.removeQueries({ queryKey: ["threads", deletedUserId] });
-      queryClient.removeQueries({ queryKey: ["thread-history", deletedUserId] });
-      queryClient.removeQueries({ queryKey: ["memories", deletedUserId] });
-
-      if (currentUserId === deletedUserId) {
-        setCurrentUserId("");
-        setCurrentThreadId("main");
-        setCurrentThreadTitle("main");
-        setDraftThreadModel("");
-        setDraftThreadTemperature(null);
-      }
+      removeLockedProfileCaches(queryClient, deletedUserId);
+      clearRecentSearchQueries();
+      clearProfileState(deletedUserId);
 
       setPendingDeleteUserId(null);
       setUnlockPassword("");
@@ -373,14 +422,25 @@ export function SettingsPage() {
         queryClient.invalidateQueries({ queryKey: ["thread-context"] }),
       ]);
     },
+    onError: () => {
+      lastContextWindowCommitRef.current = configuredContextWindow ?? "auto";
+    },
   });
   const saveProviderMutation = useMutation({
     mutationFn: async () => {
+      if (providerBusy) {
+        throw new Error(providerBusyMessage);
+      }
+      await assertProviderRestartIdle();
       const saved = await saveProviderSettings({
         provider: providerDraft,
         base_url: providerUrlDraft.trim(),
         api_key: providerApiKeyDraft.trim() || undefined,
-        preserve_existing_key: !providerApiKeyDraft.trim(),
+        preserve_existing_key: shouldPreserveExistingProviderKey(
+          providerSettings?.provider,
+          providerDraft,
+          providerApiKeyDraft,
+        ),
       });
       try {
         await restartManagedBackend({ attempts: 60, delayMs: 250 });
@@ -403,6 +463,10 @@ export function SettingsPage() {
   });
   const clearProviderKeyMutation = useMutation({
     mutationFn: async () => {
+      if (providerBusy) {
+        throw new Error(providerBusyMessage);
+      }
+      await assertProviderRestartIdle();
       await clearProviderApiKey();
       await restartManagedBackend({ attempts: 60, delayMs: 250 });
     },
@@ -412,19 +476,50 @@ export function SettingsPage() {
       await queryClient.invalidateQueries({ queryKey: ["provider-settings"] });
     },
   });
+  const providerControls = providerControlState({
+    hasSettings: Boolean(providerSettings),
+    provider: providerDraft,
+    baseUrl: providerUrlDraft,
+    dirty: providerFormDirty,
+    busy: providerBusy,
+    savePending: saveProviderMutation.isPending,
+    clearPending: clearProviderKeyMutation.isPending,
+  });
 
   const refreshModels = async () => {
-    await queryClient.invalidateQueries({ queryKey: ["models"] });
-    await queryClient.invalidateQueries({ queryKey: ["status"] });
+    setSettingsActionError("");
+    try {
+      await queryClient.invalidateQueries({ queryKey: ["models"] });
+      await queryClient.invalidateQueries({ queryKey: ["status"] });
+    } catch (error) {
+      setSettingsActionError(
+        error instanceof Error ? error.message : "Atlas could not refresh local models.",
+      );
+    }
   };
 
   const commitContextWindow = (index: number) => {
     const clampedIndex = Math.max(0, Math.min(contextWindowChoices.length - 1, index));
     const nextContextWindow = contextWindowChoices[clampedIndex] ?? null;
-    if (nextContextWindow === configuredContextWindow) {
+    const commitKey = nextContextWindow ?? "auto";
+    if (
+      nextContextWindow === configuredContextWindow ||
+      lastContextWindowCommitRef.current === commitKey ||
+      setContextWindowMutation.isPending
+    ) {
       return;
     }
+    lastContextWindowCommitRef.current = commitKey;
     setContextWindowMutation.mutate(nextContextWindow);
+  };
+
+  const runSettingsAction = async (action: () => Promise<unknown>, fallback: string) => {
+    setSettingsActionError("");
+    try {
+      await action();
+    } catch (error) {
+      setSettingsActionError(error instanceof Error ? error.message : fallback);
+    }
   };
 
   const selectSection = (value: SettingsSection) => {
@@ -480,6 +575,11 @@ export function SettingsPage() {
           <div className="settings-section-header">
             <h2>{activeSectionLabel}</h2>
             <p>{activeSectionDescription}</p>
+            {settingsActionError ? (
+              <div className="error-inline" role="alert">
+                {settingsActionError}
+              </div>
+            ) : null}
           </div>
 
           {section === "general" ? (
@@ -668,8 +768,10 @@ export function SettingsPage() {
                             <div className="settings-inline-form">
                               <input
                                 aria-label="Profile password"
+                                autoComplete="current-password"
                                 autoFocus
                                 className="text-input settings-user-input"
+                                maxLength={1024}
                                 onChange={(event) => setUnlockPassword(event.currentTarget.value)}
                                 onKeyDown={(event) => {
                                   if (event.key === "Enter" && unlockPassword.trim()) {
@@ -712,6 +814,11 @@ export function SettingsPage() {
                       </div>
                     );
                   })}
+                  {lockUserMutation.isError ? (
+                    <div className="error-inline" role="alert">
+                      {getMutationErrorMessage(lockUserMutation.error)}
+                    </div>
+                  ) : null}
                 </div>
               )}
 
@@ -724,7 +831,9 @@ export function SettingsPage() {
                   <div className="settings-inline-form">
                     <input
                       aria-label="New profile name"
+                      autoComplete="username"
                       className="text-input settings-user-input"
+                      maxLength={128}
                       onChange={(event) => setNewUserId(event.currentTarget.value)}
                       placeholder="my_profile"
                       value={newUserId}
@@ -752,7 +861,9 @@ export function SettingsPage() {
                     <div className="settings-inline-form">
                       <input
                         aria-label="Profile password"
+                        autoComplete="new-password"
                         className="text-input settings-user-input"
+                        maxLength={1024}
                         onChange={(event) => setNewUserPassword(event.currentTarget.value)}
                         placeholder="Profile password"
                         type="password"
@@ -825,6 +936,7 @@ export function SettingsPage() {
                         className="settings-context-window-slider"
                         max={contextWindowChoices.length - 1}
                         min={0}
+                        disabled={setContextWindowMutation.isPending}
                         onBlur={(event) => commitContextWindow(Number(event.currentTarget.value))}
                         onChange={(event) => setContextWindowIndex(Number(event.currentTarget.value))}
                         onKeyUp={(event) => commitContextWindow(Number(event.currentTarget.value))}
@@ -944,12 +1056,13 @@ export function SettingsPage() {
                         aria-label="Model provider"
                         className="text-input"
                         onChange={(event) => {
-                          const nextProvider = event.currentTarget.value;
-                          const definition = providerSettings?.providers.find(
-                            (item) => item.id === nextProvider,
+                          const nextDraft = providerSelectionDraft(
+                            event.currentTarget.value,
+                            providerSettings?.providers,
                           );
-                          setProviderDraft(nextProvider);
-                          setProviderUrlDraft(definition?.default_base_url ?? "");
+                          setProviderDraft(nextDraft.provider);
+                          setProviderUrlDraft(nextDraft.baseUrl);
+                          setProviderApiKeyDraft(nextDraft.apiKey);
                           setProviderFormDirty(true);
                         }}
                         value={providerDraft}
@@ -966,6 +1079,7 @@ export function SettingsPage() {
                       <input
                         aria-label="Local provider API URL"
                         className="text-input"
+                        maxLength={2048}
                         onChange={(event) => {
                           setProviderUrlDraft(event.currentTarget.value);
                           setProviderFormDirty(true);
@@ -980,9 +1094,10 @@ export function SettingsPage() {
                       <span>API key (optional)</span>
                       <input
                         aria-label="Local provider API key"
-                        autoComplete="off"
+                        autoComplete="new-password"
                         className="text-input"
                         disabled={!providerSettings?.secure_key_storage_available}
+                        maxLength={4096}
                         onChange={(event) => {
                           setProviderApiKeyDraft(event.currentTarget.value);
                           setProviderFormDirty(true);
@@ -998,8 +1113,17 @@ export function SettingsPage() {
                     </label>
                   </div>
                   <div className="provider-settings-actions">
-                    <div aria-live="polite" className="provider-settings-status" role="status">
-                      {providerSettings?.has_api_key
+                    <div
+                      aria-live="polite"
+                      className="provider-settings-status"
+                      id="provider-settings-status"
+                      role="status"
+                    >
+                      {providerControls.busy
+                        ? providerBusyMessage
+                        : providerSettings?.api_key_unavailable
+                        ? "The saved API key could not be unlocked. Enter it again before using a provider that requires authentication."
+                        : providerSettings?.has_api_key
                         ? "API key protected by the operating system."
                         : providerSettings?.secure_key_storage_available
                           ? "No saved API key."
@@ -1009,7 +1133,8 @@ export function SettingsPage() {
                       {providerSettings?.has_api_key ? (
                         <button
                           className="ghost-button compact-button"
-                          disabled={clearProviderKeyMutation.isPending}
+                          aria-describedby="provider-settings-status"
+                          disabled={providerControls.clearDisabled}
                           onClick={() => clearProviderKeyMutation.mutate()}
                           type="button"
                         >
@@ -1018,12 +1143,8 @@ export function SettingsPage() {
                       ) : null}
                       <button
                         className="primary-button compact-button"
-                        disabled={
-                          !providerSettings ||
-                          !providerDraft ||
-                          !providerUrlDraft.trim() ||
-                          saveProviderMutation.isPending
-                        }
+                        aria-describedby="provider-settings-status"
+                        disabled={providerControls.saveDisabled}
                         onClick={() => saveProviderMutation.mutate()}
                         type="button"
                       >
@@ -1031,6 +1152,13 @@ export function SettingsPage() {
                       </button>
                     </div>
                   </div>
+                  {providerSettings?.base_url_invalid ? (
+                    <div className="error-inline" role="alert">
+                      Atlas rejected the previously saved provider URL because it was not a
+                      loopback address. The safe local default is active; review and save this
+                      connection again.
+                    </div>
+                  ) : null}
                   {saveProviderMutation.isSuccess ? (
                     <div className="success-inline" role="status">
                       Provider saved and Atlas restarted.
@@ -1118,6 +1246,7 @@ export function SettingsPage() {
                     <input
                       aria-label="Memory text"
                       className="text-input settings-memory-input"
+                      maxLength={20_000}
                       onChange={(event) => setMemoryDraft(event.currentTarget.value)}
                       placeholder={currentUserId && !currentUserLocked ? "Remember this across chats" : "Select an unlocked profile first"}
                       value={memoryDraft}
@@ -1131,6 +1260,13 @@ export function SettingsPage() {
                       {createMemoryMutation.isPending ? "Saving..." : "Remember"}
                     </button>
                   </div>
+                  {createMemoryMutation.isError || deleteMemoryMutation.isError ? (
+                    <div className="error-inline" role="alert">
+                      {getMutationErrorMessage(
+                        createMemoryMutation.error ?? deleteMemoryMutation.error,
+                      )}
+                    </div>
+                  ) : null}
                   <div className="settings-memory-list">
                     {!currentUserId || currentUserLocked ? (
                       <EmptyState
@@ -1275,7 +1411,12 @@ export function SettingsPage() {
                   <div className="inline-actions">
                     <button
                       className="ghost-button compact-button"
-                      onClick={() => void openAppLocation("data")}
+                      onClick={() =>
+                        void runSettingsAction(
+                          () => openAppLocation("data"),
+                          "Atlas could not open its data folder.",
+                        )
+                      }
                       type="button"
                     >
                       <FolderOpen size={14} />
@@ -1283,7 +1424,12 @@ export function SettingsPage() {
                     </button>
                     <button
                       className="ghost-button compact-button"
-                      onClick={() => void openAppLocation("logs")}
+                      onClick={() =>
+                        void runSettingsAction(
+                          () => openAppLocation("logs"),
+                          "Atlas could not open its logs folder.",
+                        )
+                      }
                       type="button"
                     >
                       <FolderOpen size={14} />
@@ -1318,7 +1464,12 @@ export function SettingsPage() {
                 <SettingsRow label="Project" description="Open the public repository for source, issues, and release notes.">
                   <button
                     className="ghost-button compact-button"
-                    onClick={() => void openExternalUrl("https://github.com/olliedoganay/AtlasChat")}
+                    onClick={() =>
+                      void runSettingsAction(
+                        () => openExternalUrl("https://github.com/olliedoganay/AtlasChat"),
+                        "Atlas could not open the project page.",
+                      )
+                    }
                     type="button"
                   >
                     <ExternalLink size={14} />

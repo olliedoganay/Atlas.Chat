@@ -1,0 +1,6 @@
+numpy==2.5.2 \
+    --hash=sha256:3cdec01fa790a186d430433fdd4d4ffb70eed6f0eeb4bf05c8dbe2dce0a9bcb8 \
+    --hash=sha256:8ee9c4eeb8454b3660a8b53493563c3e121c2fc94fbd72b848ef814ed7b676a9
+pygame==2.6.1 \
+    --hash=sha256:1206125f14cae22c44565c9d333607f1d9f59487b1f1432945dfc809aeaa3e88 \
+    --hash=sha256:c47a6938de93fa610accd4969e638c2aebcb29b2fca518a84c3a39d91ab47116

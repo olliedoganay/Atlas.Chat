@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import ast
+import hashlib
 import json
 import os
 import queue
@@ -39,13 +40,29 @@ class RunPlan:
     command: list[str]
     ports: dict[int, int] = field(default_factory=dict)  # host:container
     gui: bool = False
+    isolated_gui_preview: bool = False
     web_container_port: int | None = None
     requires_network: bool = False
     uses_apt: bool = False
+    runtime: str | None = None
+    requested_packages: tuple[str, ...] = ()
+    unsupported_packages: tuple[str, ...] = ()
 
 
-PYTHON_GUI_IMAGE = "docker.io/library/python:3.12-slim"
+PYTHON_BASE_IMAGE = "docker.io/library/python:3.12-slim"
+PYTHON_GUI_RUNTIME_NAME = "python-gui"
+PYTHON_GUI_RUNTIME_VERSION = "1.0.1"
+PYTHON_GUI_IMAGE = f"localhost/atlas-python-gui-runtime:{PYTHON_GUI_RUNTIME_VERSION}"
+PYTHON_GUI_RUNTIME_LABEL = "com.atlas.runner.runtime"
+PYTHON_GUI_RUNTIME_VERSION_LABEL = "com.atlas.runner.runtime.version"
+PYTHON_GUI_RUNTIME_DEFINITION_LABEL = "com.atlas.runner.runtime.definition-sha256"
+PYTHON_GUI_RUNTIME_CONTEXT = Path(__file__).resolve().parent / "runner_images" / "python_gui"
+PYTHON_GUI_RUNTIME_ALLOWED_PACKAGES = {
+    "numpy": "2.5.2",
+    "pygame": "2.6.1",
+}
 LEGACY_PYTHON_GUI_IMAGES = (
+    "localhost/atlas-python-gui-runtime:1.0.0",
     "atlas-python-gui:workspace2",
     "atlas-python-gui:workspace1",
     "atlas-python-gui:latest",
@@ -56,10 +73,18 @@ PYTHON_GUI_BASE_APT_PACKAGES = (
     "fluxbox",
     "novnc",
     "websockify",
+    "util-linux",
     "fonts-dejavu",
     "fontconfig",
     "ca-certificates",
 )
+PYTHON_RUNNER_UID = 65534
+PYTHON_PREVIEW_DISPLAY_UID = PYTHON_RUNNER_UID
+PYTHON_PREVIEW_WEB_UID = PYTHON_RUNNER_UID
+PYTHON_RUNNER_HOME = "/tmp/atlas-user"
+PYTHON_RUNNER_SITE = "/tmp/atlas-python-site"
+PYTHON_PREVIEW_DISPLAY_HOME = "/tmp/atlas-display-home"
+PYTHON_PREVIEW_WEB_HOME = "/tmp/atlas-web-home"
 PYTHON_TERMINAL_APT_PACKAGES = (
     "xterm",
     "ncurses-term",
@@ -724,9 +749,51 @@ def _python_repair_package_map(imports: set[str], modules: set[str]) -> dict[str
     return {key: sorted(packages) for key, packages in sorted(package_map.items())}
 
 
-def _python_dependency_repair_script(imports: set[str], modules: set[str]) -> str:
+def _python_dependency_repair_script(
+    imports: set[str],
+    modules: set[str],
+    *,
+    install_target: str | None = None,
+    offline_runtime: bool = False,
+) -> str:
     repair_map = json.dumps(_python_repair_package_map(imports, modules), sort_keys=True)
     safe_spec = PYTHON_SAFE_PACKAGE_SPEC_RE.pattern
+    bundled_runtime_packages = ", ".join(
+        f"{name}=={version}"
+        for name, version in sorted(PYTHON_GUI_RUNTIME_ALLOWED_PACKAGES.items())
+    )
+    offline_runtime_detail = (
+        "Atlas did not grant submitted code network access. Bundled dependencies: "
+        f"{bundled_runtime_packages}. Update the trusted runtime image to add more."
+    )
+    install_target_args = (
+        f", '--target', {install_target!r}, '--upgrade'"
+        if install_target
+        else ", '--root-user-action=ignore'"
+    )
+    install_lines = (
+        [
+            "def install_packages(packages):",
+            (
+                "    print('[atlas-runner] offline GUI runtime does not include: ' + "
+                "' '.join(packages) + '. ' "
+                f"+ {offline_runtime_detail!r}, "
+                "file=sys.stderr, flush=True)"
+            ),
+            "    return 1",
+        ]
+        if offline_runtime
+        else [
+            "def install_packages(packages):",
+            "    print('[atlas-runner] detected missing Python module; installing repair packages: ' + ' '.join(packages), flush=True)",
+            (
+                "    command = [sys.executable, '-m', 'pip', 'install', '--quiet', "
+                "'--no-input', '--disable-pip-version-check'"
+                f"{install_target_args}, *packages]"
+            ),
+            "    return subprocess.call(command)",
+        ]
+    )
     return "\n".join(
         [
             "cat > /tmp/atlas_python_repair.py <<'PY'",
@@ -784,10 +851,7 @@ def _python_dependency_repair_script(imports: set[str], modules: set[str]) -> st
             "                packages.append(package)",
             "    return packages",
             "",
-            "def install_packages(packages):",
-            "    print('[atlas-runner] detected missing Python module; installing repair packages: ' + ' '.join(packages), flush=True)",
-            "    command = [sys.executable, '-m', 'pip', 'install', '--quiet', '--no-input', '--disable-pip-version-check', '--root-user-action=ignore', *packages]",
-            "    return subprocess.call(command)",
+            *install_lines,
             "",
             "def main():",
             "    command = sys.argv[1:]",
@@ -815,6 +879,44 @@ def _python_dependency_repair_script(imports: set[str], modules: set[str]) -> st
     )
 
 
+def _python_unprivileged_command(
+    command: list[str],
+    *,
+    uid: int,
+    home: str,
+    environment: dict[str, str] | None = None,
+) -> str:
+    command_environment = {
+        "HOME": home,
+        "USER": str(uid),
+        "LOGNAME": str(uid),
+        **(environment or {}),
+    }
+    if uid == PYTHON_RUNNER_UID:
+        return shlex.join(
+            [
+                "env",
+                *(f"{key}={value}" for key, value in command_environment.items()),
+                *command,
+            ]
+        )
+    return shlex.join(
+        [
+            "setpriv",
+            f"--reuid={uid}",
+            f"--regid={uid}",
+            "--clear-groups",
+            "--no-new-privs",
+            "--inh-caps=-all",
+            "--ambient-caps=-all",
+            "--pdeathsig=TERM",
+            "env",
+            *(f"{key}={value}" for key, value in command_environment.items()),
+            *command,
+        ]
+    )
+
+
 def _python_apt_packages(imports: set[str], modules: set[str], gui: bool, terminal: bool) -> list[str]:
     packages: list[str] = []
     if gui:
@@ -830,6 +932,27 @@ def _python_apt_packages(imports: set[str], modules: set[str], gui: bool, termin
     return sorted(dict.fromkeys(packages))
 
 
+def _canonical_python_package_name(package_spec: str) -> tuple[str, str]:
+    match = re.match(
+        r"^([A-Za-z0-9][A-Za-z0-9_.-]*)(?:\[[A-Za-z0-9_,.-]+\])?(.*)$",
+        package_spec.strip(),
+    )
+    if not match:
+        return "", package_spec.strip()
+    name = re.sub(r"[-_.]+", "-", match.group(1)).lower()
+    return name, match.group(2).strip()
+
+
+def _python_gui_runtime_unsupported_packages(packages: Iterable[str]) -> tuple[str, ...]:
+    unsupported: list[str] = []
+    for package in packages:
+        name, constraint = _canonical_python_package_name(package)
+        included_version = PYTHON_GUI_RUNTIME_ALLOWED_PACKAGES.get(name)
+        if included_version is None or constraint not in {"", f"=={included_version}", f"==={included_version}"}:
+            unsupported.append(package)
+    return tuple(sorted(dict.fromkeys(unsupported)))
+
+
 def _reserve_host_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -838,7 +961,7 @@ def _reserve_host_port() -> int:
 
 LANGUAGES: dict[str, LanguageSpec] = {
     "python": LanguageSpec(
-        image=PYTHON_GUI_IMAGE,
+        image=PYTHON_BASE_IMAGE,
         filename="main.py",
         command=[
             "sh",
@@ -1096,6 +1219,10 @@ RUNNER_MAX_OUTPUT_BYTES_ENV = "ATLAS_RUNNER_MAX_OUTPUT_BYTES"
 RUNNER_STORAGE_LIMIT_ENV = "ATLAS_RUNNER_STORAGE_LIMIT"
 RUNNER_ALLOWED_NETWORKS = {"none", "bridge"}
 RUNNER_INTERNAL_NETWORK = "atlas-runner-internal"
+RUNNER_INTERNAL_NETWORK_PATTERN = re.compile(
+    rf"^{re.escape(RUNNER_INTERNAL_NETWORK)}-[0-9a-f]{{16}}$"
+)
+MAX_STALE_NETWORK_CLEANUP = 64
 DEFAULT_RUNNER_MAX_CONCURRENT = 2
 MAX_RUNNER_MAX_CONCURRENT = 8
 DEFAULT_RUNNER_HISTORY_LIMIT = 2_000
@@ -1133,12 +1260,16 @@ def _remove_legacy_python_gui_images(binary: str | None = None) -> None:
     if not binary:
         return
     for image in LEGACY_PYTHON_GUI_IMAGES:
-        subprocess.run(
-            [binary, "image", "rm", image],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+        try:
+            subprocess.run(
+                [binary, "image", "rm", image],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
 
 
 def _python_plan(code: str) -> RunPlan:
@@ -1152,20 +1283,39 @@ def _python_plan(code: str) -> RunPlan:
     pip_packages = sorted(set(_python_pip_packages(imports, modules)) | web_packages | declared_packages)
     apt_packages = _python_apt_packages(imports, modules, gui, terminal)
     repair_may_need_network = _python_dependency_repair_may_need_network(code)
+    unsupported_packages = _python_gui_runtime_unsupported_packages(pip_packages) if gui else ()
     gui_args = " ".join(_python_gui_args(code))
     gui_args_suffix = f" {gui_args}" if gui_args else ""
+    runner_environment = {
+        "DISPLAY": ":99",
+        "PYTHONPATH": PYTHON_RUNNER_SITE,
+        "PYTHONPYCACHEPREFIX": f"{PYTHON_RUNNER_HOME}/pycache",
+        "XDG_RUNTIME_DIR": PYTHON_RUNNER_HOME,
+    }
     script_parts = [
         "set -e",
+        "umask 022",
         "cp /work/main.py /tmp/main.py",
+        "chmod 0444 /tmp/main.py",
         "cd /tmp",
         (
             "export DEBIAN_FRONTEND=noninteractive DISPLAY=:99 SCREEN_GEOMETRY=1280x800x24 "
             "VNC_PORT=5900 NOVNC_PORT=6080 PYTHONUNBUFFERED=1 SDL_AUDIODRIVER=dummy "
             "PYGAME_HIDE_SUPPORT_PROMPT=1 ALSA_CONFIG_PATH=/dev/null"
         ),
-        _python_dependency_repair_script(imports, modules),
+        _python_dependency_repair_script(
+            imports,
+            modules,
+            install_target=PYTHON_RUNNER_SITE if gui else None,
+            offline_runtime=gui,
+        ),
+        "chmod 0444 /tmp/atlas_python_repair.py",
     ]
-    if apt_packages:
+    if gui:
+        script_parts.append(
+            f"echo '[atlas-runner] using prepared offline Python GUI runtime {PYTHON_GUI_RUNTIME_VERSION}'"
+        )
+    if apt_packages and not gui:
         apt_args = shlex.join(apt_packages)
         script_parts.extend(
             [
@@ -1176,31 +1326,116 @@ def _python_plan(code: str) -> RunPlan:
             ],
         )
     if gui:
+        display_environment = {
+            "DISPLAY": ":99",
+            "XDG_RUNTIME_DIR": PYTHON_PREVIEW_DISPLAY_HOME,
+        }
+        display_commands = {
+            "xvfb": _python_unprivileged_command(
+                [
+                    "Xvfb",
+                    ":99",
+                    "-screen",
+                    "0",
+                    "1280x800x24",
+                    "-ac",
+                    "+extension",
+                    "GLX",
+                    "+render",
+                    "-noreset",
+                ],
+                uid=PYTHON_PREVIEW_DISPLAY_UID,
+                home=PYTHON_PREVIEW_DISPLAY_HOME,
+                environment=display_environment,
+            ),
+            "fluxbox": _python_unprivileged_command(
+                ["fluxbox", "-rc", "/tmp/atlas-fluxbox-init"],
+                uid=PYTHON_PREVIEW_DISPLAY_UID,
+                home=PYTHON_PREVIEW_DISPLAY_HOME,
+                environment=display_environment,
+            ),
+            "x11vnc": _python_unprivileged_command(
+                [
+                    "x11vnc",
+                    "-display",
+                    ":99",
+                    "-nopw",
+                    "-forever",
+                    "-shared",
+                    "-rfbport",
+                    "5900",
+                    "-quiet",
+                ],
+                uid=PYTHON_PREVIEW_DISPLAY_UID,
+                home=PYTHON_PREVIEW_DISPLAY_HOME,
+                environment=display_environment,
+            ),
+            "websockify": _python_unprivileged_command(
+                [
+                    "websockify",
+                    "--web",
+                    "/usr/share/novnc",
+                    "6080",
+                    "127.0.0.1:5900",
+                ],
+                uid=PYTHON_PREVIEW_WEB_UID,
+                home=PYTHON_PREVIEW_WEB_HOME,
+            ),
+        }
         script_parts.extend(
             [
-                "ln -sf /usr/share/novnc/vnc.html /usr/share/novnc/index.html",
-                "mkdir -p /root/.fluxbox",
+                (
+                    "install -d -m 0700 "
+                    f"{PYTHON_RUNNER_HOME} {PYTHON_RUNNER_SITE}"
+                ),
+                (
+                    f"install -d -m 0700 {PYTHON_PREVIEW_DISPLAY_HOME}"
+                ),
+                (
+                    f"install -d -m 0700 {PYTHON_PREVIEW_WEB_HOME}"
+                ),
                 (
                     "printf '%s\\n' 'session.screen0.workspaces: 1' 'session.screen0.workspaceNames: Main' "
-                    "'session.screen0.toolbar.tools: workspacename, iconbar, systemtray, clock' > /root/.fluxbox/init"
+                    "'session.screen0.toolbar.tools: workspacename, iconbar, systemtray, clock' "
+                    "> /tmp/atlas-fluxbox-init"
                 ),
+                "chmod 0444 /tmp/atlas-fluxbox-init",
                 "rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null || true",
-                'Xvfb :99 -screen 0 "$SCREEN_GEOMETRY" -ac +extension GLX +render -noreset >/tmp/xvfb.log 2>&1 & sleep 0.6',
+                f"{display_commands['xvfb']} >/tmp/xvfb.log 2>&1 & sleep 0.6",
                 (
-                    "fluxbox -rc /root/.fluxbox/init >/tmp/fluxbox.log 2>&1 & "
-                    'x11vnc -display :99 -nopw -forever -shared -rfbport "$VNC_PORT" -quiet >/tmp/x11vnc.log 2>&1 & '
-                    'websockify --web /usr/share/novnc "$NOVNC_PORT" "localhost:$VNC_PORT" >/tmp/novnc.log 2>&1 & '
+                    f"{display_commands['fluxbox']} >/tmp/fluxbox.log 2>&1 & "
+                    f"{display_commands['x11vnc']} >/tmp/x11vnc.log 2>&1 & "
+                    f"{display_commands['websockify']} >/tmp/novnc.log 2>&1 & "
                     "sleep 0.4"
                 ),
                 "echo '[atlas-runner] GUI ready on port 6080'",
             ],
         )
-    if pip_packages:
+    if pip_packages and not gui:
         pip_args = shlex.join(pip_packages)
         script_parts.append(f"echo {shlex.quote('[atlas-runner] installing Python packages: ' + ' '.join(pip_packages))}")
+        pip_command = [
+            "python",
+            "-m",
+            "pip",
+            "install",
+            "--quiet",
+            "--no-input",
+            "--disable-pip-version-check",
+        ]
+        if gui:
+            pip_command.extend(["--target", PYTHON_RUNNER_SITE, "--upgrade"])
+            pip_install = _python_unprivileged_command(
+                [*pip_command, *pip_packages],
+                uid=PYTHON_RUNNER_UID,
+                home=PYTHON_RUNNER_HOME,
+                environment=runner_environment,
+            )
+        else:
+            pip_install = f"{shlex.join(pip_command)} --root-user-action=ignore {pip_args}"
         script_parts.append(
-            f"pip install --quiet --no-input --disable-pip-version-check --root-user-action=ignore {pip_args} "
-            "|| echo '[atlas-runner] initial package install failed; continuing to run and repair imports if possible'"
+            f"{pip_install} || echo "
+            "'[atlas-runner] initial package install failed; continuing to run and repair imports if possible'"
         )
     if web_port:
         script_parts.append(f"echo {shlex.quote(f'[atlas-runner] web preview will use container port {web_port}')}")
@@ -1209,33 +1444,85 @@ def _python_plan(code: str) -> RunPlan:
         )
     if terminal:
         terminal_command = (
-            f"cd /tmp; export TERM=xterm-256color; python -u /tmp/main.py{gui_args_suffix}; "
+            "cd /tmp; export TERM=xterm-256color; "
+            f"python /tmp/atlas_python_repair.py python -u /tmp/main.py{gui_args_suffix}; "
             "status=$?; echo; echo \"[atlas-runner] terminal app exited with status $status\"; "
             "sleep 2; exit $status"
         )
         script_parts.append("echo '[atlas-runner] starting terminal UI in virtual display'")
         script_parts.append(
-            "xterm -geometry 120x34 -fa 'DejaVu Sans Mono' -fs 12 -title 'Atlas Terminal' "
-            f"-e sh -c {shlex.quote(terminal_command)}"
+            _python_unprivileged_command(
+                [
+                    "xterm",
+                    "-geometry",
+                    "120x34",
+                    "-fa",
+                    "DejaVu Sans Mono",
+                    "-fs",
+                    "12",
+                    "-title",
+                    "Atlas Terminal",
+                    "-e",
+                    "sh",
+                    "-c",
+                    terminal_command,
+                ],
+                uid=PYTHON_RUNNER_UID,
+                home=PYTHON_RUNNER_HOME,
+                environment=runner_environment,
+            )
         )
     elif web_command:
-        script_parts.append(f"python /tmp/atlas_python_repair.py sh -c {shlex.quote(web_command)}")
+        command = ["python", "/tmp/atlas_python_repair.py", "sh", "-c", web_command]
+        if gui:
+            script_parts.append(
+                _python_unprivileged_command(
+                    command,
+                    uid=PYTHON_RUNNER_UID,
+                    home=PYTHON_RUNNER_HOME,
+                    environment=runner_environment,
+                )
+            )
+        else:
+            script_parts.append(shlex.join(command))
     else:
-        script_parts.append(f"python /tmp/atlas_python_repair.py python -u /tmp/main.py{gui_args_suffix}")
+        command = [
+            "python",
+            "/tmp/atlas_python_repair.py",
+            "python",
+            "-u",
+            "/tmp/main.py",
+            *_python_gui_args(code),
+        ]
+        if gui:
+            script_parts.append(
+                _python_unprivileged_command(
+                    command,
+                    uid=PYTHON_RUNNER_UID,
+                    home=PYTHON_RUNNER_HOME,
+                    environment=runner_environment,
+                )
+            )
+        else:
+            script_parts.append(shlex.join(command))
     ports: dict[int, int] = {}
     if gui:
         ports[_reserve_host_port()] = NOVNC_CONTAINER_PORT
     if web_port:
         ports[_reserve_host_port()] = web_port
     return RunPlan(
-        image=PYTHON_GUI_IMAGE,
+        image=PYTHON_GUI_IMAGE if gui else PYTHON_BASE_IMAGE,
         filename="main.py",
         command=["sh", "-c", "\n".join(script_parts)],
         ports=ports,
         gui=gui,
+        isolated_gui_preview=gui,
         web_container_port=web_port,
-        requires_network=bool(apt_packages or pip_packages or repair_may_need_network),
-        uses_apt=bool(apt_packages),
+        requires_network=bool(not gui and (apt_packages or pip_packages or repair_may_need_network)),
+        uses_apt=bool(apt_packages and not gui),
+        runtime=PYTHON_GUI_RUNTIME_NAME if gui else None,
+        requested_packages=tuple(pip_packages),
+        unsupported_packages=unsupported_packages,
     )
 
 
@@ -1341,14 +1628,17 @@ def _runner_storage_limit_supported(binary: str) -> bool:
     return completed.returncode == 0 and "--storage-opt" in completed.stdout
 
 
-def _inspect_internal_network(binary: str) -> bool | None:
+def _inspect_internal_network(
+    binary: str,
+    network_name: str = RUNNER_INTERNAL_NETWORK,
+) -> bool | None:
     try:
         completed = subprocess.run(
             [
                 binary,
                 "network",
                 "inspect",
-                RUNNER_INTERNAL_NETWORK,
+                network_name,
                 "--format",
                 "{{.Internal}}",
             ],
@@ -1364,16 +1654,34 @@ def _inspect_internal_network(binary: str) -> bool | None:
     return completed.stdout.strip().lower() == "true"
 
 
-def _ensure_internal_network(binary: str) -> None:
-    internal = _inspect_internal_network(binary)
+def _ensure_internal_network(
+    binary: str,
+    network_name: str = RUNNER_INTERNAL_NETWORK,
+    *,
+    labels: dict[str, str] | None = None,
+) -> None:
+    internal = _inspect_internal_network(binary, network_name)
     if internal is True:
+        existing_labels = _network_labels(binary, network_name)
+        expected_labels = {"atlas.runner.network": "1", **(labels or {})}
+        if existing_labels is None or any(
+            existing_labels.get(key) != value
+            for key, value in expected_labels.items()
+        ):
+            raise RuntimeError(
+                f"Docker network '{network_name}' already exists but is not owned "
+                "by this Atlas runner."
+            )
         return
     if internal is False:
         raise RuntimeError(
-            f"Docker network '{RUNNER_INTERNAL_NETWORK}' already exists but is not internal; "
+            f"Docker network '{network_name}' already exists but is not internal; "
             "remove or rename it before running an isolated preview."
         )
 
+    label_args: list[str] = []
+    for key, value in (labels or {}).items():
+        label_args.extend(["--label", f"{key}={value}"])
     try:
         completed = subprocess.run(
             [
@@ -1385,7 +1693,8 @@ def _ensure_internal_network(binary: str) -> None:
                 "--internal",
                 "--label",
                 "atlas.runner.network=1",
-                RUNNER_INTERNAL_NETWORK,
+                *label_args,
+                network_name,
             ],
             capture_output=True,
             text=True,
@@ -1397,11 +1706,73 @@ def _ensure_internal_network(binary: str) -> None:
     except OSError as exc:
         raise RuntimeError(f"Failed to create the isolated preview network: {exc}") from exc
 
-    if completed.returncode == 0 or _inspect_internal_network(binary) is True:
+    if completed.returncode == 0:
         return
+    if _inspect_internal_network(binary, network_name) is True:
+        existing_labels = _network_labels(binary, network_name)
+        expected_labels = {"atlas.runner.network": "1", **(labels or {})}
+        if existing_labels is not None and all(
+            existing_labels.get(key) == value
+            for key, value in expected_labels.items()
+        ):
+            return
     detail = (completed.stderr or completed.stdout or "").strip()
     suffix = f" Details: {detail.splitlines()[-1]}" if detail else ""
     raise RuntimeError(f"Failed to create the isolated preview network.{suffix}")
+
+
+def _remove_internal_network(binary: str, network_name: str) -> None:
+    if (
+        network_name != RUNNER_INTERNAL_NETWORK
+        and not RUNNER_INTERNAL_NETWORK_PATTERN.fullmatch(network_name)
+    ):
+        return
+    labels = _network_labels(binary, network_name)
+    if labels is None or labels.get("atlas.runner.network") != "1":
+        return
+    try:
+        subprocess.run(
+            [binary, "network", "rm", network_name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def _network_labels(binary: str, network_name: str) -> dict[str, str] | None:
+    try:
+        completed = subprocess.run(
+            [
+                binary,
+                "network",
+                "inspect",
+                network_name,
+                "--format",
+                "{{json .Labels}}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    try:
+        labels = json.loads(completed.stdout.strip() or "{}")
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(labels, dict):
+        return None
+    return {
+        str(key): str(value)
+        for key, value in labels.items()
+        if isinstance(key, str) and value is not None
+    }
 
 
 def _runner_timeout_seconds(plan: RunPlan) -> int:
@@ -1414,6 +1785,286 @@ def _runner_timeout_seconds(plan: RunPlan) -> int:
         return max(1, int(raw))
     except ValueError:
         return default_value
+
+
+def _python_gui_runtime_definition_hash() -> str:
+    digest = hashlib.sha256()
+    for name in ("Dockerfile", ".dockerignore", "runtime-requirements.txt"):
+        path = PYTHON_GUI_RUNTIME_CONTEXT / name
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _inspect_python_gui_runtime(binary: str) -> tuple[bool, int | None, str | None]:
+    try:
+        completed = subprocess.run(
+            [binary, "image", "inspect", PYTHON_GUI_IMAGE],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, None, str(exc)
+    if completed.returncode != 0:
+        return False, None, None
+    try:
+        payload = json.loads(completed.stdout)
+        image = payload[0]
+        labels = image.get("Config", {}).get("Labels") or image.get("Labels") or {}
+        size = int(image.get("Size")) if image.get("Size") is not None else None
+    except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False, None, "The local runtime image metadata is unreadable."
+    expected_hash = _python_gui_runtime_definition_hash()
+    ready = (
+        labels.get(PYTHON_GUI_RUNTIME_LABEL) == PYTHON_GUI_RUNTIME_NAME
+        and labels.get(PYTHON_GUI_RUNTIME_VERSION_LABEL) == PYTHON_GUI_RUNTIME_VERSION
+        and labels.get(PYTHON_GUI_RUNTIME_DEFINITION_LABEL) == expected_hash
+    )
+    if not ready:
+        return False, size, "The local runtime image is stale and must be prepared again."
+    return True, size, None
+
+
+class PythonGuiRuntimeManager:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._state = "missing"
+        self._message = "Python GUI runtime is not prepared."
+        self._error: str | None = None
+        self._progress = 0.0
+        self._logs: deque[str] = deque(maxlen=80)
+        self._thread: threading.Thread | None = None
+        self._process: subprocess.Popen | None = None
+        self._started_at: float | None = None
+        self._completed_at: float | None = None
+        self._image_size_bytes: int | None = None
+
+    def status(self, binary: str | None = None) -> dict[str, Any]:
+        binary = binary or _docker_binary()
+        if not binary:
+            return self._snapshot(
+                state="unavailable",
+                message="Docker CLI was not found on PATH.",
+            )
+        with self._lock:
+            if self._state == "preparing":
+                return self._snapshot_locked()
+        ready, size, inspect_error = _inspect_python_gui_runtime(binary)
+        with self._lock:
+            if ready:
+                self._state = "ready"
+                self._message = "Secure offline Python GUI runtime is ready."
+                self._error = None
+                self._progress = 1.0
+                self._image_size_bytes = size
+            elif self._state != "failed":
+                self._state = "missing"
+                self._message = inspect_error or "Python GUI runtime is not prepared."
+                self._progress = 0.0
+                self._image_size_bytes = size
+            return self._snapshot_locked()
+
+    def prepare(self) -> dict[str, Any]:
+        binary = _docker_binary()
+        if not binary:
+            return {
+                **self.status(binary),
+                "started": False,
+            }
+        current = self.status(binary)
+        if current["state"] == "ready":
+            return {**current, "started": False}
+        with self._lock:
+            if self._state == "preparing":
+                return {**self._snapshot_locked(), "started": False}
+            self._state = "preparing"
+            self._message = (
+                "Starting trusted runtime preparation. Submitted code is not mounted or executed."
+            )
+            self._error = None
+            self._progress = 0.02
+            self._logs.clear()
+            self._started_at = time.time()
+            self._completed_at = None
+            thread = threading.Thread(
+                target=self._build,
+                args=(binary,),
+                name="atlas-python-gui-runtime-build",
+                daemon=True,
+            )
+            self._thread = thread
+            thread.start()
+            return {**self._snapshot_locked(), "started": True}
+
+    def shutdown(self) -> None:
+        with self._lock:
+            process = self._process
+        if process is not None and process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+
+    def is_preparing(self) -> bool:
+        with self._lock:
+            return self._state == "preparing"
+
+    def _build(self, binary: str) -> None:
+        definition_hash = _python_gui_runtime_definition_hash()
+        command = [
+            binary,
+            "build",
+            "--pull",
+            "--file",
+            str(PYTHON_GUI_RUNTIME_CONTEXT / "Dockerfile"),
+            "--tag",
+            PYTHON_GUI_IMAGE,
+            "--build-arg",
+            f"ATLAS_RUNTIME_DEFINITION_SHA256={definition_hash}",
+            str(PYTHON_GUI_RUNTIME_CONTEXT),
+        ]
+        creation_flags = 0x08000000 if sys.platform == "win32" else 0
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                bufsize=1,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=creation_flags,
+            )
+            with self._lock:
+                self._process = process
+            if process.stdout is not None:
+                for raw_line in process.stdout:
+                    self._record_build_line(raw_line)
+            return_code = process.wait()
+            ready, size, inspect_error = _inspect_python_gui_runtime(binary)
+            with self._lock:
+                self._process = None
+                self._completed_at = time.time()
+                self._image_size_bytes = size
+                if return_code == 0 and ready:
+                    self._state = "ready"
+                    self._progress = 1.0
+                    self._message = "Secure offline Python GUI runtime is ready."
+                    self._error = None
+                else:
+                    self._state = "failed"
+                    self._progress = 0.0
+                    detail = inspect_error or self._last_log_locked() or f"container build exited {return_code}"
+                    self._error = (
+                        "Python GUI runtime preparation failed. Check Docker connectivity and retry. "
+                        f"Details: {detail}"
+                    )
+                    self._message = "Runtime preparation failed."
+        except OSError as exc:
+            with self._lock:
+                self._process = None
+                self._completed_at = time.time()
+                self._state = "failed"
+                self._progress = 0.0
+                self._message = "Runtime preparation failed."
+                self._error = f"Could not start the trusted container build: {exc}"
+
+    def _record_build_line(self, raw_line: str) -> None:
+        line = raw_line.strip()
+        if not line:
+            return
+        line = line[-500:]
+        progress = None
+        step_match = re.search(r"\bSTEP\s+(\d+)/(\d+)\b", line, re.IGNORECASE)
+        if step_match:
+            current, total = (int(value) for value in step_match.groups())
+            if total > 0:
+                progress = min(0.95, max(0.05, current / total * 0.9))
+        with self._lock:
+            self._logs.append(line)
+            self._message = line
+            if progress is not None:
+                self._progress = progress
+
+    def _snapshot(self, *, state: str, message: str) -> dict[str, Any]:
+        with self._lock:
+            payload = self._snapshot_locked()
+        payload["state"] = state
+        payload["message"] = message
+        return payload
+
+    def _snapshot_locked(self) -> dict[str, Any]:
+        return {
+            "name": PYTHON_GUI_RUNTIME_NAME,
+            "version": PYTHON_GUI_RUNTIME_VERSION,
+            "image": PYTHON_GUI_IMAGE,
+            "state": self._state,
+            "message": self._message,
+            "error": self._error,
+            "progress": self._progress,
+            "started_at": self._started_at,
+            "completed_at": self._completed_at,
+            "image_size_bytes": self._image_size_bytes,
+            "bundled_packages": [
+                f"{name}=={version}"
+                for name, version in sorted(PYTHON_GUI_RUNTIME_ALLOWED_PACKAGES.items())
+            ],
+            "execution_network": "internal-preview-only",
+            "submitted_code_used_during_preparation": False,
+            "log_tail": list(self._logs)[-20:],
+        }
+
+    def _last_log_locked(self) -> str | None:
+        return self._logs[-1] if self._logs else None
+
+
+_python_gui_runtime_manager = PythonGuiRuntimeManager()
+
+
+def python_gui_runtime_status() -> dict[str, Any]:
+    return _python_gui_runtime_manager.status()
+
+
+def prepare_python_gui_runtime() -> dict[str, Any]:
+    return _python_gui_runtime_manager.prepare()
+
+
+def _unsupported_python_gui_runtime_message(plan: RunPlan) -> str:
+    requested = ", ".join(plan.unsupported_packages)
+    bundled = ", ".join(
+        f"{name}=={version}"
+        for name, version in sorted(PYTHON_GUI_RUNTIME_ALLOWED_PACKAGES.items())
+    )
+    return (
+        "The secure offline Python GUI runtime does not include these requested dependencies: "
+        f"{requested}. Bundled third-party packages: {bundled}. Atlas will not grant submitted "
+        "code network access or install arbitrary packages at run time. Remove the dependency or "
+        "add a reviewed, pinned package to the trusted runtime image and bump its version."
+    )
+
+
+def prepare_runner_runtime(language: str, code: str) -> dict[str, Any]:
+    resolved = resolve_language(language)
+    if not resolved:
+        raise RuntimeError(f"Language '{language}' is not supported.")
+    if resolved in CLIENT_LANGUAGES:
+        return {"required": False, "runtime": None, "started": False}
+    plan = resolve_plan(resolved, code)
+    if plan.unsupported_packages:
+        raise RuntimeError(_unsupported_python_gui_runtime_message(plan))
+    if plan.runtime != PYTHON_GUI_RUNTIME_NAME:
+        return {"required": False, "runtime": None, "started": False}
+    runtime = prepare_python_gui_runtime()
+    return {
+        "required": True,
+        "runtime": runtime,
+        "started": bool(runtime.get("started", False)),
+    }
 
 
 def docker_status() -> dict[str, Any]:
@@ -1543,10 +2194,28 @@ class CodeRunner:
 
         self._cleanup_finished_runs()
         plan = resolve_plan(resolved, code)
+        if plan.unsupported_packages:
+            raise RuntimeError(_unsupported_python_gui_runtime_message(plan))
+        if plan.runtime == PYTHON_GUI_RUNTIME_NAME:
+            runtime = _python_gui_runtime_manager.status(binary)
+            if runtime.get("state") != "ready":
+                raise RuntimeError(
+                    "The secure offline Python GUI runtime is not ready. "
+                    "Prepare it from the runner and wait for preparation to finish before retrying."
+                )
+        if plan.gui and not plan.isolated_gui_preview:
+            raise RuntimeError(
+                "Refusing to publish a GUI preview without the runner privilege boundary."
+            )
         run_id = uuid.uuid4().hex[:16]
         container_name = f"atlas-run-{run_id}"
         configured_network = _configured_runner_network()
-        network = _runner_network_policy(plan)
+        network_policy = _runner_network_policy(plan)
+        network = (
+            f"{RUNNER_INTERNAL_NETWORK}-{run_id}"
+            if network_policy == RUNNER_INTERNAL_NETWORK
+            else network_policy
+        )
         timeout_seconds = _runner_timeout_seconds(plan)
         storage_limit = _runner_storage_limit()
         if storage_limit and not _runner_storage_limit_supported(binary):
@@ -1562,11 +2231,22 @@ class CodeRunner:
         work_dir: Path | None = None
         process: subprocess.Popen | None = None
         registered = False
+        internal_network_created = False
         try:
             self._cleanup_stale_containers(binary)
+            self._cleanup_stale_networks(binary)
             _remove_legacy_python_gui_images(binary)
-            if network == RUNNER_INTERNAL_NETWORK:
-                _ensure_internal_network(binary)
+            if network_policy == RUNNER_INTERNAL_NETWORK:
+                _ensure_internal_network(
+                    binary,
+                    network,
+                    labels={
+                        "atlas.runner.owner_id": self._owner_id,
+                        "atlas.runner.owner_pid": str(os.getpid()),
+                        "atlas.runner.run_id": run_id,
+                    },
+                )
+                internal_network_created = True
 
             work_dir = Path(tempfile.mkdtemp(prefix=f"atlas-run-{run_id}-"))
             source_path = work_dir / plan.filename
@@ -1683,6 +2363,20 @@ class CodeRunner:
                     },
                     enforce_output_limit=False,
                 )
+            if plan.web_container_port and not outbound_network:
+                self._emit(
+                    runner,
+                    {
+                        "type": "output",
+                        "stream": "stderr",
+                        "chunk": (
+                            "[atlas-runner] browser web preview is disabled while outbound "
+                            f"network access is blocked. Set {RUNNER_NETWORK_ENV}=bridge only "
+                            "if you explicitly want the preview and its browser-side network access.\n"
+                        ),
+                    },
+                    enforce_output_limit=False,
+                )
 
             stdout_thread = threading.Thread(
                 target=self._pump_stream,
@@ -1727,11 +2421,13 @@ class CodeRunner:
                 response["vnc_url"] = (
                     f"http://127.0.0.1:{host_port}/vnc.html?autoconnect=1&resize=remote&reconnect=1"
                 )
-            if plan.web_container_port:
+            if plan.web_container_port and outbound_network:
                 for host_port, container_port in plan.ports.items():
                     if container_port == plan.web_container_port:
                         response["web_url"] = f"http://127.0.0.1:{host_port}/"
                         break
+            elif plan.web_container_port:
+                response["web_preview_disabled"] = True
             return response
         except OSError as exc:
             raise RuntimeError(f"Failed to start Docker: {exc}") from exc
@@ -1747,6 +2443,8 @@ class CodeRunner:
                         pass
                 if work_dir is not None:
                     shutil.rmtree(work_dir, ignore_errors=True)
+                if internal_network_created:
+                    _remove_internal_network(binary, network)
 
     def subscribe(
         self,
@@ -1762,6 +2460,12 @@ class CodeRunner:
             )
             runner.subscribers.append(subscriber)
             return history, subscriber, False
+
+    def active_run_count(self) -> int:
+        with self._lock:
+            return len(self._starting_names) + sum(
+                1 for runner in self._runs.values() if not runner.finished
+            )
 
     def unsubscribe(self, run_id: str, subscriber: queue.Queue[dict[str, Any]]) -> None:
         with self._lock:
@@ -1921,6 +2625,9 @@ class CodeRunner:
         for subscriber in subscribers:
             put_bounded_queue(subscriber, event)
         shutil.rmtree(runner.work_dir, ignore_errors=True)
+        binary = _docker_binary()
+        if binary:
+            _remove_internal_network(binary, runner.network)
 
     def _enforce_timeout(self, runner: RunnerProcess) -> None:
         deadline = runner.started_at + max(1, runner.timeout_seconds)
@@ -2025,6 +2732,81 @@ class CodeRunner:
             if owned_by_this_runner or legacy_owned_by_this_process or stale_owner:
                 self._remove_container_name(binary, name)
 
+    def _cleanup_stale_networks(
+        self,
+        binary: str,
+        *,
+        preserve_active: bool = True,
+    ) -> None:
+        with self._lock:
+            if preserve_active:
+                active_networks = {
+                    runner.network
+                    for runner in self._runs.values()
+                    if not runner.finished
+                    and RUNNER_INTERNAL_NETWORK_PATTERN.fullmatch(runner.network)
+                }
+                for container_name in self._starting_names:
+                    if not container_name.startswith("atlas-run-"):
+                        continue
+                    run_id = container_name.removeprefix("atlas-run-")
+                    network_name = f"{RUNNER_INTERNAL_NETWORK}-{run_id}"
+                    if RUNNER_INTERNAL_NETWORK_PATTERN.fullmatch(network_name):
+                        active_networks.add(network_name)
+            else:
+                active_networks = set()
+        try:
+            completed = subprocess.run(
+                [
+                    binary,
+                    "network",
+                    "ls",
+                    "--filter",
+                    "label=atlas.runner.network=1",
+                    "--format",
+                    "{{.Name}}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return
+        if completed.returncode != 0:
+            return
+
+        candidates: list[str] = []
+        for line in completed.stdout.splitlines():
+            name = line.strip()
+            if (
+                (
+                    name == RUNNER_INTERNAL_NETWORK
+                    or RUNNER_INTERNAL_NETWORK_PATTERN.fullmatch(name)
+                )
+                and name not in active_networks
+            ):
+                candidates.append(name)
+                if len(candidates) >= MAX_STALE_NETWORK_CLEANUP:
+                    break
+
+        for name in candidates:
+            labels = _network_labels(binary, name)
+            if labels is None or labels.get("atlas.runner.network") != "1":
+                continue
+            owner_id = labels.get("atlas.runner.owner_id", "").strip()
+            owner_pid_raw = labels.get("atlas.runner.owner_pid", "").strip()
+            try:
+                owner_pid = int(owner_pid_raw)
+            except ValueError:
+                owner_pid = None
+
+            owned_by_this_runner = owner_id == self._owner_id
+            legacy_owned_by_this_process = not owner_id and owner_pid == os.getpid()
+            stale_owner = owner_pid is None or not _process_is_alive(owner_pid)
+            if owned_by_this_runner or legacy_owned_by_this_process or stale_owner:
+                _remove_internal_network(binary, name)
+
     @staticmethod
     def _container_labels(binary: str, container_name: str) -> dict[str, str] | None:
         try:
@@ -2058,6 +2840,7 @@ class CodeRunner:
         }
 
     def shutdown(self) -> None:
+        _python_gui_runtime_manager.shutdown()
         with self._lock:
             if self._shutting_down:
                 return
@@ -2078,6 +2861,7 @@ class CodeRunner:
             )
             if binary:
                 self._remove_container_name(binary, runner.container_name)
+                _remove_internal_network(binary, runner.network)
             try:
                 runner.process.kill()
             except OSError:
@@ -2086,6 +2870,7 @@ class CodeRunner:
 
         if binary:
             self._cleanup_stale_containers(binary, preserve_active=False)
+            self._cleanup_stale_networks(binary, preserve_active=False)
 
     close = shutdown
 
@@ -2102,7 +2887,20 @@ def get_runner() -> CodeRunner:
         return _runner_singleton
 
 
+def runner_activity_status() -> dict[str, int | bool]:
+    with _runner_lock:
+        runner = _runner_singleton
+    active_runs = runner.active_run_count() if runner is not None else 0
+    runtime_preparing = _python_gui_runtime_manager.is_preparing()
+    return {
+        "busy": active_runs > 0 or runtime_preparing,
+        "active_runs": active_runs,
+        "runtime_preparing": runtime_preparing,
+    }
+
+
 def shutdown_runner() -> None:
+    _python_gui_runtime_manager.shutdown()
     with _runner_lock:
         runner = _runner_singleton
     if runner is not None:

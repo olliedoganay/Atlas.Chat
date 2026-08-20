@@ -135,7 +135,7 @@ jobs:
 
       - name: Audit frontend dependencies
         working-directory: apps/atlas
-        run: npm audit --audit-level=high
+        run: npm run audit:dependencies
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable

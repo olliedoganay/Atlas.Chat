@@ -8,6 +8,7 @@ from atlas_local.discovery import (
     RecommendedModel,
     _estimate_model_fit,
     _normalize_windows_gpu_entries,
+    _recommended_model_from_ollama_metadata,
     _resolve_windows_system_label,
     build_discovery_report,
     load_discovery_models,
@@ -81,7 +82,13 @@ class DiscoveryReportTests(unittest.TestCase):
                 },
             )
             catalog = OllamaCatalogSnapshot(
-                models=(OllamaModelInfo(name="qwen3:8b", supports_reasoning=True),),
+                models=(
+                    OllamaModelInfo(
+                        name="qwen3:8b",
+                        size_bytes=5_200_000_000,
+                        supports_reasoning=True,
+                    ),
+                ),
                 ollama_online=True,
                 has_local_models=True,
                 source="ollama",
@@ -93,6 +100,8 @@ class DiscoveryReportTests(unittest.TestCase):
         self.assertTrue(payload["atlas"]["configured_embed_model_installed"])
         self.assertEqual(payload["recommended_models"][0]["name"], "qwen3:8b")
         self.assertEqual(payload["recommended_models"][0]["fit"], "good")
+        self.assertEqual(payload["recommended_models"][0]["model_size_gb"], 4.8)
+        self.assertTrue(payload["recommended_models"][0]["supports_reasoning"])
         recommended_names = [item["name"] for item in payload["recommended_models"]]
         self.assertIn("llama3.1:8b", recommended_names)
         self.assertIn("qwen3:8b", recommended_names)
@@ -213,3 +222,63 @@ class DiscoveryReportTests(unittest.TestCase):
 
         self.assertEqual(fit, "tight")
         self.assertEqual(runtime, "CPU")
+
+    def test_live_model_size_drives_full_gpu_and_hybrid_fit_thresholds(self) -> None:
+        candidate = _recommended_model_from_ollama_metadata(
+            OllamaModelInfo(
+                name="qwen3.8:27b",
+                size_bytes=17_741_872_154,
+                supports_images=True,
+                supports_reasoning=True,
+            )
+        )
+
+        fit, runtime, reason = _estimate_model_fit(
+            candidate,
+            {
+                "memory": {"total_gb": 31.1},
+                "gpus": [
+                    {
+                        "name": "RTX 4080 Laptop GPU",
+                        "memory_gb": 12.0,
+                        "kind": "dedicated",
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(candidate.title, "Installed vision and reasoning model")
+        self.assertEqual(candidate.model_size_gb, 16.5)
+        self.assertEqual(candidate.min_ram_gb, 23.0)
+        self.assertEqual(candidate.good_ram_gb, 31.0)
+        self.assertEqual(candidate.min_vram_gb, 18.0)
+        self.assertEqual(candidate.good_vram_gb, 20.0)
+        self.assertEqual(fit, "tight")
+        self.assertEqual(runtime, "Hybrid")
+        self.assertIn("mixed CPU/GPU offload", reason)
+
+    def test_fit_estimation_uses_partial_dedicated_gpu_for_hybrid_runtime(self) -> None:
+        candidate = RecommendedModel(
+            name="local:8b",
+            title="Local model",
+            use_case="chat",
+            atlas_role="chat",
+            min_ram_gb=12.0,
+            good_ram_gb=18.0,
+            min_vram_gb=8.0,
+            good_vram_gb=12.0,
+        )
+
+        fit, runtime, reason = _estimate_model_fit(
+            candidate,
+            {
+                "memory": {"total_gb": 14.0},
+                "gpus": [
+                    {"name": "Dedicated GPU", "memory_gb": 4.0, "kind": "dedicated"},
+                ],
+            },
+        )
+
+        self.assertEqual(fit, "tight")
+        self.assertEqual(runtime, "Hybrid")
+        self.assertIn("below the full-model estimate", reason)

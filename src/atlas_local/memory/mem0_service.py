@@ -49,6 +49,8 @@ def _load_mem0_runtime(data_dir: Path) -> tuple[Any, Any]:
             _mem0_main_module = imported_mem0_main
             _mem0_setup_module = imported_mem0_setup
 
+        _secure_mem0_ollama_factories()
+
         # A source process can construct sequential AppConfig instances (for
         # example in tests or automation). Rebind Mem0's cached path before it
         # reads or writes its identity config so each instance remains inside
@@ -59,10 +61,24 @@ def _load_mem0_runtime(data_dir: Path) -> tuple[Any, Any]:
         return Memory, mem0_storage
 
 
+def _secure_mem0_ollama_factories() -> None:
+    from mem0.utils.factory import EmbedderFactory, LlmFactory
+
+    _, ollama_config_class = LlmFactory.provider_to_class["ollama"]
+    LlmFactory.provider_to_class["ollama"] = (
+        "atlas_local.memory.local_ollama.AtlasOllamaLLM",
+        ollama_config_class,
+    )
+    EmbedderFactory.provider_to_class["ollama"] = (
+        "atlas_local.memory.local_ollama.AtlasOllamaEmbedding"
+    )
+
+
 class Mem0Service:
     def __init__(self, config: AppConfig):
         self.config = config
         self._memory: Any | None = None
+        self._lifecycle_lock = threading.RLock()
         _, runtime_storage = _load_mem0_runtime(config.data_dir)
         sqlite_module = build_encrypted_sqlite_module(data_dir=config.data_dir)
         runtime_storage.sqlite3 = sqlite_module
@@ -71,9 +87,14 @@ class Mem0Service:
         _reconcile_legacy_qdrant_collections(config)
 
     def search(self, query: str, *, user_id: str, limit: int) -> list[StoredMemory]:
-        response = self._require_memory().search(
+        memory = self._require_memory()
+        filters = {"user_id": user_id}
+        existing = memory.get_all(filters=filters, top_k=1)
+        if not existing.get("results", []):
+            return []
+        response = memory.search(
             query,
-            filters={"user_id": user_id},
+            filters=filters,
             top_k=limit,
             rerank=False,
         )
@@ -124,79 +145,83 @@ class Mem0Service:
         self._require_memory().delete_all(user_id=user_id)
 
     def reset(self) -> None:
-        self.close()
-        _remove_memory_path(self.config.qdrant_path)
-        _remove_memory_path(self.config.mem0_history_db)
-        self.config.qdrant_path.mkdir(parents=True, exist_ok=True)
-        self.config.mem0_history_db.parent.mkdir(parents=True, exist_ok=True)
+        with self._lifecycle_lock:
+            self.close()
+            _remove_memory_path(self.config.qdrant_path)
+            _remove_memory_path(self.config.mem0_history_db)
+            self.config.qdrant_path.mkdir(parents=True, exist_ok=True)
+            self.config.mem0_history_db.parent.mkdir(parents=True, exist_ok=True)
 
     def close(self) -> None:
-        memory = self._memory
-        if memory is None:
-            return
-        try:
+        with self._lifecycle_lock:
+            memory = self._memory
+            if memory is None:
+                return
             try:
-                memory.close()
+                try:
+                    memory.close()
+                finally:
+                    vector_store = getattr(memory, "vector_store", None)
+                    client = getattr(vector_store, "client", None)
+                    close = getattr(client, "close", None)
+                    if callable(close):
+                        close()
             finally:
-                vector_store = getattr(memory, "vector_store", None)
-                client = getattr(vector_store, "client", None)
-                close = getattr(client, "close", None)
-                if callable(close):
-                    close()
-        finally:
-            self._memory = None
+                self._memory = None
 
     def _require_memory(self) -> Any:
-        if self._memory is not None:
-            return self._memory
-        memory_runtime, _ = _load_mem0_runtime(self.config.data_dir)
-        try:
-            self._memory = memory_runtime.from_config(
-                {
-                    "vector_store": {
-                        "provider": "qdrant",
-                        "config": {
-                            "collection_name": self.config.mem0_collection,
-                            "path": str(self.config.qdrant_path),
-                            "embedding_model_dims": self.config.embed_dim,
-                            "on_disk": True,
+        with self._lifecycle_lock:
+            if self._memory is not None:
+                return self._memory
+            memory_runtime, _ = _load_mem0_runtime(self.config.data_dir)
+            try:
+                memory = memory_runtime.from_config(
+                    {
+                        "vector_store": {
+                            "provider": "qdrant",
+                            "config": {
+                                "collection_name": self.config.mem0_collection,
+                                "path": str(self.config.qdrant_path),
+                                "embedding_model_dims": self.config.embed_dim,
+                                "on_disk": True,
+                            },
                         },
-                    },
-                    "llm": {
-                        "provider": "ollama",
-                        "config": {
-                            # Mem0 still constructs an LLM client even though Atlas uses
-                            # local extraction and disables reranking. Keep chat model
-                            # selection outside memory setup.
-                            "model": self.config.embed_model,
-                            "temperature": 0.0,
-                            "max_tokens": 600,
-                            "ollama_base_url": self.config.ollama_url,
+                        "llm": {
+                            "provider": "ollama",
+                            "config": {
+                                # Mem0 still constructs an LLM client even though Atlas uses
+                                # local extraction and disables reranking. Keep chat model
+                                # selection outside memory setup.
+                                "model": self.config.embed_model,
+                                "temperature": 0.0,
+                                "max_tokens": 600,
+                                "ollama_base_url": self.config.ollama_url,
+                            },
                         },
-                    },
-                    "embedder": {
-                        "provider": "ollama",
-                        "config": {
-                            "model": self.config.embed_model,
-                            "ollama_base_url": self.config.ollama_url,
+                        "embedder": {
+                            "provider": "ollama",
+                            "config": {
+                                "model": self.config.embed_model,
+                                "ollama_base_url": self.config.ollama_url,
+                            },
                         },
-                    },
-                    "history_db_path": str(self.config.mem0_history_db),
-                }
-            )
-        except RuntimeError as exc:
-            if "already accessed by another instance" in str(exc):
+                        "history_db_path": str(self.config.mem0_history_db),
+                    }
+                )
+            except RuntimeError as exc:
+                if "already accessed by another instance" in str(exc):
+                    raise RuntimeError(
+                        "Local Qdrant storage is locked by another Atlas process. "
+                        "Run one CLI process at a time when using local-path Qdrant, "
+                        "or switch to a remote Qdrant server for concurrent access."
+                    ) from exc
+                raise RuntimeError("Atlas memory service is unavailable.") from exc
+            except Exception as exc:
                 raise RuntimeError(
-                    "Local Qdrant storage is locked by another Atlas process. "
-                    "Run one CLI process at a time when using local-path Qdrant, "
-                    "or switch to a remote Qdrant server for concurrent access."
+                    "Atlas memory service is unavailable. Make sure Ollama is running and the configured models are available."
                 ) from exc
-            raise RuntimeError("Atlas memory service is unavailable.") from exc
-        except Exception as exc:
-            raise RuntimeError(
-                "Atlas memory service is unavailable. Make sure Ollama is running and the configured models are available."
-            ) from exc
-        return self._memory
+            self._memory = memory
+            return memory
 
 
 def _remove_memory_path(path: Path) -> None:

@@ -1,7 +1,7 @@
 # Atlas Repo Note
 
 - Repo: `olliedoganay/AtlasChat`
-- Current version: `1.2.0`
+- Current version: `1.3.0`
 - Stack: Tauri 2 + React/Vite frontend, Rust desktop shell, Python FastAPI backend, local model providers, Docker-backed code runner.
 - Runtime shape: local-first desktop app; Tauri launches a loopback backend protected by a per-launch instance token.
 
@@ -115,15 +115,18 @@ Runner behavior:
 - Docker image names are fully qualified to avoid short-name resolution ambiguity.
 - `ATLAS_RUNNER_NETWORK=none` is the default and must never silently become outbound `bridge` networking. Dependency-aware runs warn when explicit outbound access is absent.
 - `ATLAS_RUNNER_NETWORK=bridge` is the only mode that grants outbound access; use it deliberately for package resolution or code that needs the network.
-- GUI and web previews under `none` use the Atlas-owned internal preview network so loopback port publishing works without outbound routing.
+- GUI and web-preview containers under `none` use the Atlas-owned internal network so loopback port publishing works without outbound routing. Atlas embeds the GUI/noVNC preview; it does not load server-generated web pages into the host WebView unless `bridge` was explicitly selected, because browser-side requests sit outside Docker's network boundary.
+- Python GUI runs use the versioned runtime defined in `src/atlas_local/runner_images/python_gui`. Trusted preparation may fetch only its pinned base image, fixed apt list, and hash-locked Python allowlist; it never receives submitted code. Preparation is observable and deduplicated in the backend.
+- The prepared GUI runtime currently allowlists `pygame==2.6.1` and `numpy==2.5.2` (required by Pygame's optional array/audio APIs). Reject undeclared third-party GUI dependencies before execution rather than enabling runtime apt/pip or outbound access.
+- Execute GUI snippets in a separate disposable container as UID 65534 with a read-only root filesystem and source mount, all capabilities dropped, `no-new-privileges`, and the internal preview network only. Keep runtime image labels/version/definition hash checks aligned when changing its assets.
 - Docker runs have concurrency, history, subscriber-queue, output, timeout, memory, CPU, PID, and file-size bounds. Compatible runs also use a read-only root filesystem and unprivileged user.
 - Containers drop all capabilities by default, enable `no-new-privileges`, use ownership labels, and are cleaned up on stop and backend shutdown. Keep added capabilities narrowly limited to workloads that install system packages.
 - HTML runs in the frontend sandbox and does not need Docker.
 - Python has extra support for:
   - import-based pip detection and common import/package aliases,
   - model-provided hints such as `pip install ...` and `Requirements: ...`,
-  - one safe retry-repair pass for missing-module errors,
-  - GUI/terminal apps through noVNC/xterm where appropriate,
+  - one safe retry-repair pass for missing-module errors in non-GUI runs,
+  - offline GUI/terminal apps through the prepared noVNC/xterm runtime where appropriate,
   - common web previews for Flask/FastAPI/Streamlit/Gradio/etc.,
   - common native apt packages for GUI/media/database libraries.
 
@@ -131,7 +134,7 @@ When changing language specs, run focused `tests.test_code_runner` coverage and 
 
 ## Releases
 
-- Current release tag: `v1.2.0`
+- Current release tag: `v1.3.0`
 - `scripts/bump_atlas_version.py` updates this file and `README.md` together with the release manifests.
 - `scripts/check_atlas_version.py` validates this file and `README.md` together with the release manifests.
 - The consolidated `release` workflow verifies once, then publishes Windows MSI, Linux `.deb`/`.rpm`/AppImage, and unsigned macOS x64/arm64 DMG artifacts only after every build succeeds.

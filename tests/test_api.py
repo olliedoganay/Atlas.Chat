@@ -1,12 +1,15 @@
+import copy
 import os
 import queue
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from atlas_local.api import create_api_app
+from atlas_local.api import _validate_attachment_budget, create_api_app
 
 
 class FakeService:
@@ -283,8 +286,24 @@ class FakeService:
     def cancel_run(self, run_id: str):
         return {"status": "cancelling", "run_id": run_id}
 
-    def get_thread_history(self, *, user_id=None, thread_id: str):
-        return [{"role": "user", "content": f"{user_id or 'research_user'}:{thread_id}", "attachments": []}]
+    def get_thread_history(self, *, user_id: str, thread_id: str):
+        return [{"role": "user", "content": f"{user_id}:{thread_id}", "attachments": []}]
+
+    def get_thread_context_usage(self, *, user_id: str, thread_id: str):
+        return {
+            "thread_id": thread_id,
+            "user_id": user_id,
+            "representation_tokens": 100,
+        }
+
+    def list_thread_runs(self, *, user_id: str, thread_id: str):
+        return [
+            {
+                "run_id": "run-1",
+                "user_id": user_id,
+                "thread_id": thread_id,
+            }
+        ]
 
     def search_threads(self, *, user_id: str, query: str, current_thread_id: str | None = None, limit: int = 8):
         return {
@@ -396,6 +415,33 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(users.json()[0]["user_id"], "research_user")
         self.assertEqual(memories.json()[0]["memory_id"], "mem-1")
 
+    def test_chunked_request_body_is_bounded_without_content_length(self) -> None:
+        with patch("atlas_local.api.MAX_HTTP_REQUEST_BYTES", 16):
+            client = TestClient(create_api_app(FakeService()))
+
+        response = client.post(
+            "/users",
+            content=iter([b'{"user_id":"', b"a" * 32, b'"}']),
+            headers={"content-type": "application/json"},
+        )
+
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(response.json()["detail"], "Atlas request body is too large.")
+
+    def test_attachment_budget_accounts_for_base64_padding(self) -> None:
+        with (
+            patch("atlas_local.api.MAX_ATTACHMENT_BYTES", 2),
+            patch("atlas_local.api.MAX_TOTAL_ATTACHMENT_BYTES", 2),
+        ):
+            _validate_attachment_budget(
+                [{"name": "two-bytes.bin", "data_url": "data:application/octet-stream;base64,YWI="}]
+            )
+
+            with self.assertRaisesRegex(HTTPException, "10 MiB limit"):
+                _validate_attachment_budget(
+                    [{"name": "three-bytes.bin", "data_url": "data:application/octet-stream;base64,YWJj"}]
+                )
+
     def test_ollama_context_window_update(self) -> None:
         response = self.client.patch(
             "/models/context-window",
@@ -416,6 +462,7 @@ class ApiTests(unittest.TestCase):
                 "api_key": "local-secret",
             },
         )
+        cleared = self.client.delete("/settings/provider/api-key")
         started = self.client.post("/models/pulls", json={"model": "test-model"})
         listed = self.client.get("/models/pulls")
         cancelled = self.client.delete("/models/pulls/pull-1")
@@ -424,6 +471,8 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(updated.status_code, 200)
         self.assertEqual(updated.json()["provider"], "lmstudio")
         self.assertNotIn("local-secret", updated.text)
+        self.assertEqual(cleared.status_code, 200)
+        self.assertTrue(cleared.json()["restart_required"])
         self.assertEqual(started.json()["progress"], 0.5)
         self.assertEqual(listed.json()[0]["pull_id"], "pull-1")
         self.assertEqual(cancelled.json()["status"], "cancelled")
@@ -438,7 +487,54 @@ class ApiTests(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 400)
-        self.assertIn("without credentials", response.json()["detail"])
+        self.assertIn("credentials", response.json()["detail"])
+
+    def test_provider_settings_accept_loopback_urls_and_canonicalize_localhost(
+        self,
+    ) -> None:
+        localhost = self.client.put(
+            "/settings/provider",
+            json={
+                "provider": "openai-compatible",
+                "base_url": "http://localhost:8000/v1/",
+            },
+        )
+        ipv6 = self.client.put(
+            "/settings/provider",
+            json={
+                "provider": "openai-compatible",
+                "base_url": "http://[::1]:8000/api/v1",
+            },
+        )
+
+        self.assertEqual(localhost.status_code, 200)
+        self.assertEqual(
+            localhost.json()["base_url"],
+            "http://127.0.0.1:8000/v1",
+        )
+        self.assertEqual(ipv6.status_code, 200)
+        self.assertEqual(
+            ipv6.json()["base_url"],
+            "http://[::1]:8000/api/v1",
+        )
+
+    def test_provider_settings_reject_non_loopback_urls(self) -> None:
+        for base_url in (
+            "https://example.com/v1",
+            "http://192.168.1.8:8000/v1",
+            "http://169.254.169.254/latest/meta-data",
+        ):
+            with self.subTest(base_url=base_url):
+                response = self.client.put(
+                    "/settings/provider",
+                    json={
+                        "provider": "openai-compatible",
+                        "base_url": base_url,
+                    },
+                )
+
+                self.assertEqual(response.status_code, 400)
+                self.assertIn("loopback", response.json()["detail"])
 
     def test_ollama_model_unload(self) -> None:
         response = self.client.post("/models/unload", json={"model": "test-model"})
@@ -456,6 +552,23 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.json()[0]["thread_id"], "main")
         self.assertEqual(response.json()[0]["title"], "Main chat")
         self.assertEqual(details.json()["answer"], "hello")
+
+    def test_thread_detail_reads_require_explicit_profile_owner(self) -> None:
+        endpoints = (
+            "/threads/main/history",
+            "/threads/main/context",
+            "/threads/main/runs",
+        )
+
+        for endpoint in endpoints:
+            with self.subTest(endpoint=endpoint):
+                missing_owner = self.client.get(endpoint)
+                owned = self.client.get(
+                    endpoint,
+                    params={"user_id": "research_user"},
+                )
+                self.assertEqual(missing_owner.status_code, 422)
+                self.assertEqual(owned.status_code, 200)
 
     def test_chat_search(self) -> None:
         response = self.client.get(
@@ -552,10 +665,86 @@ class ApiTests(unittest.TestCase):
             "/runner/exec",
             json={"language": "python", "code": "x" * 1_000_001},
         )
+        windows_traversal = self.client.post("/runs/..%5Coutside/cancel")
+        body_traversal = self.client.post(
+            "/chat",
+            json={
+                "prompt": "hello",
+                "user_id": r"..\outside",
+                "thread_id": "main",
+            },
+        )
 
         self.assertEqual(oversized_prompt.status_code, 422)
         self.assertEqual(invalid_user.status_code, 422)
         self.assertEqual(oversized_code.status_code, 422)
+        self.assertEqual(windows_traversal.status_code, 422)
+        self.assertEqual(body_traversal.status_code, 422)
+
+    def test_python_gui_runtime_status_and_preparation_are_observable(self) -> None:
+        runtime = {
+            "name": "python-gui",
+            "version": "1.0.1",
+            "state": "preparing",
+            "progress": 0.42,
+            "message": "STEP 4/10",
+            "log_tail": ["STEP 4/10"],
+            "submitted_code_used_during_preparation": False,
+        }
+        with (
+            patch("atlas_local.api.python_gui_runtime_status", return_value=runtime),
+            patch(
+                "atlas_local.api.prepare_runner_runtime",
+                return_value={"required": True, "started": True, "runtime": runtime},
+            ) as prepare,
+        ):
+            status = self.client.get("/runner/runtime/python-gui")
+            preparation = self.client.post(
+                "/runner/runtime/prepare",
+                json={"language": "python", "code": "import pygame"},
+            )
+
+        self.assertEqual(status.status_code, 200)
+        self.assertEqual(status.json()["state"], "preparing")
+        self.assertFalse(status.json()["submitted_code_used_during_preparation"])
+        self.assertEqual(preparation.status_code, 200)
+        self.assertTrue(preparation.json()["required"])
+        self.assertTrue(preparation.json()["started"])
+        prepare.assert_called_once_with("python", "import pygame")
+
+    def test_runner_status_exposes_only_aggregate_activity(self) -> None:
+        with (
+            patch(
+                "atlas_local.api.docker_status",
+                return_value={"available": True, "server_version": "test"},
+            ),
+            patch(
+                "atlas_local.api.runner_activity_status",
+                return_value={"busy": True, "active_runs": 2, "runtime_preparing": True},
+            ),
+        ):
+            response = self.client.get("/runner/status")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["busy"])
+        self.assertEqual(response.json()["active_runs"], 2)
+        self.assertTrue(response.json()["runtime_preparing"])
+        self.assertNotIn("run_id", response.json())
+
+    def test_python_gui_runtime_preparation_returns_actionable_dependency_error(self) -> None:
+        with patch(
+            "atlas_local.api.prepare_runner_runtime",
+            side_effect=RuntimeError(
+                "The secure offline Python GUI runtime does not include customtkinter."
+            ),
+        ):
+            response = self.client.post(
+                "/runner/runtime/prepare",
+                json={"language": "python", "code": "import customtkinter"},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("does not include customtkinter", response.json()["detail"])
 
     def test_cancel_run(self) -> None:
         response = self.client.post("/runs/run-1/cancel")
@@ -630,6 +819,282 @@ class ApiTests(unittest.TestCase):
         self.assertLess(payload.index("event: run_started"), payload.index("event: token"))
         self.assertLess(payload.index("event: token"), payload.index("event: run_completed"))
 
+    def test_stream_replays_mixed_compacted_reasoning_and_answer_once(self) -> None:
+        service = FakeService()
+        service.artifacts["run-1"] = {
+            "run_id": "run-1",
+            "status": "completed",
+            "started_at": "2026-04-08T00:00:00Z",
+            "completed_at": "2026-04-08T00:00:02Z",
+            "events": [
+                {
+                    "type": "stream_snapshot",
+                    "timestamp": "2026-04-08T00:00:01Z",
+                    "payload": {
+                        "thinking_text": "private plan",
+                        "answer_text": "public answer",
+                    },
+                    "sequence": 1,
+                    "sequence_end": 4,
+                },
+                {
+                    "type": "run_completed",
+                    "timestamp": "2026-04-08T00:00:02Z",
+                    "payload": {"answer": "public answer"},
+                    "sequence": 5,
+                },
+            ],
+            "reasoning": "private plan",
+            "answer": "public answer",
+            "error": None,
+        }
+        client = TestClient(create_api_app(service))
+
+        with client.stream("GET", "/chat/stream/run-1") as response:
+            self.assertEqual(response.status_code, 200)
+            payload = "".join(response.iter_text())
+
+        self.assertEqual(payload.count("event: thinking_token"), 1)
+        self.assertEqual(payload.count("event: token"), 1)
+        self.assertEqual(payload.count("event: run_completed"), 1)
+        self.assertIn('"text": "private plan"', payload)
+        self.assertIn('"text": "public answer"', payload)
+        self.assertIn('"sequence": 1', payload)
+        self.assertIn('"sequence": 2', payload)
+        self.assertIn('"sequence_end": 4', payload)
+        self.assertLess(
+            payload.index("event: thinking_token"),
+            payload.index("event: token"),
+        )
+        self.assertLess(
+            payload.index("event: token"),
+            payload.index("event: run_completed"),
+        )
+
+    def test_stream_synthesizes_missing_terminal_event_for_legacy_artifact(
+        self,
+    ) -> None:
+        for status, event_type, field, value in (
+            ("completed", "run_completed", "answer", "legacy answer"),
+            ("failed", "run_failed", "error", "legacy failure"),
+        ):
+            with self.subTest(status=status):
+                service = FakeService()
+                service.artifacts["run-1"] = {
+                    "run_id": "run-1",
+                    "status": status,
+                    "started_at": "2026-04-08T00:00:00Z",
+                    "completed_at": "2026-04-08T00:00:01Z",
+                    "events": [
+                        {
+                            "type": "run_started",
+                            "timestamp": "2026-04-08T00:00:00Z",
+                            "payload": {},
+                            "sequence": 1,
+                        }
+                    ],
+                    "answer": value if field == "answer" else "",
+                    "error": value if field == "error" else None,
+                }
+                client = TestClient(create_api_app(service))
+
+                with client.stream("GET", "/chat/stream/run-1") as response:
+                    payload = "".join(response.iter_text())
+
+                self.assertEqual(response.status_code, 200)
+                self.assertIn(f"event: {event_type}", payload)
+                self.assertIn(value, payload)
+                self.assertIn('"sequence": 2', payload)
+
+    def test_stream_reconciles_events_created_immediately_before_subscription(self) -> None:
+        class RaceService(FakeService):
+            def get_run(self, run_id: str):
+                return copy.deepcopy(super().get_run(run_id))
+
+            def subscribe(self, run_id: str):
+                artifact = self.artifacts[run_id]
+                artifact["events"] = [
+                    artifact["events"][0],
+                    {
+                        "type": "token",
+                        "timestamp": "2026-04-08T00:00:01Z",
+                        "payload": {"text": "raced"},
+                    },
+                    {
+                        "type": "run_completed",
+                        "timestamp": "2026-04-08T00:00:02Z",
+                        "payload": {"answer": "raced"},
+                    },
+                ]
+                artifact["status"] = "completed"
+                return super().subscribe(run_id)
+
+        service = RaceService()
+        service.artifacts["run-1"]["events"] = [
+            service.artifacts["run-1"]["events"][0]
+        ]
+        service.artifacts["run-1"]["status"] = "running"
+        client = TestClient(create_api_app(service))
+
+        started_at = time.monotonic()
+        with client.stream("GET", "/chat/stream/run-1") as response:
+            self.assertEqual(response.status_code, 200)
+            payload = "".join(response.iter_text())
+        elapsed = time.monotonic() - started_at
+
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(payload.count("event: token"), 1)
+        self.assertEqual(payload.count("event: run_completed"), 1)
+        self.assertEqual(service.subscribers["run-1"], [])
+
+    def test_stream_reconciles_dropped_queue_events_before_emitting_later_tokens(
+        self,
+    ) -> None:
+        class GapService(FakeService):
+            def __init__(self):
+                super().__init__()
+                self.get_run_calls = 0
+                self.artifacts["run-1"]["events"] = [
+                    {
+                        "type": "run_started",
+                        "timestamp": "2026-04-08T00:00:00Z",
+                        "payload": {},
+                        "sequence": 1,
+                    }
+                ]
+                self.artifacts["run-1"]["status"] = "running"
+
+            def get_run(self, run_id: str):
+                self.get_run_calls += 1
+                if self.get_run_calls == 2:
+                    snapshot = copy.deepcopy(self.artifacts[run_id])
+                    later_events = [
+                        {
+                            "type": "token",
+                            "timestamp": "2026-04-08T00:00:01Z",
+                            "payload": {"text": "A"},
+                            "sequence": 2,
+                        },
+                        {
+                            "type": "token",
+                            "timestamp": "2026-04-08T00:00:02Z",
+                            "payload": {"text": "B"},
+                            "sequence": 3,
+                        },
+                        {
+                            "type": "token",
+                            "timestamp": "2026-04-08T00:00:03Z",
+                            "payload": {"text": "C"},
+                            "sequence": 4,
+                        },
+                        {
+                            "type": "run_completed",
+                            "timestamp": "2026-04-08T00:00:04Z",
+                            "payload": {"answer": "ABC"},
+                            "sequence": 5,
+                        },
+                    ]
+                    self.artifacts[run_id]["events"].extend(later_events)
+                    self.artifacts[run_id]["status"] = "completed"
+                    subscriber = self.subscribers[run_id][0]
+                    for event in later_events:
+                        if subscriber.full():
+                            subscriber.get_nowait()
+                        subscriber.put_nowait(event)
+                    return snapshot
+                return copy.deepcopy(super().get_run(run_id))
+
+            def subscribe(self, run_id: str):
+                subscriber: queue.Queue[dict[str, object]] = queue.Queue(maxsize=2)
+                self.subscribers.setdefault(run_id, []).append(subscriber)
+                return subscriber
+
+        service = GapService()
+        client = TestClient(create_api_app(service))
+
+        with client.stream("GET", "/chat/stream/run-1") as response:
+            self.assertEqual(response.status_code, 200)
+            payload = "".join(response.iter_text())
+
+        self.assertEqual(payload.count("event: token"), 3)
+        self.assertEqual(payload.count("event: run_completed"), 1)
+        self.assertLess(payload.index('"text": "A"'), payload.index('"text": "B"'))
+        self.assertLess(payload.index('"text": "B"'), payload.index('"text": "C"'))
+        self.assertLess(payload.index('"text": "C"'), payload.index("event: run_completed"))
+
+    def test_stream_reconciles_a_partially_emitted_compacted_range(self) -> None:
+        class CompactionRaceService(FakeService):
+            def __init__(self):
+                super().__init__()
+                self.get_run_calls = 0
+                self.artifacts["run-1"] = {
+                    "run_id": "run-1",
+                    "status": "running",
+                    "events": [
+                        {
+                            "type": "token",
+                            "timestamp": "2026-04-08T00:00:01Z",
+                            "payload": {"text": "A"},
+                            "sequence": 1,
+                        }
+                    ],
+                    "answer": "A",
+                    "reasoning": "",
+                    "error": None,
+                }
+
+            def get_run(self, run_id: str):
+                self.get_run_calls += 1
+                if self.get_run_calls <= 2:
+                    return copy.deepcopy(self.artifacts[run_id])
+                return {
+                    **copy.deepcopy(self.artifacts[run_id]),
+                    "status": "completed",
+                    "events": [
+                        {
+                            "type": "token",
+                            "timestamp": "2026-04-08T00:00:01Z",
+                            "payload": {"text": "ABC"},
+                            "sequence": 1,
+                            "sequence_end": 3,
+                        },
+                        {
+                            "type": "run_completed",
+                            "timestamp": "2026-04-08T00:00:04Z",
+                            "payload": {"answer": "ABC"},
+                            "sequence": 4,
+                        },
+                    ],
+                    "answer": "ABC",
+                }
+
+            def subscribe(self, run_id: str):
+                subscriber = super().subscribe(run_id)
+                subscriber.put_nowait(
+                    {
+                        "type": "run_completed",
+                        "timestamp": "2026-04-08T00:00:04Z",
+                        "payload": {"answer": "ABC"},
+                        "sequence": 4,
+                    }
+                )
+                return subscriber
+
+        service = CompactionRaceService()
+        client = TestClient(create_api_app(service))
+
+        with client.stream("GET", "/chat/stream/run-1") as response:
+            self.assertEqual(response.status_code, 200)
+            payload = "".join(response.iter_text())
+
+        self.assertEqual(payload.count("event: token"), 2)
+        self.assertIn('"text": "A"', payload)
+        self.assertIn('"text": "BC"', payload)
+        self.assertNotIn('"text": "ABC"', payload)
+        self.assertEqual(payload.count("event: run_completed"), 1)
+        self.assertLess(payload.index('"text": "A"'), payload.index('"text": "BC"'))
+        self.assertLess(payload.index('"text": "BC"'), payload.index("event: run_completed"))
+
     def test_reset_endpoints(self) -> None:
         reset_user = self.client.delete("/users/research_user", params={"confirmation_user_id": "research_user"})
         reset_all = self.client.post("/admin/reset/all", json={"confirmation": "RESET ATLAS"})
@@ -690,6 +1155,47 @@ class ApiTests(unittest.TestCase):
         )
         self.assertEqual(service.close_calls, 1)
         self.assertEqual(server_shutdown_calls, ["shutdown"])
+
+    def test_prepare_shutdown_quiesces_owned_service_before_lifespan_close(self) -> None:
+        service = FakeService()
+        shutdown_begin_calls: list[str] = []
+        shutdown_begun = threading.Event()
+        server_shutdown_requested = threading.Event()
+
+        def begin_shutdown() -> None:
+            shutdown_begin_calls.append("begin")
+            shutdown_begun.set()
+
+        service.begin_shutdown = begin_shutdown  # type: ignore[attr-defined]
+
+        with (
+            patch.dict(os.environ, {"ATLAS_INSTANCE_TOKEN": "test-token"}, clear=False),
+            patch(
+                "atlas_local.api.AtlasBackendService.create",
+                return_value=service,
+            ),
+        ):
+            app = create_api_app(
+                request_server_shutdown=server_shutdown_requested.set,
+            )
+            with TestClient(app) as client:
+                scheduled = client.post(
+                    "/admin/prepare-shutdown",
+                    headers={"X-Atlas-Instance-Token": "test-token"},
+                )
+                self.assertTrue(shutdown_begun.wait(1.0))
+                self.assertTrue(server_shutdown_requested.wait(1.0))
+                self.assertEqual(service.close_calls, 0)
+                still_open = client.get(
+                    "/status",
+                    headers={"X-Atlas-Instance-Token": "test-token"},
+                )
+                self.assertEqual(still_open.status_code, 200)
+
+            self.assertEqual(service.close_calls, 1)
+
+        self.assertEqual(scheduled.status_code, 200)
+        self.assertEqual(shutdown_begin_calls, ["begin"])
 
     def test_requests_reject_untrusted_origins(self) -> None:
         with patch.dict(os.environ, {"ATLAS_INSTANCE_TOKEN": "test-token"}, clear=False):

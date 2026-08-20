@@ -47,6 +47,15 @@ import {
 import { useBackendPhase } from "../lib/backendPhase";
 import { buildChatMarkdownExport, chatExportFilename, downloadMarkdownFile } from "../lib/chatExport";
 import { buildContextMeter, type ContextMeter } from "../lib/contextMeter";
+import { describeRunProgress } from "../lib/runProgress";
+import {
+  buildRunnerRepairPrompt,
+  discardRunnerRepairRequest,
+  readRunnerRepairRequest,
+  RUNNER_REPAIR_BROADCAST_CHANNEL,
+  RUNNER_REPAIR_REQUEST_STORAGE_KEY,
+  type RunnerRepairRequest,
+} from "../lib/runner";
 import { PROFILE_SETTINGS_PATH } from "../lib/settingsSections";
 import { resolveStartupState } from "../lib/startupState";
 import { displayThreadTitle, editableThreadTitle, requestThreadTitle } from "../lib/threadTitles";
@@ -83,6 +92,7 @@ type StartPromptPayload = {
 };
 
 type WorkspaceComposerHandle = {
+  appendPrompt: (content: string) => void;
   quoteMessage: (content: string) => void;
   setPrompt: (content: string) => void;
 };
@@ -113,6 +123,7 @@ type PendingModelSwitch = {
   toModel: string;
   payload: StartPromptPayload;
   clearDraft: () => void;
+  draftScopeKey: string;
 };
 
 const STARTER_PROMPTS = [
@@ -139,6 +150,7 @@ export function WorkspacePage() {
   const scrollToLatestRetryFrameRef = useRef<number | null>(null);
   const scrollToLatestTimeoutRef = useRef<number | null>(null);
   const composerRef = useRef<WorkspaceComposerHandle | null>(null);
+  const modelSwitchCheckSequenceRef = useRef(0);
 
   const currentUserId = useAtlasStore((state) => state.currentUserId);
   const currentThreadId = useAtlasStore((state) => state.currentThreadId);
@@ -169,6 +181,7 @@ export function WorkspacePage() {
   const setReasoningMode = useAtlasStore((state) => state.setReasoningMode);
   const beginRun = useAtlasStore((state) => state.beginRun);
   const setStage = useAtlasStore((state) => state.setStage);
+  const restoreRunStage = useAtlasStore((state) => state.restoreRunStage);
   const failRun = useAtlasStore((state) => state.failRun);
   const clearCompactionNotice = useAtlasStore((state) => state.clearCompactionNotice);
   const searchJumpTarget = useAtlasStore((state) => state.searchJumpTarget);
@@ -182,9 +195,14 @@ export function WorkspacePage() {
   const [copiedMessageKey, setCopiedMessageKey] = useState<string | null>(null);
   const [pendingModelSwitch, setPendingModelSwitch] = useState<PendingModelSwitch | null>(null);
   const [modelSwitchCheckPending, setModelSwitchCheckPending] = useState(false);
+  const [workspaceActionError, setWorkspaceActionError] = useState("");
+  const composerDraftScopeKey = workspaceComposerDraftKey(currentUserId, currentThreadId);
+  const composerDraftScopeKeyRef = useRef(composerDraftScopeKey);
+  composerDraftScopeKeyRef.current = composerDraftScopeKey;
 
   const {
     data: status,
+    isError: statusError,
     isPending: statusPending,
     isFetching: statusFetching,
   } = useQuery({
@@ -194,6 +212,7 @@ export function WorkspacePage() {
   });
   const backendPhase = useBackendPhase({
     hasStatus: Boolean(status),
+    isError: statusError,
     isPending: statusPending,
     isFetching: statusFetching,
     bootStartedAt: backendStartupStartedAt,
@@ -205,7 +224,7 @@ export function WorkspacePage() {
     enabled: backendOnline,
     staleTime: 10000,
   });
-  const { data: users = [] } = useQuery({
+  const { data: users = [], isFetched: usersFetched } = useQuery({
     queryKey: ["users"],
     queryFn: getUsers,
     enabled: backendOnline,
@@ -225,6 +244,62 @@ export function WorkspacePage() {
   }, [users]);
   const currentUserProfile = visibleUsers.find((user) => user.user_id === currentUserId) ?? null;
   const currentUserLocked = Boolean(currentUserProfile?.locked);
+
+  useEffect(() => {
+    const deliverRepairDraft = (raw: string | null) => {
+      if (!raw) {
+        return;
+      }
+      const request = readRunnerRepairRequest(raw);
+      if (!request) {
+        discardRunnerRepairRequest();
+        return;
+      }
+      if (!canAcceptRunnerRepairRequest(request, {
+        currentThreadId,
+        currentUserId,
+        currentUserAvailable: Boolean(currentUserProfile),
+        currentUserLocked,
+        usersFetched,
+      })) {
+        return;
+      }
+      composerRef.current?.appendPrompt(buildRunnerRepairPrompt(request));
+      discardRunnerRepairRequest(request.requestId);
+      setWorkspaceActionError("");
+    };
+
+    try {
+      deliverRepairDraft(window.localStorage.getItem(RUNNER_REPAIR_REQUEST_STORAGE_KEY));
+    } catch {
+      // Local storage can be unavailable in hardened browser contexts.
+    }
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === RUNNER_REPAIR_REQUEST_STORAGE_KEY) {
+        deliverRepairDraft(event.newValue);
+      }
+    };
+    window.addEventListener("storage", handleStorage);
+    let repairChannel: BroadcastChannel | null = null;
+    if (typeof BroadcastChannel === "function") {
+      try {
+        repairChannel = new BroadcastChannel(RUNNER_REPAIR_BROADCAST_CHANNEL);
+        repairChannel.addEventListener("message", () => {
+          try {
+            deliverRepairDraft(window.localStorage.getItem(RUNNER_REPAIR_REQUEST_STORAGE_KEY));
+          } catch {
+            // The storage listener remains available when direct reads are blocked.
+          }
+        });
+      } catch {
+        repairChannel = null;
+      }
+    }
+    return () => {
+      window.removeEventListener("storage", handleStorage);
+      repairChannel?.close();
+    };
+  }, [currentThreadId, currentUserId, currentUserLocked, currentUserProfile, usersFetched]);
   const { data: threads = [] } = useQuery({
     queryKey: ["threads", currentUserId],
     queryFn: () => getThreads(currentUserId),
@@ -475,28 +550,42 @@ export function WorkspacePage() {
     return liveThinkingText ? [...persistedEntries, liveEntry] : persistedEntries;
   }, [currentRunId, currentThreadHasActiveChatRun, liveThinkingText, runDetails?.chat_model, runDetails?.diagnostics?.total_duration_ms, runDetails?.started_at, selectedModel, threadRuns]);
   const latestThinkingEntry = thinkingEntries[thinkingEntries.length - 1];
-  const canToggleThinkingPanel = Boolean(currentThreadHasActiveChatRun || thinkingEntries.length);
+  const currentRunProgress = describeRunProgress({
+    stage: currentStage,
+    mode: currentRunMode,
+    model: selectedModel || runDetails?.chat_model || "",
+    hasThinking: Boolean(liveThinkingText),
+    hasAnswer: Boolean(liveAnswer),
+  });
+  const inspectorRun = runDetails ?? (latestThinkingEntry ? ({
+    run_id: latestThinkingEntry.runId,
+    mode: "chat",
+    user_id: currentUserId,
+    thread_id: currentThreadId,
+    prompt: "",
+    status: latestThinkingEntry.status,
+    started_at: latestThinkingEntry.startedAt || "",
+    answer: "",
+    events: [],
+  } as RunSummary) : undefined);
+  const inspectorModel = currentThreadHasActiveChatRun
+    ? selectedModel || runDetails?.chat_model || latestThinkingEntry?.chatModel
+    : runDetails?.chat_model || latestThinkingEntry?.chatModel;
+  const inspectorDurationMs = runDetails?.diagnostics?.total_duration_ms ?? latestThinkingEntry?.durationMs;
+  const inspectorStartedAt = runDetails?.started_at || latestThinkingEntry?.startedAt;
+  const canToggleThinkingPanel = Boolean(
+    currentThreadHasActiveChatRun || thinkingEntries.length || runDetails?.mode === "chat",
+  );
   const thinkingPanelStatusLabel = currentThreadHasActiveChatRun
-    ? chatWaitingLabel(currentStage)
-    : formatRunStatusLabel(latestThinkingEntry ? ({
-        run_id: latestThinkingEntry.runId,
-        mode: "chat",
-        user_id: currentUserId,
-        thread_id: currentThreadId,
-        prompt: "",
-        status: latestThinkingEntry.status,
-        started_at: latestThinkingEntry.startedAt || "",
-        answer: "",
-        events: [],
-      } as RunSummary) : runDetails);
+    ? currentRunProgress.label
+    : formatRunStatusLabel(inspectorRun);
   const thinkingPanelStatusClass = currentThreadHasActiveChatRun
     ? "online"
-    : latestThinkingEntry?.status === "failed" || runDetails?.status === "failed"
+    : inspectorRun?.status === "failed"
       ? "offline"
-      : latestThinkingEntry?.status === "completed" || runDetails?.status === "completed"
+      : inspectorRun?.status === "completed"
         ? "subtle"
         : "muted";
-  const currentChatWaitingLabel = chatWaitingLabel(currentStage);
 
   useEffect(() => {
     setDraftTitle(currentThreadEditableTitle);
@@ -508,7 +597,11 @@ export function WorkspacePage() {
   }, [currentUserId, currentThreadId]);
 
   useEffect(() => {
+    modelSwitchCheckSequenceRef.current += 1;
+    setModelSwitchCheckPending(false);
+    setPendingModelSwitch(null);
     setIsThinkingPanelOpen(false);
+    setWorkspaceActionError("");
   }, [currentThreadId, currentUserId]);
 
   const clearScheduledScrollToLatest = useCallback(() => {
@@ -614,11 +707,21 @@ export function WorkspacePage() {
       }
       return cancelRun(currentRunId);
     },
-    onSuccess: () => {
+    onMutate: () => {
+      setWorkspaceActionError("");
+      if (!currentRunId) {
+        return null;
+      }
+      const context = { runId: currentRunId, previousStage: currentStage };
       setStage("stopping");
+      return context;
     },
-    onError: (error) => {
-      failRun(error instanceof Error ? error.message : "Atlas could not stop this run.", currentUserId, currentThreadId);
+    onError: (error, _variables, context) => {
+      if (context && restoreRunStage(context.runId, context.previousStage)) {
+        setWorkspaceActionError(
+          error instanceof Error ? error.message : "Atlas could not stop this run.",
+        );
+      }
     },
   });
 
@@ -629,6 +732,9 @@ export function WorkspacePage() {
       }
       return branchThread(currentThreadId, currentUserId, payload.afterMessageCount);
     },
+    onMutate: () => {
+      setWorkspaceActionError("");
+    },
     onSuccess: async (thread) => {
       setCurrentThreadId(thread.thread_id);
       setCurrentThreadTitle(editableThreadTitle(thread.title, thread.thread_id));
@@ -638,6 +744,11 @@ export function WorkspacePage() {
         queryClient.invalidateQueries({ queryKey: ["threads", currentUserId] }),
         queryClient.invalidateQueries({ queryKey: ["thread-history", currentUserId] }),
       ]);
+    },
+    onError: (error) => {
+      setWorkspaceActionError(
+        error instanceof Error ? error.message : "Atlas could not branch this chat.",
+      );
     },
   });
 
@@ -679,21 +790,35 @@ export function WorkspacePage() {
   });
 
   const refreshModels = async () => {
-    await Promise.all([
-      queryClient.invalidateQueries({ queryKey: ["status"] }),
-      queryClient.invalidateQueries({ queryKey: ["models"] }),
-      queryClient.invalidateQueries({ queryKey: ["threads"] }),
-    ]);
+    setWorkspaceActionError("");
+    try {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["status"] }),
+        queryClient.invalidateQueries({ queryKey: ["models"] }),
+        queryClient.invalidateQueries({ queryKey: ["threads"] }),
+      ]);
+    } catch (error) {
+      setWorkspaceActionError(
+        error instanceof Error ? error.message : "Atlas could not refresh local models.",
+      );
+    }
   };
 
   const restartBackend = async () => {
+    setWorkspaceActionError("");
     markBackendBooting();
-    await restartManagedBackend();
-    await Promise.all([
-      queryClient.invalidateQueries({ queryKey: ["status"] }),
-      queryClient.invalidateQueries({ queryKey: ["models"] }),
-      queryClient.invalidateQueries({ queryKey: ["users"] }),
-    ]);
+    try {
+      await restartManagedBackend();
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["status"] }),
+        queryClient.invalidateQueries({ queryKey: ["models"] }),
+        queryClient.invalidateQueries({ queryKey: ["users"] }),
+      ]);
+    } catch (error) {
+      setWorkspaceActionError(
+        error instanceof Error ? error.message : "Atlas could not restart the local runtime.",
+      );
+    }
   };
 
   useEffect(() => {
@@ -721,23 +846,28 @@ export function WorkspacePage() {
     }
   }, [currentThread?.title, currentThreadId, currentThreadTitle, setCurrentThreadTitle]);
 
-  const transcript = useMemo(() => {
-    const items: ConversationMessage[] = visibleHistory.map((item: ThreadMessage, historyIndex) => ({
-      role: item.role,
-      content: item.content,
-      attachments: item.attachments,
-      historyIndex: typeof item.history_index === "number" ? item.history_index : historyIndex,
-      kind: item.kind,
-      runId: item.run_id,
-      timestamp: item.timestamp,
-      compactionReason: item.compaction_reason,
-      threadSummary: item.thread_summary,
-      compactedMessageCount: item.compacted_message_count,
-      newlyCompactedMessageCount: item.newly_compacted_message_count,
-      detectedContextWindow: item.detected_context_window,
-      historyRepresentationTokensBeforeCompaction: item.history_representation_tokens_before_compaction,
-      historyRepresentationTokensAfterCompaction: item.history_representation_tokens_after_compaction,
-    }));
+  const persistedTranscript = useMemo(
+    () =>
+      visibleHistory.map((item: ThreadMessage, historyIndex): ConversationMessage => ({
+        role: item.role,
+        content: item.content,
+        attachments: item.attachments,
+        historyIndex: typeof item.history_index === "number" ? item.history_index : historyIndex,
+        kind: item.kind,
+        runId: item.run_id,
+        timestamp: item.timestamp,
+        compactionReason: item.compaction_reason,
+        threadSummary: item.thread_summary,
+        compactedMessageCount: item.compacted_message_count,
+        newlyCompactedMessageCount: item.newly_compacted_message_count,
+        detectedContextWindow: item.detected_context_window,
+        historyRepresentationTokensBeforeCompaction: item.history_representation_tokens_before_compaction,
+        historyRepresentationTokensAfterCompaction: item.history_representation_tokens_after_compaction,
+      })),
+    [visibleHistory],
+  );
+  const liveTranscript = useMemo(() => {
+    const items: ConversationMessage[] = [];
     if (currentThreadHasActiveRun && (pendingPrompt || pendingAttachments.length)) {
       items.push({ role: "user", content: pendingPrompt, attachments: pendingAttachments, ephemeral: true, runId: currentRunId || undefined });
     }
@@ -748,8 +878,19 @@ export function WorkspacePage() {
       items.push({ role: "assistant", content: liveAnswer, ephemeral: true, runId: currentRunId || undefined });
     }
     return items;
-  }, [currentRunId, currentThreadCompactionNotice, currentThreadHasActiveRun, liveAnswer, pendingAttachments, pendingPrompt, visibleHistory]);
-  const transcriptPresentation = useMemo(() => buildConversationPresentation(transcript), [transcript]);
+  }, [currentRunId, currentThreadCompactionNotice, currentThreadHasActiveRun, liveAnswer, pendingAttachments, pendingPrompt]);
+  const transcript = useMemo(
+    () => [...persistedTranscript, ...liveTranscript],
+    [liveTranscript, persistedTranscript],
+  );
+  const persistedTranscriptPresentation = useMemo(
+    () => buildConversationPresentation(persistedTranscript),
+    [persistedTranscript],
+  );
+  const liveTranscriptPresentation = useMemo(
+    () => buildConversationPresentation(liveTranscript),
+    [liveTranscript],
+  );
   const isCompactingContext =
     startManualCompact.isPending || (isStreaming && (currentRunMode === "compact" || currentStage === "compaction"));
   const showOllamaWarning = startupState.key === "ollama-offline" && transcript.length > 0;
@@ -869,10 +1010,18 @@ export function WorkspacePage() {
 
   const commitTitle = useMutation({
     mutationFn: async (title: string) => renameThread(currentThreadId, currentUserId, title),
+    onMutate: () => {
+      setWorkspaceActionError("");
+    },
     onSuccess: async (thread) => {
       setCurrentThreadTitle(editableThreadTitle(thread.title, thread.thread_id));
       setIsEditingTitle(false);
       await queryClient.invalidateQueries({ queryKey: ["threads", currentUserId] });
+    },
+    onError: (error) => {
+      setWorkspaceActionError(
+        error instanceof Error ? error.message : "Atlas could not rename this chat.",
+      );
     },
   });
 
@@ -884,7 +1033,22 @@ export function WorkspacePage() {
       setIsEditingTitle(false);
       return;
     }
-    await commitTitle.mutateAsync(normalized || currentThreadDisplayTitle);
+    try {
+      await commitTitle.mutateAsync(normalized || currentThreadDisplayTitle);
+    } catch {
+      // The mutation renders its error next to the title.
+    }
+  };
+
+  const handleOpenProviderDownload = async () => {
+    setWorkspaceActionError("");
+    try {
+      await openExternalUrl("https://ollama.com/download");
+    } catch (error) {
+      setWorkspaceActionError(
+        error instanceof Error ? error.message : "Atlas could not open the provider download page.",
+      );
+    }
   };
 
   const toggleCompactionSummary = useCallback((key: string) => {
@@ -914,11 +1078,20 @@ export function WorkspacePage() {
     if (modelSwitchCheckPending || pendingModelSwitch) {
       return;
     }
+    const draftScopeKey = workspaceComposerDraftKey(currentUserId, currentThreadId);
+    const checkSequence = modelSwitchCheckSequenceRef.current + 1;
+    modelSwitchCheckSequenceRef.current = checkSequence;
     const modelForRun = (lockedThreadModel || selectedModel || "").trim();
     setModelSwitchCheckPending(true);
     void queryClient.fetchQuery({ queryKey: ["models"], queryFn: getModels, staleTime: 0 })
       .catch(() => models)
       .then((freshModels) => {
+        if (
+          modelSwitchCheckSequenceRef.current !== checkSequence ||
+          composerDraftScopeKeyRef.current !== draftScopeKey
+        ) {
+          return;
+        }
         const canUnloadModels = Boolean(freshModels?.supports_model_unload ?? supportsModelUnload);
         const fromModels = canUnloadModels
           ? modelsToStopBeforeSwitch(freshModels?.loaded_models ?? loadedModels, modelForRun)
@@ -929,16 +1102,25 @@ export function WorkspacePage() {
             toModel: modelForRun,
             payload,
             clearDraft,
+            draftScopeKey,
           });
           return;
         }
         startRunMutate(payload, { onSuccess: clearDraft });
       })
-      .finally(() => setModelSwitchCheckPending(false));
-  }, [loadedModels, lockedThreadModel, modelSwitchCheckPending, models, pendingModelSwitch, queryClient, selectedModel, startRunMutate, supportsModelUnload]);
+      .finally(() => {
+        if (modelSwitchCheckSequenceRef.current === checkSequence) {
+          setModelSwitchCheckPending(false);
+        }
+      });
+  }, [currentThreadId, currentUserId, loadedModels, lockedThreadModel, modelSwitchCheckPending, models, pendingModelSwitch, queryClient, selectedModel, startRunMutate, supportsModelUnload]);
 
   const confirmModelSwitch = useCallback(async () => {
     if (!pendingModelSwitch) {
+      return;
+    }
+    if (pendingModelSwitch.draftScopeKey !== composerDraftScopeKeyRef.current) {
+      setPendingModelSwitch(null);
       return;
     }
     try {
@@ -1003,6 +1185,7 @@ export function WorkspacePage() {
                       setIsEditingTitle(false);
                     }
                   }}
+                  maxLength={200}
                   placeholder="Chat title"
                   value={draftTitle}
                 />
@@ -1044,6 +1227,11 @@ export function WorkspacePage() {
             )}
           </div>
           <p className="workspace-title-summary">{headerSummary}</p>
+          {workspaceActionError ? (
+            <p className="error-inline" role="alert">
+              {workspaceActionError}
+            </p>
+          ) : null}
         </div>
 
         <div className="workspace-header-controls">
@@ -1067,14 +1255,14 @@ export function WorkspacePage() {
                 <span className="workspace-model-label">Trace</span>
                 <button
                   aria-expanded={isThinkingPanelOpen}
-                  aria-label={isThinkingPanelOpen ? "Hide thinking panel" : "Show thinking panel"}
+                  aria-label={isThinkingPanelOpen ? "Hide run details" : "Show run details"}
                   className={`ghost-button compact-button workspace-thinking-open-button${isThinkingPanelOpen ? " active" : ""}`}
                   onClick={toggleThinkingPanel}
-                  title={isThinkingPanelOpen ? "Hide thinking panel" : "Show thinking panel"}
+                  title={isThinkingPanelOpen ? "Hide run details" : "Show run details"}
                   type="button"
                 >
                   <Lightbulb size={15} />
-                  Thinking
+                  Run details
                 </button>
               </div>
             ) : null}
@@ -1245,7 +1433,7 @@ export function WorkspacePage() {
                             href="https://ollama.com/download"
                             onClick={(event) => {
                               event.preventDefault();
-                              void openExternalUrl("https://ollama.com/download");
+                              void handleOpenProviderDownload();
                             }}
                             rel="noreferrer"
                             target="_blank"
@@ -1314,7 +1502,7 @@ export function WorkspacePage() {
                 expandedCompactionKeys={expandedCompactionKeys}
                 highlightedHistoryIndex={highlightedHistoryIndex}
                 isStreaming={isStreaming}
-                items={transcriptPresentation}
+                items={persistedTranscriptPresentation}
                 onBranchMessage={handleBranchMessage}
                 onClearCompactionNotice={clearCompactionNotice}
                 onCopyMessage={handleCopyMessage}
@@ -1323,37 +1511,66 @@ export function WorkspacePage() {
                 onToggleCompactionSummary={toggleCompactionSummary}
                 retryPending={retryAssistantTurn.isPending}
               />
-              {currentThreadHasActiveRun && isStreaming && !liveAnswer ? (
-                <article className={`message-card ${currentRunMode === "compact" ? "system" : "assistant"} message-card-waiting`}>
-                  <div className="message-meta">
-                    <span>{currentRunMode === "compact" ? "SYSTEM" : formatMessageRoleLabel("assistant")}</span>
-                  </div>
-                  {currentRunMode === "compact" ? (
-                    <div className="stream-waiting-line" aria-live="polite">
-                      <span className="stream-waiting-text">{compactWaitingLabel(currentStage)}</span>
+              <ConversationTranscript
+                branchPending={branchMessage.isPending}
+                canBranch={false}
+                copiedMessageKey={copiedMessageKey}
+                expandedCompactionKeys={expandedCompactionKeys}
+                highlightedHistoryIndex={highlightedHistoryIndex}
+                isStreaming={isStreaming}
+                items={liveTranscriptPresentation}
+                onBranchMessage={handleBranchMessage}
+                onClearCompactionNotice={clearCompactionNotice}
+                onCopyMessage={handleCopyMessage}
+                onQuoteMessage={handleQuoteMessage}
+                onRetryAssistantTurn={handleRetryAssistantTurn}
+                onToggleCompactionSummary={toggleCompactionSummary}
+                retryPending={retryAssistantTurn.isPending}
+              />
+              {currentThreadHasActiveRun && isStreaming ? (
+                liveAnswer && currentRunMode === "chat" ? (
+                  <button
+                    aria-expanded={isThinkingPanelOpen}
+                    aria-label={isThinkingPanelOpen ? "Hide run details" : "Show run details"}
+                    aria-live="polite"
+                    className="run-progress-inline"
+                    onClick={openThinkingPanel}
+                    title={currentRunProgress.detail}
+                    type="button"
+                  >
+                    <span className="status-dot" />
+                    <span>{currentRunProgress.label}</span>
+                  </button>
+                ) : (
+                  <article className={`message-card ${currentRunMode === "compact" ? "system" : "assistant"} message-card-waiting`}>
+                    <div className="message-meta">
+                      <span>{currentRunMode === "compact" ? "SYSTEM" : formatMessageRoleLabel("assistant")}</span>
                     </div>
-                  ) : (
-                    <button
-                      aria-expanded={isThinkingPanelOpen}
-                      aria-label={isThinkingPanelOpen ? "Hide live thinking" : "Show live thinking"}
-                      className={`thinking-toggle ${canToggleThinkingPanel ? "interactive" : ""}`}
-                      disabled={!canToggleThinkingPanel}
-                      onClick={() => {
-                        if (!canToggleThinkingPanel) {
-                          return;
-                        }
-                        openThinkingPanel();
-                      }}
-                      type="button"
-                    >
-                      <span className="stream-waiting-line" aria-live="polite">
-                        <span className={`stream-waiting-text${currentChatWaitingLabel === "Deciding" ? " deciding-sweep" : ""}`}>
-                          {currentChatWaitingLabel}
+                    {currentRunMode === "compact" ? (
+                      <div className="run-progress-copy" role="status">
+                        <span className={`stream-waiting-text${currentRunProgress.tone === "active" ? " deciding-sweep" : ""}`}>
+                          {currentRunProgress.label}
                         </span>
-                      </span>
-                    </button>
-                  )}
-                </article>
+                        <span className="stream-waiting-detail">{currentRunProgress.detail}</span>
+                      </div>
+                    ) : (
+                      <button
+                        aria-expanded={isThinkingPanelOpen}
+                        aria-label={isThinkingPanelOpen ? "Hide run details" : "Show run details"}
+                        className="thinking-toggle interactive"
+                        onClick={openThinkingPanel}
+                        type="button"
+                      >
+                        <span className="run-progress-copy" role="status">
+                          <span className={`stream-waiting-text${currentRunProgress.tone === "active" ? " deciding-sweep" : ""}`}>
+                            {currentRunProgress.label}
+                          </span>
+                          <span className="stream-waiting-detail">{currentRunProgress.detail}</span>
+                        </span>
+                      </button>
+                    )}
+                  </article>
+                )
               ) : null}
               {currentThreadHasLiveError ? <div className="error-banner" role="alert">{liveError}</div> : null}
             </div>
@@ -1365,6 +1582,7 @@ export function WorkspacePage() {
       </div>
 
       <WorkspaceComposer
+        key={composerDraftScopeKey}
         activeReasoningOption={activeReasoningOption}
         canStartChat={canStartChat}
         contextUsage={contextUsage}
@@ -1398,20 +1616,20 @@ export function WorkspacePage() {
       />
       </div>
       {isThinkingPanelOpen ? (
-        <aside className="workspace-thinking-inspector" aria-label="Thinking panel">
+        <aside className="workspace-thinking-inspector" aria-label="Run details panel">
           <div className="workspace-thinking-panel">
             <div className="workspace-thinking-panel-header">
               <div className="workspace-thinking-panel-copy">
-                <p className="workspace-section-label">Thinking</p>
+                <p className="workspace-section-label">Run details</p>
                 <h2>{displayThreadTitle(currentThreadEditableTitle, currentThreadId, "Run details")}</h2>
                 <p className="workspace-thinking-panel-summary">
                   {currentThreadHasActiveChatRun
-                    ? "New deciding traces append here and stay in order for this thread."
-                    : "Saved deciding traces stay here in order for this thread."}
+                    ? currentRunProgress.detail
+                    : "Run status is shown here. Reasoning output appears only when the model provides it."}
                 </p>
               </div>
               <button
-                aria-label="Close thinking panel"
+                aria-label="Close run details"
                 className="ghost-button icon-button"
                 onClick={closeThinkingPanel}
                 type="button"
@@ -1425,23 +1643,27 @@ export function WorkspacePage() {
                 <span className="status-dot" />
                 <span>{thinkingPanelStatusLabel}</span>
               </span>
-              {latestThinkingEntry?.chatModel ? <span className="workspace-thinking-meta-chip">{latestThinkingEntry.chatModel}</span> : null}
-              {latestThinkingEntry?.durationMs ? (
+              {inspectorModel ? <span className="workspace-thinking-meta-chip">{inspectorModel}</span> : null}
+              {inspectorDurationMs ? (
                 <span className="workspace-thinking-meta-chip">
-                  {formatDurationLabel(latestThinkingEntry.durationMs)}
+                  {formatDurationLabel(inspectorDurationMs)}
                 </span>
               ) : null}
-              {latestThinkingEntry?.startedAt ? (
-                <span className="workspace-thinking-meta-chip">{formatInspectorTimestamp(latestThinkingEntry.startedAt)}</span>
+              {inspectorStartedAt ? (
+                <span className="workspace-thinking-meta-chip">{formatInspectorTimestamp(inspectorStartedAt)}</span>
               ) : null}
               {thinkingEntries.length > 1 ? (
-                <span className="workspace-thinking-meta-chip">{`${thinkingEntries.length} runs`}</span>
+                <span className="workspace-thinking-meta-chip">{`${thinkingEntries.length} reasoning traces`}</span>
               ) : null}
             </div>
 
             <div className="workspace-thinking-panel-body">
               <div className="workspace-thinking-detail">
-                {thinkingEntries.length ? (
+                {currentThreadHasActiveChatRun && !liveThinkingText ? (
+                  <div className="workspace-thinking-placeholder">
+                    {currentRunProgress.detail} Reasoning output will appear here only if this model emits it.
+                  </div>
+                ) : thinkingEntries.length ? (
                   <div className="workspace-thinking-sequence">
                     {thinkingEntries.map((entry) => (
                       <section className={`workspace-thinking-entry${entry.isLive ? " live" : ""}`} key={entry.runId}>
@@ -1459,12 +1681,14 @@ export function WorkspacePage() {
                       </section>
                     ))}
                   </div>
-                ) : canToggleThinkingPanel ? (
+                ) : inspectorRun ? (
                   <div className="workspace-thinking-placeholder">
-                    Atlas has not emitted any deciding trace yet.
+                    {inspectorRun.status === "failed" && inspectorRun.error
+                      ? `This run failed before it exposed reasoning output: ${inspectorRun.error}`
+                      : "This model did not expose reasoning output for this run. The run status and saved response remain available."}
                   </div>
                 ) : (
-                  <div className="workspace-thinking-empty">No deciding trace yet for this thread.</div>
+                  <div className="workspace-thinking-empty">No reasoning output is saved for this thread.</div>
                 )}
               </div>
             </div>
@@ -1524,7 +1748,7 @@ type WorkspaceComposerProps = {
   onStopRun: () => void;
 };
 
-const WorkspaceComposer = memo(forwardRef<WorkspaceComposerHandle, WorkspaceComposerProps>(function WorkspaceComposer({
+export const WorkspaceComposer = memo(forwardRef<WorkspaceComposerHandle, WorkspaceComposerProps>(function WorkspaceComposer({
   placeholder,
   canStartChat,
   currentUserId,
@@ -1564,18 +1788,25 @@ const WorkspaceComposer = memo(forwardRef<WorkspaceComposerHandle, WorkspaceComp
   const promptInputRef = useRef<HTMLTextAreaElement | null>(null);
   const [prompt, setPrompt] = useState("");
   const [attachments, setAttachments] = useState<ImageAttachment[]>([]);
+  const [attachmentError, setAttachmentError] = useState("");
   const [isAttachmentMenuOpen, setIsAttachmentMenuOpen] = useState(false);
   const [isReasoningMenuOpen, setIsReasoningMenuOpen] = useState(false);
   const deferredPrompt = useDeferredValue(prompt);
 
   useImperativeHandle(ref, () => ({
+    appendPrompt(content: string) {
+      setPrompt((current) => appendComposerPrompt(current, content));
+      window.requestAnimationFrame(() => promptInputRef.current?.focus());
+    },
     quoteMessage(content: string) {
       const quoted = buildQuotedPrompt(content);
-      setPrompt((current) => (current.trim() ? `${current.trim()}\n\n${quoted}` : quoted));
+      setPrompt((current) =>
+        (current.trim() ? `${current.trim()}\n\n${quoted}` : quoted).slice(0, MAX_PROMPT_LENGTH),
+      );
       window.requestAnimationFrame(() => promptInputRef.current?.focus());
     },
     setPrompt(content: string) {
-      setPrompt(content);
+      setPrompt(content.slice(0, MAX_PROMPT_LENGTH));
       window.requestAnimationFrame(() => promptInputRef.current?.focus());
     },
   }), []);
@@ -1636,22 +1867,36 @@ const WorkspaceComposer = memo(forwardRef<WorkspaceComposerHandle, WorkspaceComp
     if (!files.length) {
       return;
     }
-    const nextAttachments = await Promise.all(files.map((file) => fileToAttachment(file)));
-    setAttachments((current) => [...current, ...nextAttachments]);
+    const validationError = validateAttachmentSelection(attachments, files);
+    if (validationError) {
+      setAttachmentError(validationError);
+      return;
+    }
+    setAttachmentError("");
+    try {
+      const nextAttachments = await Promise.all(files.map((file) => fileToAttachment(file)));
+      setAttachments((current) => [...current, ...nextAttachments]);
+    } catch (error) {
+      setAttachmentError(
+        error instanceof Error ? error.message : "Atlas could not read the selected attachment.",
+      );
+    }
   };
 
   const handleImageSelection = async (event: ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(event.currentTarget.files ?? []);
+    const input = event.currentTarget;
+    const files = Array.from(input.files ?? []);
     await appendAttachmentsFromFiles(files);
-    event.currentTarget.value = "";
+    input.value = "";
     setIsAttachmentMenuOpen(false);
     window.requestAnimationFrame(() => attachmentMenuTriggerRef.current?.focus());
   };
 
   const handleAttachmentSelection = async (event: ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(event.currentTarget.files ?? []);
+    const input = event.currentTarget;
+    const files = Array.from(input.files ?? []);
     await appendAttachmentsFromFiles(files);
-    event.currentTarget.value = "";
+    input.value = "";
     setIsAttachmentMenuOpen(false);
     window.requestAnimationFrame(() => attachmentMenuTriggerRef.current?.focus());
   };
@@ -1659,6 +1904,7 @@ const WorkspaceComposer = memo(forwardRef<WorkspaceComposerHandle, WorkspaceComp
   const clearDraft = useCallback(() => {
     setPrompt("");
     setAttachments([]);
+    setAttachmentError("");
     if (imageInputRef.current) {
       imageInputRef.current.value = "";
     }
@@ -1711,7 +1957,10 @@ const WorkspaceComposer = memo(forwardRef<WorkspaceComposerHandle, WorkspaceComp
                 <button
                   aria-label={`Remove ${item.name || "attachment"}`}
                   className="ghost-button icon-button composer-attachment-remove"
-                  onClick={() => setAttachments((current) => current.filter((_, currentIndex) => currentIndex !== index))}
+                  onClick={() => {
+                    setAttachments((current) => current.filter((_, currentIndex) => currentIndex !== index));
+                    setAttachmentError("");
+                  }}
                   type="button"
                 >
                   <X size={14} />
@@ -1721,12 +1970,18 @@ const WorkspaceComposer = memo(forwardRef<WorkspaceComposerHandle, WorkspaceComp
           })}
         </div>
       ) : null}
+      {attachmentError ? (
+        <div className="error-inline composer-attachment-error" role="alert">
+          {attachmentError}
+        </div>
+      ) : null}
 
       <textarea
         aria-label="Message"
         className="prompt-input"
         onChange={(event) => setPrompt(event.currentTarget.value)}
         onKeyDown={handlePromptKeyDown}
+        maxLength={MAX_PROMPT_LENGTH}
         placeholder={placeholder}
         ref={promptInputRef}
         rows={3}
@@ -1739,6 +1994,7 @@ const WorkspaceComposer = memo(forwardRef<WorkspaceComposerHandle, WorkspaceComp
           className="hidden-file-input"
           onChange={handleImageSelection}
           multiple
+          disabled={!canStartChat || isStreaming}
           ref={imageInputRef}
           type="file"
         />
@@ -1747,6 +2003,7 @@ const WorkspaceComposer = memo(forwardRef<WorkspaceComposerHandle, WorkspaceComp
           className="hidden-file-input"
           onChange={handleAttachmentSelection}
           multiple
+          disabled={!canStartChat || isStreaming}
           ref={attachmentInputRef}
           type="file"
         />
@@ -2135,6 +2392,12 @@ const ConversationTranscript = memo(function ConversationTranscript({
 
 const MODEL_DEFAULT_TEMPERATURE_VALUE = "model-default";
 const TEMPERATURE_OPTIONS = Array.from({ length: 21 }, (_, index) => Number((index / 10).toFixed(1)));
+const MAX_PROMPT_LENGTH = 200_000;
+const MAX_ATTACHMENT_COUNT = 8;
+const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+const MAX_ATTACHMENT_TOTAL_BYTES = 25 * 1024 * 1024;
+const MAX_TEXT_ATTACHMENT_BYTES = 500_000;
+const MAX_ATTACHMENT_NAME_LENGTH = 255;
 const DOCUMENT_FILE_ACCEPT = [
   ".txt", ".md", ".markdown", ".json", ".csv", ".pdf", ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
   ".html", ".css", ".scss", ".sass", ".sql", ".yaml", ".yml", ".xml", ".sh", ".ps1", ".java", ".c",
@@ -2149,6 +2412,33 @@ const LEVEL_REASONING_OPTIONS: Array<{ value: ReasoningMode; label: string }> = 
   { value: "medium", label: "Medium" },
   { value: "high", label: "High" },
 ];
+
+export function workspaceComposerDraftKey(userId: string, threadId: string) {
+  return JSON.stringify([userId, threadId]);
+}
+
+export function appendComposerPrompt(current: string, content: string) {
+  return (current.trim() ? `${current.trim()}\n\n${content}` : content).slice(0, MAX_PROMPT_LENGTH);
+}
+
+export function canAcceptRunnerRepairRequest(
+  request: RunnerRepairRequest,
+  scope: {
+    currentUserId: string;
+    currentThreadId: string;
+    currentUserAvailable: boolean;
+    currentUserLocked: boolean;
+    usersFetched: boolean;
+  },
+) {
+  return Boolean(
+    scope.usersFetched &&
+    scope.currentUserAvailable &&
+    !scope.currentUserLocked &&
+    request.originUserId === scope.currentUserId &&
+    request.originThreadId === scope.currentThreadId,
+  );
+}
 
 function formatModelLabel(value: string) {
   return value || "Select model";
@@ -2358,34 +2648,11 @@ function timelineEphemeralLabel(message: ConversationMessage) {
   return message.kind === "context_compacted" ? "during this response" : "live";
 }
 
-function chatWaitingLabel(stage: string) {
-  if (stage === "queued") {
-    return "Queued";
-  }
-  if (stage === "compaction") {
-    return "Compacting";
-  }
-  if (stage === "stopping") {
-    return "Stopping";
-  }
-  return "Deciding";
-}
-
-function compactWaitingLabel(stage: string) {
-  if (stage === "queued") {
-    return "Compaction queued";
-  }
-  if (stage === "stopping") {
-    return "Stopping compaction";
-  }
-  return "Compacting older context";
-}
-
 function isBranchableMessage(message: ConversationMessage) {
   return (message.role === "user" || message.role === "assistant") && !message.ephemeral && !message.kind;
 }
 
-function buildConversationPresentation(transcript: ConversationMessage[]): ConversationPresentationItem[] {
+export function buildConversationPresentation(transcript: ConversationMessage[]): ConversationPresentationItem[] {
   const branchCounts: number[] = [];
   let branchCount = 0;
   let latestAssistantIndex = -1;
@@ -2408,7 +2675,7 @@ function buildConversationPresentation(transcript: ConversationMessage[]): Conve
         continue;
       }
       retryContexts.set(latestAssistantIndex, {
-        afterMessageCount: branchCounts[cursor] ?? 0,
+        afterMessageCount: branchCounts[cursor - 1] ?? 0,
         prompt: candidate.content,
         attachments: candidate.attachments ?? [],
       });
@@ -2548,6 +2815,62 @@ async function fileToAttachment(file: File): Promise<ImageAttachment> {
     data_url: await readFileAsDataUrl(file),
     byte_size: file.size,
   };
+}
+
+export function validateAttachmentSelection(
+  existing: Array<Pick<ImageAttachment, "byte_size">>,
+  files: Array<Pick<File, "name" | "size" | "type">>,
+): string | null {
+  if (existing.length + files.length > MAX_ATTACHMENT_COUNT) {
+    return `Attach up to ${MAX_ATTACHMENT_COUNT} files at a time.`;
+  }
+  if (files.some((file) => (file.name || "attachment").length > MAX_ATTACHMENT_NAME_LENGTH)) {
+    return `Attachment names must be ${MAX_ATTACHMENT_NAME_LENGTH} characters or fewer.`;
+  }
+  if (
+    files.some((file) =>
+      isUnsafeImageAttachment(
+        file.name || "attachment",
+        file.type || fallbackMediaTypeForFile(file.name),
+      ),
+    )
+  ) {
+    return "SVG and XML-based image attachments are not supported.";
+  }
+  if (files.some((file) => file.size > MAX_ATTACHMENT_BYTES)) {
+    return "Each attachment must be 10 MiB or smaller.";
+  }
+  if (
+    files.some(
+      (file) =>
+        isTextLikeFile(file.name || "attachment", file.type || fallbackMediaTypeForFile(file.name)) &&
+        file.size > MAX_TEXT_ATTACHMENT_BYTES,
+    )
+  ) {
+    return "Text attachments must be 500 KB or smaller.";
+  }
+  const existingBytes = existing.reduce(
+    (total, attachment) => total + Math.max(0, attachment.byte_size ?? 0),
+    0,
+  );
+  const selectedBytes = files.reduce((total, file) => total + Math.max(0, file.size), 0);
+  if (existingBytes + selectedBytes > MAX_ATTACHMENT_TOTAL_BYTES) {
+    return "Attachments must total 25 MiB or less.";
+  }
+  return null;
+}
+
+function isUnsafeImageAttachment(name: string, mediaType: string) {
+  const normalizedName = name.trim().toLowerCase();
+  const normalizedType = mediaType.trim().toLowerCase().split(";", 1)[0];
+  if (normalizedName.endsWith(".svg") || normalizedName.endsWith(".svgz")) {
+    return true;
+  }
+  if (!normalizedType.startsWith("image/")) {
+    return false;
+  }
+  const subtype = normalizedType.slice("image/".length);
+  return subtype.includes("svg") || subtype.endsWith("+xml");
 }
 
 function attachmentIsImage(attachment: Pick<ImageAttachment, "kind" | "media_type" | "data_url" | "name">) {

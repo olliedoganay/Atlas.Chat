@@ -1,42 +1,61 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Check, Code2, Copy, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, Play, RotateCcw, Square, Terminal } from "lucide-react";
+import { Check, Code2, Copy, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, Play, RotateCcw, Square, Terminal, Wrench } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 
 import {
   execCode,
+  getPythonGuiRuntimeStatus,
   getRunnerStatus,
+  prepareRunnerRuntime,
   stopRunnerRun,
   streamRunnerRun,
   type RunnerEvent,
+  type RunnerRuntimeStatus,
   type RunnerStatus,
 } from "../lib/api";
-import { consumePendingRun, isClientLanguage } from "../lib/runner";
+import {
+  consumePendingRun,
+  createRunnerRepairRequest,
+  isClientLanguage,
+  stashRunnerRepairRequest,
+} from "../lib/runner";
+import { useAtlasStore } from "../store/useAtlasStore";
 
 type OutputLine = {
   stream: "stdout" | "stderr";
   text: string;
 };
 
-type Phase = "loading" | "docker-down" | "running" | "finished" | "error" | "idle";
+type Phase = "loading" | "preparing" | "docker-down" | "running" | "finished" | "error" | "idle";
+type RepairState = "idle" | "drafting" | "ready" | "error";
 
-export const CLIENT_PREVIEW_SANDBOX = "allow-scripts allow-forms allow-modals allow-popups allow-pointer-lock";
+export const CLIENT_PREVIEW_SANDBOX = "allow-scripts allow-forms allow-pointer-lock";
+export const SERVER_PREVIEW_SANDBOX =
+  "allow-scripts allow-forms allow-pointer-lock allow-same-origin";
 export const CLIENT_PREVIEW_MESSAGE_SOURCE = "atlas-client-preview";
+export const MAX_CLIENT_PREVIEW_CONSOLE_CHARS = 8_192;
+export const RUNNER_PREVIEW_PROBE_TIMEOUT_MS = 3_000;
+export const RUNNER_CLOSE_STOP_TIMEOUT_MS = 3_000;
+export const RUNNER_RUNTIME_POLL_INTERVAL_MS = 750;
 export const CLIENT_PREVIEW_CSP = [
   "default-src 'none'",
-  "script-src 'unsafe-inline' 'unsafe-eval' data: blob: http: https:",
-  "script-src-elem 'unsafe-inline' 'unsafe-eval' data: blob: http: https:",
+  "script-src 'unsafe-inline' 'unsafe-eval' data: blob:",
+  "script-src-elem 'unsafe-inline' 'unsafe-eval' data: blob:",
   "script-src-attr 'unsafe-inline'",
-  "style-src 'unsafe-inline' data: blob: http: https:",
-  "style-src-elem 'unsafe-inline' data: blob: http: https:",
+  "style-src 'unsafe-inline' data: blob:",
+  "style-src-elem 'unsafe-inline' data: blob:",
   "style-src-attr 'unsafe-inline'",
-  "img-src data: blob: http: https:",
-  "font-src data: blob: http: https:",
-  "media-src data: blob: http: https:",
-  "connect-src data: blob: http: https: ws: wss:",
+  "img-src data: blob:",
+  "font-src data: blob:",
+  "media-src data: blob:",
+  "connect-src 'none'",
   "worker-src data: blob:",
   "child-src data: blob:",
   "frame-src data: blob:",
+  "object-src 'none'",
+  "base-uri 'none'",
+  "form-action 'none'",
 ].join("; ");
 
 type ClientPreviewConsoleLevel = "log" | "warn" | "error";
@@ -55,23 +74,18 @@ type ClientPreviewLine = {
 };
 
 export function buildClientPreviewDocument(code: string, channel: string): string {
-  const csp = buildClientPreviewCspMeta();
-  const bootstrap = buildClientPreviewBootstrap(channel);
-  if (isCompleteHtmlDocument(code)) {
-    return injectClientPreviewHead(code, `${csp}${bootstrap}`);
-  }
+  // Trusted policy and diagnostics must precede every byte of user HTML.
+  // Regex insertion can be redirected into a fake <head>, while parsing the
+  // source in the host document can itself fetch attacker-controlled resources.
+  // Leaving our head open lets the browser naturally merge either a complete
+  // document or a fragment after the policy has already taken effect.
   return [
-    "<!DOCTYPE html>",
-    "<html>",
-    "<head>",
-    '<meta charset="utf-8" />',
-    '<meta name="viewport" content="width=device-width, initial-scale=1" />',
-    csp,
-    bootstrap,
-    "</head>",
-    "<body>",
+    "<!DOCTYPE html><html><head>",
+    '<meta charset="utf-8">',
+    '<meta name="viewport" content="width=device-width, initial-scale=1">',
+    buildClientPreviewCspMeta(),
+    `<script>${buildClientPreviewBootstrapScript(channel)}</script>`,
     code,
-    "</body>",
     "</html>",
   ].join("");
 }
@@ -80,35 +94,20 @@ export function buildClientPreviewBlob(code: string, channel = ""): Blob {
   return new Blob([channel ? buildClientPreviewDocument(code, channel) : code], { type: "text/html;charset=utf-8" });
 }
 
-function isCompleteHtmlDocument(code: string): boolean {
-  return /<!doctype\s+html/i.test(code) || /<html[\s>]/i.test(code);
-}
-
-function injectClientPreviewHead(code: string, headContent: string): string {
-  if (/<head[\s>]/i.test(code)) {
-    return code.replace(/<head([^>]*)>/i, `<head$1>${headContent}`);
-  }
-  if (/<body[\s>]/i.test(code)) {
-    return code.replace(/<body([^>]*)>/i, `<body$1>${headContent}`);
-  }
-  if (/<html[\s>]/i.test(code)) {
-    return code.replace(/<html([^>]*)>/i, `<html$1><head>${headContent}</head>`);
-  }
-  return `${headContent}${code}`;
-}
-
 function buildClientPreviewCspMeta(): string {
   const escaped = CLIENT_PREVIEW_CSP.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
-  return `<meta http-equiv="Content-Security-Policy" content="${escaped}" />`;
+  return `<meta http-equiv="Content-Security-Policy" content="${escaped}">`;
 }
 
-function buildClientPreviewBootstrap(channel: string): string {
+function buildClientPreviewBootstrapScript(channel: string): string {
   const source = JSON.stringify(CLIENT_PREVIEW_MESSAGE_SOURCE);
   const channelValue = JSON.stringify(channel);
+  const maxConsoleChars = JSON.stringify(MAX_CLIENT_PREVIEW_CONSOLE_CHARS);
   const script = [
     "(() => {",
     `  const source = ${source};`,
     `  const channel = ${channelValue};`,
+    `  const maxConsoleChars = ${maxConsoleChars};`,
     '  const send = (payload) => { try { parent.postMessage({ source, channel, ...payload }, "*"); } catch {} };',
     "  const installStorageFallback = (name) => {",
     "    try {",
@@ -141,10 +140,14 @@ function buildClientPreviewBootstrap(channel: string): string {
     "      return String(value);",
     "    }",
     "  };",
+    "  const boundedText = (value) => {",
+    "    const text = stringify(value);",
+    '    return text.length > maxConsoleChars ? `${text.slice(0, maxConsoleChars)}\\n[atlas-preview] output truncated` : text;',
+    "  };",
     '  ["log", "warn", "error"].forEach((level) => {',
     "    const original = console[level];",
     "    console[level] = (...args) => {",
-    '      send({ type: "console", level, text: args.map(stringify).join(" ") });',
+    '      send({ type: "console", level, text: boundedText(args.map(boundedText).join(" ")) });',
     "      original.apply(console, args);",
     "    };",
     "  });",
@@ -153,7 +156,7 @@ function buildClientPreviewBootstrap(channel: string): string {
     '    send({ type: "error", level: "error", text });',
     "  });",
     '  window.addEventListener("unhandledrejection", (event) => {',
-    '    send({ type: "error", level: "error", text: stringify(event.reason) });',
+    '    send({ type: "error", level: "error", text: boundedText(event.reason) });',
     "  });",
     '  window.addEventListener("securitypolicyviolation", (event) => {',
     "    const blocked = event.blockedURI || \"inline\";",
@@ -170,11 +173,13 @@ function buildClientPreviewBootstrap(channel: string): string {
     "  });",
     "})();",
   ].join("\n");
-  return `<script>${script}</script>`;
+  return script;
 }
 
 export function CodeRunnerPage() {
   const { token = "" } = useParams();
+  const launchUserId = useAtlasStore((state) => state.currentUserId);
+  const launchThreadId = useAtlasStore((state) => state.currentThreadId);
   const [phase, setPhase] = useState<Phase>("loading");
   const [language, setLanguage] = useState<string>("");
   const [code, setCode] = useState<string>("");
@@ -189,11 +194,19 @@ export function CodeRunnerPage() {
   const [vncReady, setVncReady] = useState(false);
   const [clientPreviewNonce, setClientPreviewNonce] = useState(0);
   const [serverLogsOpen, setServerLogsOpen] = useState(false);
+  const [stopPending, setStopPending] = useState(false);
   const [sourceOpen, setSourceOpen] = useState(true);
   const [sourceCopied, setSourceCopied] = useState(false);
+  const [runtimeStatus, setRuntimeStatus] = useState<RunnerRuntimeStatus | null>(null);
+  const [repairState, setRepairState] = useState<RepairState>("idle");
+  const [repairMessage, setRepairMessage] = useState("");
   const streamDisposer = useRef<(() => void) | null>(null);
   const outputRef = useRef<HTMLDivElement | null>(null);
   const currentRunId = useRef<string | null>(null);
+  const runAttemptRef = useRef(0);
+  const initialPayloadRef = useRef<ReturnType<typeof consumePendingRun> | undefined>(undefined);
+  const closeInProgressRef = useRef(false);
+  const copyResetTimerRef = useRef<number | null>(null);
 
   const clientLang = useMemo(() => (language ? isClientLanguage(language) : false), [language]);
   const showVncPane = Boolean(vncUrl && vncReady && phase !== "finished" && phase !== "error");
@@ -201,9 +214,10 @@ export function CodeRunnerPage() {
   const showServerPreview = showVncPane || showWebPane;
   const outputLineCount = output.length + (errorMessage ? 1 : 0);
   const activityLabel = useMemo(
-    () => runnerActivityLabel({ clientLang, output, phase, vncReady, vncUrl, webUrl }),
-    [clientLang, output, phase, vncReady, vncUrl, webUrl],
+    () => runnerActivityLabel({ clientLang, output, phase, runtimeStatus, vncReady, vncUrl, webUrl }),
+    [clientLang, output, phase, runtimeStatus, vncReady, vncUrl, webUrl],
   );
+  const failedRun = phase === "error" || (phase === "finished" && exitCode !== null && exitCode !== 0);
 
   useEffect(() => {
     if (!token) {
@@ -211,7 +225,10 @@ export function CodeRunnerPage() {
       setErrorMessage("Runner token missing from URL.");
       return;
     }
-    const payload = consumePendingRun(token);
+    if (initialPayloadRef.current === undefined) {
+      initialPayloadRef.current = consumePendingRun(token);
+    }
+    const payload = initialPayloadRef.current;
     if (!payload) {
       setPhase("error");
       setErrorMessage("This run window lost its payload. Close and try again.");
@@ -251,6 +268,7 @@ export function CodeRunnerPage() {
         setOutput((prev) => [...prev, { stream: event.stream, text: event.chunk }]);
         scrollToEnd();
       } else if (event.type === "exit") {
+        currentRunId.current = null;
         setExitCode(event.code);
         setDurationMs(event.duration_ms);
         setPhase("finished");
@@ -263,6 +281,8 @@ export function CodeRunnerPage() {
     if (!language || !code) {
       return;
     }
+    const runAttempt = runAttemptRef.current + 1;
+    runAttemptRef.current = runAttempt;
     setPhase("loading");
     setOutput([]);
     setExitCode(null);
@@ -272,16 +292,26 @@ export function CodeRunnerPage() {
     setWebUrl(null);
     setVncReady(false);
     setServerLogsOpen(false);
+    setStopPending(false);
+    setRuntimeStatus(null);
+    setRepairState("idle");
+    setRepairMessage("");
 
     let status: RunnerStatus;
     try {
       status = await getRunnerStatus();
     } catch (error) {
+      if (runAttempt !== runAttemptRef.current) {
+        return;
+      }
       setPhase("error");
       setErrorMessage(error instanceof Error ? error.message : "Failed to contact backend.");
       return;
     }
 
+    if (runAttempt !== runAttemptRef.current) {
+      return;
+    }
     if (!status.available) {
       setPhase("docker-down");
       setDockerReason(status.reason ?? "Docker Desktop is not running.");
@@ -289,7 +319,35 @@ export function CodeRunnerPage() {
     }
 
     try {
+      const preparation = await prepareRunnerRuntime(language, code);
+      if (runAttempt !== runAttemptRef.current) {
+        return;
+      }
+      if (preparation.required) {
+        if (!preparation.runtime) {
+          throw new Error("Atlas did not return Python GUI runtime preparation status.");
+        }
+        setPhase("preparing");
+        const prepared = await waitForRunnerRuntime(
+          preparation.runtime,
+          (runtime) => {
+            if (runAttempt !== runAttemptRef.current) {
+              return;
+            }
+            setRuntimeStatus(runtime);
+            setOutput(runtimeLogLines(runtime));
+          },
+          () => runAttempt === runAttemptRef.current,
+        );
+        if (!prepared || runAttempt !== runAttemptRef.current) {
+          return;
+        }
+      }
       const started = await execCode(language, code);
+      if (runAttempt !== runAttemptRef.current) {
+        void stopRunnerRun(started.run_id).catch(() => undefined);
+        return;
+      }
       currentRunId.current = started.run_id;
       setRunId(started.run_id);
       setVncUrl(started.vnc_url ?? null);
@@ -297,10 +355,25 @@ export function CodeRunnerPage() {
       setServerLogsOpen(false);
       setPhase("running");
       streamDisposer.current?.();
-      streamDisposer.current = streamRunnerRun(started.run_id, handleEvent, (message) => {
-        setErrorMessage(message);
-      });
+      streamDisposer.current = streamRunnerRun(
+        started.run_id,
+        (event) => {
+          if (runAttempt === runAttemptRef.current) {
+            handleEvent(event);
+          }
+        },
+        (message) => {
+          if (runAttempt !== runAttemptRef.current) {
+            return;
+          }
+          setErrorMessage(message);
+          setPhase("error");
+        },
+      );
     } catch (error) {
+      if (runAttempt !== runAttemptRef.current) {
+        return;
+      }
       setPhase("error");
       setErrorMessage(error instanceof Error ? error.message : "Failed to start run.");
     }
@@ -319,6 +392,7 @@ export function CodeRunnerPage() {
 
   useEffect(() => {
     return () => {
+      runAttemptRef.current += 1;
       streamDisposer.current?.();
       streamDisposer.current = null;
       const id = currentRunId.current;
@@ -330,50 +404,86 @@ export function CodeRunnerPage() {
 
   useEffect(() => {
     let unlisten: (() => void) | null = null;
+    let cancelled = false;
     const appWindow = getSafeCurrentWindow();
     if (!appWindow) {
       return undefined;
     }
     void appWindow
-      .onCloseRequested(() => {
+      .onCloseRequested(async (event) => {
+        if (closeInProgressRef.current) {
+          return;
+        }
         streamDisposer.current?.();
         streamDisposer.current = null;
         const id = currentRunId.current;
-        if (id) {
-          void stopRunnerRun(id).catch(() => undefined);
+        if (!id) {
+          return;
+        }
+        event.preventDefault();
+        closeInProgressRef.current = true;
+        currentRunId.current = null;
+        let stopTimeout: number | null = null;
+        try {
+          await Promise.race([
+            stopRunnerRun(id).catch(() => undefined),
+            new Promise<void>((resolve) => {
+              stopTimeout = window.setTimeout(resolve, RUNNER_CLOSE_STOP_TIMEOUT_MS);
+            }),
+          ]);
+        } finally {
+          if (stopTimeout !== null) {
+            window.clearTimeout(stopTimeout);
+          }
+          await appWindow.close().catch(() => undefined);
         }
       })
       .then((fn) => {
-        unlisten = fn;
+        if (cancelled) {
+          fn();
+        } else {
+          unlisten = fn;
+        }
       })
       .catch(() => undefined);
     return () => {
+      cancelled = true;
       unlisten?.();
     };
   }, []);
 
   const stopRun = useCallback(async () => {
     const id = currentRunId.current;
-    if (!id) {
+    if (!id || stopPending) {
       return;
     }
+    setStopPending(true);
     try {
       await stopRunnerRun(id);
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : "Failed to stop run.");
+    } finally {
+      setStopPending(false);
     }
-  }, []);
+  }, [stopPending]);
 
-  const rerun = useCallback(() => {
+  const rerun = useCallback(async () => {
     if (clientLang) {
       setPhase("idle");
       setErrorMessage(null);
       setClientPreviewNonce((current) => current + 1);
       return;
     }
+    runAttemptRef.current += 1;
+    streamDisposer.current?.();
+    streamDisposer.current = null;
+    const previousRunId = currentRunId.current;
     currentRunId.current = null;
     setRunId(null);
-    void beginServerRun();
+    if (previousRunId) {
+      await stopRunnerRun(previousRunId).catch(() => undefined);
+    }
+    await beginServerRun();
   }, [beginServerRun, clientLang]);
 
   const copySource = useCallback(async () => {
@@ -383,15 +493,60 @@ export function CodeRunnerPage() {
       }
       await navigator.clipboard.writeText(code);
       setSourceCopied(true);
-      window.setTimeout(() => setSourceCopied(false), 1200);
+      if (copyResetTimerRef.current !== null) {
+        window.clearTimeout(copyResetTimerRef.current);
+      }
+      copyResetTimerRef.current = window.setTimeout(() => {
+        copyResetTimerRef.current = null;
+        setSourceCopied(false);
+      }, 1200);
     } catch {
       // Clipboard access can be denied in browser preview or locked-down desktop contexts.
     }
   }, [code]);
 
+  const fixWithAtlas = useCallback(async () => {
+    if (!failedRun || repairState === "drafting") {
+      return;
+    }
+    const payload = initialPayloadRef.current;
+    setRepairState("drafting");
+    setRepairMessage("");
+    try {
+      const request = createRunnerRepairRequest({
+        language,
+        code,
+        diagnostics: buildRunnerRepairDiagnostics({ errorMessage, exitCode, output }),
+        originUserId: payload?.originUserId ?? launchUserId,
+        originThreadId: payload?.originThreadId ?? launchThreadId,
+      });
+      stashRunnerRepairRequest(request);
+      setRepairState("ready");
+      setRepairMessage("Repair draft ready in the original Atlas chat. Review it before sending.");
+      const appWindow = getSafeCurrentWindow();
+      if (appWindow && typeof appWindow.close === "function") {
+        await appWindow.close().catch(() => undefined);
+      }
+    } catch (error) {
+      setRepairState("error");
+      setRepairMessage(
+        error instanceof Error ? error.message : "Atlas could not create the repair draft.",
+      );
+    }
+  }, [code, errorMessage, exitCode, failedRun, language, launchThreadId, launchUserId, output, repairState]);
+
   useEffect(() => {
     setSourceCopied(false);
   }, [code, language]);
+
+  useEffect(
+    () => () => {
+      if (copyResetTimerRef.current !== null) {
+        window.clearTimeout(copyResetTimerRef.current);
+      }
+    },
+    [],
+  );
 
   if (!language) {
     return (
@@ -423,18 +578,50 @@ export function CodeRunnerPage() {
             Source
           </button>
           {phase === "running" ? (
-            <button className="ghost-button compact-button runner-stop" onClick={() => void stopRun()} type="button">
-              <Square size={14} /> Stop
+            <button
+              className="ghost-button compact-button runner-stop"
+              disabled={stopPending}
+              onClick={() => void stopRun()}
+              type="button"
+            >
+              <Square size={14} /> {stopPending ? "Stopping..." : "Stop"}
+            </button>
+          ) : null}
+          {failedRun ? (
+            <button
+              className="primary-button compact-button runner-fix"
+              disabled={repairState === "drafting"}
+              onClick={() => void fixWithAtlas()}
+              title="Create a reviewable repair draft in the original Atlas chat"
+              type="button"
+            >
+              <Wrench size={14} />
+              {repairState === "drafting" ? "Preparing draft..." : "Fix with Atlas"}
             </button>
           ) : null}
           {clientLang || phase === "finished" || phase === "error" || phase === "docker-down" ? (
-            <button className="ghost-button compact-button" onClick={() => rerun()} type="button">
+            <button
+              className="ghost-button compact-button"
+              onClick={() => void rerun()}
+              title={clientLang ? "Reload the preview" : "Run the same source again without changes"}
+              type="button"
+            >
               {clientLang ? <Play size={14} /> : <RotateCcw size={14} />}
-              {clientLang ? "Reload" : "Rerun"}
+              {clientLang ? "Reload" : "Rerun same source"}
             </button>
           ) : null}
         </div>
       </header>
+
+      {repairMessage ? (
+        <div
+          aria-live="polite"
+          className={`runner-repair-message${repairState === "error" ? " error" : ""}`}
+          role={repairState === "error" ? "alert" : "status"}
+        >
+          {repairMessage}
+        </div>
+      ) : null}
 
       <main className={`runner-body${showServerPreview ? " with-vnc" : ""}${sourceOpen ? " with-source" : ""}`}>
         {sourceOpen ? (
@@ -487,7 +674,13 @@ export function CodeRunnerPage() {
 
       <footer className="runner-footer">
         <span className="runner-meta">
-          {runId ? `Run ${runId.slice(0, 8)}` : clientLang ? "Client sandbox" : "Awaiting Docker"}
+          {runId
+            ? `Run ${runId.slice(0, 8)}`
+            : clientLang
+              ? "Client sandbox"
+              : phase === "preparing"
+                ? `Offline runtime ${Math.round((runtimeStatus?.progress ?? 0) * 100)}%`
+                : "Awaiting Docker"}
         </span>
         {durationMs != null ? <span className="runner-meta">{(durationMs / 1000).toFixed(2)}s</span> : null}
         {exitCode != null ? <span className="runner-meta">exit {exitCode}</span> : null}
@@ -535,12 +728,77 @@ function getSafeCurrentWindow() {
   }
 }
 
+const BENIGN_RUNNER_DIAGNOSTIC = /^\[atlas-runner\]\s+(?:trusted preparation|secure offline python gui runtime|using prepared offline python gui runtime|gui ready on port)/i;
+
+export function buildRunnerRepairDiagnostics({
+  errorMessage,
+  exitCode,
+  output,
+}: {
+  errorMessage: string | null;
+  exitCode: number | null;
+  output: OutputLine[];
+}): string {
+  const lines = output
+    .flatMap((entry) => entry.text.replace(/\r\n?/g, "\n").split("\n"))
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim() && !BENIGN_RUNNER_DIAGNOSTIC.test(line.trim()));
+  const diagnostics: string[] = [];
+  if (exitCode !== null) {
+    diagnostics.push(`Process exited with code ${exitCode}.`);
+  }
+  if (errorMessage?.trim()) {
+    diagnostics.push(errorMessage.trim());
+  }
+  diagnostics.push(...lines);
+  return diagnostics.join("\n").trim() || "The process failed without diagnostic output.";
+}
+
+async function waitForRunnerRuntime(
+  initial: RunnerRuntimeStatus,
+  onUpdate: (runtime: RunnerRuntimeStatus) => void,
+  isCurrent: () => boolean,
+): Promise<RunnerRuntimeStatus | null> {
+  let runtime = initial;
+  onUpdate(runtime);
+  while (runtime.state === "preparing" && isCurrent()) {
+    await new Promise<void>((resolve) => {
+      window.setTimeout(resolve, RUNNER_RUNTIME_POLL_INTERVAL_MS);
+    });
+    if (!isCurrent()) {
+      return null;
+    }
+    runtime = await getPythonGuiRuntimeStatus();
+    onUpdate(runtime);
+  }
+  if (!isCurrent()) {
+    return null;
+  }
+  if (runtime.state !== "ready") {
+    throw new Error(
+      runtime.error ??
+        "The secure offline Python GUI runtime is not ready. Check Docker connectivity and retry.",
+    );
+  }
+  return runtime;
+}
+
+function runtimeLogLines(runtime: RunnerRuntimeStatus): OutputLine[] {
+  const trustBoundary =
+    "[atlas-runner] trusted preparation downloads only pinned Atlas dependencies; submitted code is not mounted or executed";
+  const lines = runtime.log_tail.length > 0 ? runtime.log_tail : [runtime.message];
+  return [trustBoundary, ...lines].map((text) => ({ stream: "stdout", text }));
+}
+
 function RunnerStatusBadge({ phase, exitCode }: { phase: Phase; exitCode: number | null }) {
   if (phase === "running") {
     return <span className="runner-status running">Running</span>;
   }
   if (phase === "loading") {
     return <span className="runner-status pending">Starting...</span>;
+  }
+  if (phase === "preparing") {
+    return <span className="runner-status pending">Preparing runtime...</span>;
   }
   if (phase === "finished") {
     const ok = exitCode === 0;
@@ -559,6 +817,7 @@ function runnerActivityLabel({
   clientLang,
   output,
   phase,
+  runtimeStatus,
   vncReady,
   vncUrl,
   webUrl,
@@ -566,6 +825,7 @@ function runnerActivityLabel({
   clientLang: boolean;
   output: OutputLine[];
   phase: Phase;
+  runtimeStatus: RunnerRuntimeStatus | null;
   vncReady: boolean;
   vncUrl: string | null;
   webUrl: string | null;
@@ -575,6 +835,10 @@ function runnerActivityLabel({
   }
   if (phase === "loading") {
     return "Checking runner...";
+  }
+  if (phase === "preparing") {
+    const progress = runtimeStatus ? Math.round(runtimeStatus.progress * 100) : 0;
+    return `Building secure offline GUI runtime... ${progress}%`;
   }
   if (phase !== "running") {
     return null;
@@ -717,16 +981,25 @@ function ClientPreview({ code }: { code: string }) {
 
   useEffect(() => {
     const handleMessage = (event: MessageEvent) => {
+      if (event.source !== frameRef.current?.contentWindow) {
+        return;
+      }
       const data = event.data as Partial<ClientPreviewEvent> | null;
       if (!data || data.source !== CLIENT_PREVIEW_MESSAGE_SOURCE || data.channel !== channel) {
         return;
       }
       if (data.type === "console" || data.type === "error") {
-        const text = String(data.text ?? "").trim();
+        const text = String(data.text ?? "").slice(0, MAX_CLIENT_PREVIEW_CONSOLE_CHARS).trim();
         if (!text) {
           return;
         }
-        const level = data.type === "error" ? "error" : data.level ?? "log";
+        const requestedLevel = String(data.level ?? "log");
+        const level =
+          data.type === "error"
+            ? "error"
+            : ["log", "warn", "error"].includes(requestedLevel)
+              ? (requestedLevel as ClientPreviewConsoleLevel)
+              : "log";
         setConsoleLines((current) => [...current.slice(-79), { level, text }]);
       }
     };
@@ -809,34 +1082,66 @@ function RunnerUrlPreview({
     setReady(false);
     setSrc(null);
     let cancelled = false;
+    let retryTimer: number | null = null;
+    let probeController: AbortController | null = null;
     const start = Date.now();
     const deadlineMs = 45_000;
     const attempt = async () => {
+      probeController?.abort();
+      const controller = new AbortController();
+      probeController = controller;
+      const probeTimer = window.setTimeout(
+        () => controller.abort(),
+        Math.min(
+          RUNNER_PREVIEW_PROBE_TIMEOUT_MS,
+          Math.max(1, deadlineMs - (Date.now() - start)),
+        ),
+      );
       try {
-        await fetch(url, { method: "GET", mode: "no-cors" });
+        await fetch(url, {
+          method: "GET",
+          mode: "no-cors",
+          signal: controller.signal,
+        });
         if (!cancelled) {
           setSrc(url);
           setReady(true);
         }
       } catch {
         if (!cancelled && Date.now() - start < deadlineMs) {
-          setTimeout(attempt, 500);
+          retryTimer = window.setTimeout(attempt, 500);
         } else if (!cancelled) {
           setSrc(url);
           setReady(true);
+        }
+      } finally {
+        window.clearTimeout(probeTimer);
+        if (probeController === controller) {
+          probeController = null;
         }
       }
     };
     void attempt();
     return () => {
       cancelled = true;
+      probeController?.abort();
+      probeController = null;
+      if (retryTimer !== null) {
+        window.clearTimeout(retryTimer);
+      }
     };
   }, [url]);
 
   return (
     <div className={`runner-vnc ${background === "light" ? "runner-web-preview" : ""}`}>
       {ready && src ? (
-        <iframe className="runner-vnc-frame" src={src} title={title} />
+        <iframe
+          className="runner-vnc-frame"
+          referrerPolicy="no-referrer"
+          sandbox={SERVER_PREVIEW_SANDBOX}
+          src={src}
+          title={title}
+        />
       ) : (
         <div className="runner-vnc-placeholder">{loadingLabel}</div>
       )}

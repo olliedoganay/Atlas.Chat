@@ -92,6 +92,9 @@ export function AtlasShell() {
   const pinnedThreadKeys = useAtlasStore((state) => state.pinnedThreadKeys);
   const togglePinnedThread = useAtlasStore((state) => state.togglePinnedThread);
   const backendStartupStartedAt = useAtlasStore((state) => state.backendStartupStartedAt);
+  const isStreaming = useAtlasStore((state) => state.isStreaming);
+  const activeRunUserId = useAtlasStore((state) => state.activeRunUserId);
+  const activeRunThreadId = useAtlasStore((state) => state.activeRunThreadId);
   const markBackendBooting = useAtlasStore((state) => state.markBackendBooting);
   const toggleNavCollapsed = useAtlasStore((state) => state.toggleNavCollapsed);
   const setNavWidth = useAtlasStore((state) => state.setNavWidth);
@@ -105,9 +108,12 @@ export function AtlasShell() {
   const [isCompactViewport, setIsCompactViewport] = useState(false);
   const [isResponsiveNavOpen, setIsResponsiveNavOpen] = useState(false);
   const [isFirstRunActive, setIsFirstRunActive] = useState(false);
+  const [shellActionError, setShellActionError] = useState("");
+  const [restartPending, setRestartPending] = useState(false);
 
   const {
     data: status,
+    isError: statusError,
     isPending: statusPending,
     isFetching: statusFetching,
   } = useQuery({
@@ -136,13 +142,18 @@ export function AtlasShell() {
   });
   const backendPhase = useBackendPhase({
     hasStatus: Boolean(status),
+    isError: statusError,
     isPending: statusPending,
     isFetching: statusFetching,
     bootStartedAt: backendStartupStartedAt,
   });
   const currentUserProfile = users.find((user) => user.user_id === currentUserId);
   const currentUserLocked = Boolean(currentUserProfile?.locked);
-  const { data: threads = [] } = useQuery({
+  const {
+    data: threads = [],
+    isError: threadsError,
+    error: threadsQueryError,
+  } = useQuery({
     queryKey: ["threads", currentUserId],
     queryFn: () => getThreads(currentUserId),
     enabled: isWorkspaceRoute && Boolean(currentUserId) && !currentUserLocked,
@@ -209,6 +220,9 @@ export function AtlasShell() {
   });
   const duplicateThreadMutation = useMutation({
     mutationFn: async (thread: ThreadSummary) => duplicateThread(thread.thread_id, thread.user_id || currentUserId),
+    onMutate: () => {
+      setShellActionError("");
+    },
     onSuccess: async (thread) => {
       setCurrentThreadId(thread.thread_id);
       setCurrentThreadTitle(editableThreadTitle(thread.title, thread.thread_id));
@@ -218,6 +232,11 @@ export function AtlasShell() {
         queryClient.invalidateQueries({ queryKey: ["threads", currentUserId] }),
         queryClient.invalidateQueries({ queryKey: ["thread-history", currentUserId] }),
       ]);
+    },
+    onError: (error) => {
+      setShellActionError(
+        error instanceof Error ? error.message : "Atlas could not duplicate this chat.",
+      );
     },
   });
 
@@ -399,13 +418,26 @@ export function AtlasShell() {
   }, [currentUserId, currentUserLocked, isWorkspaceRoute]);
 
   const restartBackend = async () => {
+    if (restartPending) {
+      return;
+    }
+    setShellActionError("");
+    setRestartPending(true);
     markBackendBooting();
-    await restartManagedBackend();
-    await Promise.all([
-      queryClient.invalidateQueries({ queryKey: ["status"] }),
-      queryClient.invalidateQueries({ queryKey: ["models"] }),
-      queryClient.invalidateQueries({ queryKey: ["threads"] }),
-    ]);
+    try {
+      await restartManagedBackend();
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["status"] }),
+        queryClient.invalidateQueries({ queryKey: ["models"] }),
+        queryClient.invalidateQueries({ queryKey: ["threads"] }),
+      ]);
+    } catch (error) {
+      setShellActionError(
+        error instanceof Error ? error.message : "Atlas could not restart the local backend.",
+      );
+    } finally {
+      setRestartPending(false);
+    }
   };
 
   const selectThread = (thread: ThreadSummary) => {
@@ -490,17 +522,24 @@ export function AtlasShell() {
   };
 
   const handleProfilePick = async (userId: string) => {
+    setShellActionError("");
     setCurrentUserId(userId);
     setCurrentThreadId("main");
     setCurrentThreadTitle("Main");
     setDraftThreadModel("");
     setDraftThreadTemperature(null);
-    await Promise.all([
-      queryClient.invalidateQueries({ queryKey: ["users"] }),
-      queryClient.invalidateQueries({ queryKey: ["threads"] }),
-      queryClient.invalidateQueries({ queryKey: ["thread-history"] }),
-      queryClient.invalidateQueries({ queryKey: ["memories"] }),
-    ]);
+    try {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["users"] }),
+        queryClient.invalidateQueries({ queryKey: ["threads"] }),
+        queryClient.invalidateQueries({ queryKey: ["thread-history"] }),
+        queryClient.invalidateQueries({ queryKey: ["memories"] }),
+      ]);
+    } catch (error) {
+      setShellActionError(
+        error instanceof Error ? error.message : "Atlas could not refresh the selected profile.",
+      );
+    }
   };
 
   const handleProfileUnlock = (_userId: string) => {
@@ -560,7 +599,14 @@ export function AtlasShell() {
         className={`app-shell ${effectiveNavCollapsed ? "nav-collapsed" : ""}${isCompactViewport ? " compact-viewport" : ""}${isResponsiveNavOpen ? " responsive-nav-open" : ""}${isNavResizing ? " nav-resizing" : ""}`}
         style={shellStyle}
       >
-        <RunStreamCoordinator />
+        <RunStreamCoordinator
+          canRecoverRun={
+            backendPhase === "online" &&
+            usersFetched &&
+            Boolean(currentUserProfile) &&
+            !currentUserLocked
+          }
+        />
         <aside aria-label="Primary navigation" className={`global-nav ${effectiveNavCollapsed ? "collapsed" : ""}`}>
         <div className="brand-lockup">
           <div className="brand-lockup-main">
@@ -675,6 +721,10 @@ export function AtlasShell() {
                         {displayThreadItems.map((thread) => {
                           const persistedThread = threadItems.some((item) => isSameThread(item, thread, currentUserId));
                           const pinned = isThreadPinned(thread, pinnedThreadKeys, currentUserId);
+                          const threadHasActiveRun =
+                            isStreaming &&
+                            activeRunUserId === (thread.user_id || currentUserId) &&
+                            activeRunThreadId === thread.thread_id;
                           return (
                             <div
                               className={`thread-card ${thread.thread_id === currentThreadId ? "active" : ""}${pinned ? " pinned" : ""}`}
@@ -695,7 +745,9 @@ export function AtlasShell() {
                               <button
                                 aria-label={`Duplicate ${displayThreadTitle(thread)}`}
                                 className="ghost-button icon-button thread-card-duplicate"
+                                disabled={duplicateThreadMutation.isPending || threadHasActiveRun}
                                 onClick={() => duplicateThreadMutation.mutate(thread)}
+                                title={threadHasActiveRun ? "Wait for this run to finish" : "Duplicate chat"}
                                 type="button"
                               >
                                 <Copy size={14} />
@@ -705,7 +757,9 @@ export function AtlasShell() {
                               <button
                                 aria-label={`Delete ${displayThreadTitle(thread)}`}
                                 className="ghost-button icon-button thread-card-delete"
+                                disabled={deleteThreadMutation.isPending || threadHasActiveRun}
                                 onClick={() => setThreadToDelete(thread)}
+                                title={threadHasActiveRun ? "Stop this run before deleting the chat" : "Delete chat"}
                                 type="button"
                               >
                                 <X size={14} />
@@ -751,6 +805,25 @@ export function AtlasShell() {
         </div>
 
         <div className="nav-footer">
+          {shellActionError || threadsError ? (
+            <div
+              className="error-inline shell-action-error"
+              role="alert"
+              title={
+                shellActionError ||
+                (threadsQueryError instanceof Error
+                  ? threadsQueryError.message
+                  : "Atlas could not load chats.")
+              }
+            >
+              {effectiveNavCollapsed
+                ? "Action failed"
+                : shellActionError ||
+                  (threadsQueryError instanceof Error
+                    ? threadsQueryError.message
+                    : "Atlas could not load chats.")}
+            </div>
+          ) : null}
           {!effectiveNavCollapsed ? (
             <ProfileMenu
               currentUserId={currentUserId}
@@ -771,9 +844,14 @@ export function AtlasShell() {
             <span>{startupState.shellLabel}</span>
           </div>
           {startupState.key === "backend-offline" ? (
-            <button className="ghost-button full-width" onClick={restartBackend} type="button">
+            <button
+              className="ghost-button full-width"
+              disabled={restartPending}
+              onClick={() => void restartBackend()}
+              type="button"
+            >
               <RotateCcw size={16} />
-              Restart backend
+              {restartPending ? "Restarting..." : "Restart backend"}
             </button>
           ) : null}
         </div>

@@ -30,7 +30,7 @@ class LlmContextWindowTests(unittest.TestCase):
             payload = responses.pop(0)
             return _FakeResponse(json.dumps(payload).encode("utf-8"))
 
-        with patch("atlas_local.llm.request.urlopen", side_effect=fake_urlopen):
+        with patch("atlas_local.llm.provider_urlopen", side_effect=fake_urlopen):
             value = resolve_effective_context_window(self.config, "gpt-oss:20b")
 
         self.assertEqual(value, 16384)
@@ -48,7 +48,7 @@ class LlmContextWindowTests(unittest.TestCase):
             payload = responses.pop(0)
             return _FakeResponse(json.dumps(payload).encode("utf-8"))
 
-        with patch("atlas_local.llm.request.urlopen", side_effect=fake_urlopen):
+        with patch("atlas_local.llm.provider_urlopen", side_effect=fake_urlopen):
             value = resolve_effective_context_window(self.config, "gpt-oss:20b")
 
         self.assertEqual(value, 24576)
@@ -63,7 +63,7 @@ class LlmContextWindowTests(unittest.TestCase):
             payload = responses.pop(0)
             return _FakeResponse(json.dumps(payload).encode("utf-8"))
 
-        with patch("atlas_local.llm.request.urlopen", side_effect=fake_urlopen):
+        with patch("atlas_local.llm.provider_urlopen", side_effect=fake_urlopen):
             value = resolve_effective_context_window(self.config, "gpt-oss:20b")
 
         self.assertEqual(value, 8192)

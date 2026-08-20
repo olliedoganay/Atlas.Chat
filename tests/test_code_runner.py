@@ -1,3 +1,5 @@
+import json
+import os
 import queue
 import subprocess
 import tempfile
@@ -14,11 +16,19 @@ from atlas_local.code_runner import (
     LANGUAGES,
     LEGACY_PYTHON_GUI_IMAGES,
     PYTHON_GUI_IMAGE,
+    PYTHON_GUI_RUNTIME_ALLOWED_PACKAGES,
+    PYTHON_GUI_RUNTIME_CONTEXT,
+    PYTHON_GUI_RUNTIME_NAME,
+    PYTHON_GUI_RUNTIME_VERSION,
+    PythonGuiRuntimeManager,
     RUNNER_INTERNAL_NETWORK,
     RUNNER_MAX_CODE_BYTES,
     RunPlan,
     RunnerProcess,
     _ensure_internal_network,
+    _inspect_python_gui_runtime,
+    _python_gui_runtime_definition_hash,
+    prepare_runner_runtime,
     resolve_plan,
     _remove_legacy_python_gui_images,
     _runner_network_policy,
@@ -132,7 +142,7 @@ class CodeRunnerPolicyTests(unittest.TestCase):
         self.assertEqual(response["filesystem_mode"], "read-only")
         self.assertEqual(response["timeout_seconds"], 120)
 
-    def test_start_returns_web_url_for_web_plan(self) -> None:
+    def test_offline_web_plan_does_not_load_model_html_in_host_webview(self) -> None:
         captured: dict[str, list[str]] = {}
 
         class FakeProcess:
@@ -172,16 +182,67 @@ class CodeRunnerPolicyTests(unittest.TestCase):
                 _wait_for_runner_cleanup(Path(tmp))
 
         args = captured["args"]
-        self.assertEqual(
+        self.assertRegex(
             args[args.index("--network") + 1],
-            RUNNER_INTERNAL_NETWORK,
+            rf"^{RUNNER_INTERNAL_NETWORK}-[0-9a-f]{{16}}$",
         )
         self.assertIn("-p", args)
         self.assertIn("127.0.0.1:12345:5000", args)
-        self.assertEqual(response["web_url"], "http://127.0.0.1:12345/")
+        self.assertNotIn("web_url", response)
+        self.assertTrue(response["web_preview_disabled"])
         self.assertFalse(response["outbound_network"])
 
-    def test_gui_start_keeps_only_package_install_capabilities(self) -> None:
+    def test_explicit_bridge_web_plan_returns_web_url(self) -> None:
+        class FakeProcess:
+            stdout: list[str] = []
+            stderr: list[str] = []
+
+            def wait(self) -> int:
+                return 0
+
+            def kill(self) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = RunPlan(
+                image="python:3.12-slim",
+                filename="main.py",
+                command=["python", "/work/main.py"],
+                ports={12345: 5000},
+                web_container_port=5000,
+            )
+            with (
+                patch.dict("os.environ", {"ATLAS_RUNNER_NETWORK": "bridge"}),
+                patch("atlas_local.code_runner._docker_binary", return_value="docker"),
+                patch("atlas_local.code_runner.resolve_plan", return_value=plan),
+                patch(
+                    "atlas_local.code_runner.subprocess.Popen",
+                    return_value=FakeProcess(),
+                ),
+                patch(
+                    "atlas_local.code_runner.subprocess.run",
+                    return_value=SimpleNamespace(
+                        returncode=0,
+                        stdout="",
+                        stderr="",
+                    ),
+                ),
+                patch(
+                    "atlas_local.code_runner.tempfile.mkdtemp",
+                    return_value=tmp,
+                ),
+            ):
+                response = CodeRunner().start("python", "print('hello')")
+                _wait_for_runner_cleanup(Path(tmp))
+
+        self.assertEqual(
+            response["web_url"],
+            "http://127.0.0.1:12345/",
+        )
+        self.assertTrue(response["outbound_network"])
+        self.assertNotIn("web_preview_disabled", response)
+
+    def test_prepared_gui_start_stays_non_root_read_only_and_capability_free(self) -> None:
         captured: dict[str, list[str]] = {}
 
         class FakeProcess:
@@ -205,11 +266,16 @@ class CodeRunnerPolicyTests(unittest.TestCase):
                 command=["sh", "-c", "echo gui"],
                 ports={12345: 6080},
                 gui=True,
-                uses_apt=True,
+                isolated_gui_preview=True,
+                runtime=PYTHON_GUI_RUNTIME_NAME,
             )
             with (
                 patch("atlas_local.code_runner._docker_binary", return_value="docker"),
                 patch("atlas_local.code_runner.resolve_plan", return_value=plan),
+                patch(
+                    "atlas_local.code_runner._python_gui_runtime_manager.status",
+                    return_value={"state": "ready"},
+                ),
                 patch("atlas_local.code_runner._ensure_internal_network"),
                 patch("atlas_local.code_runner.subprocess.Popen", side_effect=fake_popen),
                 patch(
@@ -227,9 +293,55 @@ class CodeRunnerPolicyTests(unittest.TestCase):
             for index, value in enumerate(args)
             if value == "--cap-add" and index + 1 < len(args)
         ]
-        self.assertEqual(added_caps, ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"])
-        self.assertNotIn("--read-only", args)
-        self.assertNotIn("--user", args)
+        self.assertEqual(added_caps, [])
+        self.assertIn("--read-only", args)
+        self.assertIn("--user", args)
+        self.assertEqual(args[args.index("--user") + 1], "65534:65534")
+        self.assertIn("--cap-drop", args)
+        self.assertEqual(args[args.index("--cap-drop") + 1], "ALL")
+        self.assertIn("no-new-privileges", args)
+        self.assertTrue(any(value.endswith(":/work:ro") for value in args))
+
+    def test_gui_preview_fails_closed_without_privilege_boundary(self) -> None:
+        plan = RunPlan(
+            image=PYTHON_GUI_IMAGE,
+            filename="main.py",
+            command=["sh", "-c", "echo unsafe"],
+            ports={12345: 6080},
+            gui=True,
+            uses_apt=True,
+        )
+        with (
+            patch("atlas_local.code_runner._docker_binary", return_value="docker"),
+            patch("atlas_local.code_runner.resolve_plan", return_value=plan),
+            patch("atlas_local.code_runner.subprocess.Popen") as popen,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "privilege boundary"):
+                CodeRunner().start("python", "print('hello')")
+        popen.assert_not_called()
+
+    def test_gui_start_fails_closed_until_prepared_runtime_is_ready(self) -> None:
+        plan = RunPlan(
+            image=PYTHON_GUI_IMAGE,
+            filename="main.py",
+            command=["sh", "-c", "echo gui"],
+            ports={12345: 6080},
+            gui=True,
+            isolated_gui_preview=True,
+            runtime=PYTHON_GUI_RUNTIME_NAME,
+        )
+        with (
+            patch("atlas_local.code_runner._docker_binary", return_value="docker"),
+            patch("atlas_local.code_runner.resolve_plan", return_value=plan),
+            patch(
+                "atlas_local.code_runner._python_gui_runtime_manager.status",
+                return_value={"state": "preparing"},
+            ),
+            patch("atlas_local.code_runner.subprocess.Popen") as popen,
+            self.assertRaisesRegex(RuntimeError, "runtime is not ready"),
+        ):
+            CodeRunner().start("python", "import pygame")
+        popen.assert_not_called()
 
     def test_docker_commands_do_not_use_login_shells(self) -> None:
         for language, spec in LANGUAGES.items():
@@ -503,6 +615,40 @@ class CodeRunnerPolicyTests(unittest.TestCase):
         self.assertEqual(sum("output truncated" in chunk for chunk in chunks), 1)
         self.assertEqual(output_runner.output_bytes, 4)
 
+    def test_active_run_count_includes_starting_and_unfinished_runs_only(self) -> None:
+        runner = CodeRunner()
+        runner._starting_names.add("atlas-run-starting")
+        active = RunnerProcess(
+            run_id="active",
+            language="python",
+            container_name="atlas-run-active",
+            work_dir=Path(tempfile.gettempdir()) / "atlas-run-active-test",
+            started_at=time.time(),
+            timeout_seconds=120,
+            network="none",
+            process=SimpleNamespace(),
+            history_limit=10,
+            subscriber_queue_size=2,
+            max_output_bytes=100,
+        )
+        finished = RunnerProcess(
+            run_id="finished",
+            language="python",
+            container_name="atlas-run-finished",
+            work_dir=Path(tempfile.gettempdir()) / "atlas-run-finished-test",
+            started_at=time.time(),
+            timeout_seconds=120,
+            network="none",
+            process=SimpleNamespace(),
+            history_limit=10,
+            subscriber_queue_size=2,
+            max_output_bytes=100,
+            finished=True,
+        )
+        runner._runs = {active.run_id: active, finished.run_id: finished}
+
+        self.assertEqual(runner.active_run_count(), 2)
+
     def test_cleanup_removes_current_and_dead_owner_containers_but_preserves_live_owners(self) -> None:
         runner = CodeRunner()
         removed: list[str] = []
@@ -543,6 +689,96 @@ class CodeRunnerPolicyTests(unittest.TestCase):
 
         self.assertEqual(set(removed), {"owned-current", "owned-dead"})
 
+    def test_cleanup_removes_only_stale_labeled_atlas_networks_and_is_idempotent(
+        self,
+    ) -> None:
+        runner = CodeRunner()
+        active = f"{RUNNER_INTERNAL_NETWORK}-aaaaaaaaaaaaaaaa"
+        dead = f"{RUNNER_INTERNAL_NETWORK}-bbbbbbbbbbbbbbbb"
+        live = f"{RUNNER_INTERNAL_NETWORK}-cccccccccccccccc"
+        unlabeled = f"{RUNNER_INTERNAL_NETWORK}-dddddddddddddddd"
+        owned = f"{RUNNER_INTERNAL_NETWORK}-eeeeeeeeeeeeeeee"
+        legacy = RUNNER_INTERNAL_NETWORK
+        invalid_name = f"{RUNNER_INTERNAL_NETWORK}-not-a-run-id"
+        removed: set[str] = set()
+        labels = {
+            active: {
+                "atlas.runner.network": "1",
+                "atlas.runner.owner_id": runner._owner_id,
+                "atlas.runner.owner_pid": str(os.getpid()),
+            },
+            dead: {
+                "atlas.runner.network": "1",
+                "atlas.runner.owner_id": "other",
+                "atlas.runner.owner_pid": "222",
+            },
+            live: {
+                "atlas.runner.network": "1",
+                "atlas.runner.owner_id": "other",
+                "atlas.runner.owner_pid": "333",
+            },
+            unlabeled: {
+                "atlas.runner.owner_id": runner._owner_id,
+                "atlas.runner.owner_pid": str(os.getpid()),
+            },
+            owned: {
+                "atlas.runner.network": "1",
+                "atlas.runner.owner_id": runner._owner_id,
+                "atlas.runner.owner_pid": str(os.getpid()),
+            },
+            legacy: {
+                "atlas.runner.network": "1",
+            },
+        }
+        runner._starting_names.add("atlas-run-aaaaaaaaaaaaaaaa")
+
+        def fake_run(args, **_kwargs):
+            if args[1:3] == ["network", "ls"]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="\n".join(
+                        [
+                            active,
+                            dead,
+                            live,
+                            unlabeled,
+                            owned,
+                            legacy,
+                            invalid_name,
+                        ]
+                    ),
+                    stderr="",
+                )
+            if args[1:3] == ["network", "inspect"]:
+                name = args[3]
+                if name in removed:
+                    return SimpleNamespace(returncode=1, stdout="", stderr="not found")
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps(labels.get(name, {})),
+                    stderr="",
+                )
+            if args[1:3] == ["network", "rm"]:
+                removed.add(args[-1])
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            raise AssertionError(f"Unexpected command: {args}")
+
+        with (
+            patch("atlas_local.code_runner.subprocess.run", side_effect=fake_run),
+            patch(
+                "atlas_local.code_runner._process_is_alive",
+                side_effect=lambda pid: pid == 333,
+            ),
+        ):
+            runner._cleanup_stale_networks("docker")
+            runner._cleanup_stale_networks("docker")
+
+        self.assertEqual(removed, {dead, owned, legacy})
+        self.assertNotIn(active, removed)
+        self.assertNotIn(live, removed)
+        self.assertNotIn(unlabeled, removed)
+        self.assertNotIn(invalid_name, removed)
+
     def test_python_generated_runner_script_is_valid_shell_syntax(self) -> None:
         plan = resolve_plan("python", "name = 'requests'\nmodule = __import__(name)\nprint(module)")
 
@@ -570,51 +806,233 @@ class CodeRunnerPolicyTests(unittest.TestCase):
         self.assertEqual(removed_images, list(LEGACY_PYTHON_GUI_IMAGES))
         self.assertNotIn(PYTHON_GUI_IMAGE, removed_images)
 
-    def test_python_gui_uses_disposable_base_image_and_runtime_dependencies(self) -> None:
+    def test_python_gui_runtime_definition_is_checked_in_and_hash_locked(self) -> None:
+        dockerfile = (PYTHON_GUI_RUNTIME_CONTEXT / "Dockerfile").read_text(encoding="utf-8")
+        requirements = (PYTHON_GUI_RUNTIME_CONTEXT / "runtime-requirements.txt").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertRegex(_python_gui_runtime_definition_hash(), r"^[0-9a-f]{64}$")
+        self.assertIn("FROM docker.io/library/python:3.12.13-slim-bookworm@sha256:", dockerfile)
+        self.assertIn("ATLAS_RUNTIME_DEFINITION_SHA256", dockerfile)
+        self.assertIn("USER 65534:65534", dockerfile)
+        self.assertIn("numpy==2.5.2", requirements)
+        self.assertIn("pygame==2.6.1", requirements)
+        self.assertIn("--hash=sha256:", requirements)
+        self.assertEqual(
+            PYTHON_GUI_RUNTIME_ALLOWED_PACKAGES,
+            {"numpy": "2.5.2", "pygame": "2.6.1"},
+        )
+
+    def test_python_gui_runtime_inspection_requires_matching_definition_labels(self) -> None:
+        matching = {
+            "Config": {
+                "Labels": {
+                    "com.atlas.runner.runtime": PYTHON_GUI_RUNTIME_NAME,
+                    "com.atlas.runner.runtime.version": PYTHON_GUI_RUNTIME_VERSION,
+                    "com.atlas.runner.runtime.definition-sha256": "definition-hash",
+                }
+            },
+            "Size": 1234,
+        }
+        with (
+            patch(
+                "atlas_local.code_runner._python_gui_runtime_definition_hash",
+                return_value="definition-hash",
+            ),
+            patch(
+                "atlas_local.code_runner.subprocess.run",
+                return_value=SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps([matching]),
+                    stderr="",
+                ),
+            ),
+        ):
+            self.assertEqual(_inspect_python_gui_runtime("docker"), (True, 1234, None))
+
+        matching["Config"]["Labels"][
+            "com.atlas.runner.runtime.definition-sha256"
+        ] = "stale"
+        with (
+            patch(
+                "atlas_local.code_runner._python_gui_runtime_definition_hash",
+                return_value="definition-hash",
+            ),
+            patch(
+                "atlas_local.code_runner.subprocess.run",
+                return_value=SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps([matching]),
+                    stderr="",
+                ),
+            ),
+        ):
+            ready, size, error = _inspect_python_gui_runtime("docker")
+
+        self.assertFalse(ready)
+        self.assertEqual(size, 1234)
+        self.assertIn("stale", error or "")
+
+    def test_python_gui_runtime_preparation_is_deduplicated(self) -> None:
+        starts: list[tuple[object, tuple[object, ...]]] = []
+
+        class FakeThread:
+            def __init__(self, *, target, args, **_kwargs):
+                self.target = target
+                self.args = args
+
+            def start(self) -> None:
+                starts.append((self.target, self.args))
+
+        manager = PythonGuiRuntimeManager()
+        with (
+            patch("atlas_local.code_runner._docker_binary", return_value="docker"),
+            patch(
+                "atlas_local.code_runner._inspect_python_gui_runtime",
+                return_value=(False, None, None),
+            ),
+            patch("atlas_local.code_runner.threading.Thread", FakeThread),
+        ):
+            first = manager.prepare()
+            second = manager.prepare()
+
+        self.assertTrue(first["started"])
+        self.assertFalse(second["started"])
+        self.assertEqual(first["state"], "preparing")
+        self.assertEqual(second["state"], "preparing")
+        self.assertEqual(len(starts), 1)
+        self.assertFalse(first["submitted_code_used_during_preparation"])
+
+    def test_python_gui_runtime_build_uses_only_trusted_context(self) -> None:
+        captured: dict[str, list[str]] = {}
+
+        class FakeProcess:
+            stdout: list[str] = []
+
+            def wait(self) -> int:
+                return 0
+
+        def fake_popen(args, **_kwargs):
+            captured["args"] = args
+            return FakeProcess()
+
+        manager = PythonGuiRuntimeManager()
+        with (
+            patch("atlas_local.code_runner.subprocess.Popen", side_effect=fake_popen),
+            patch(
+                "atlas_local.code_runner._inspect_python_gui_runtime",
+                return_value=(True, 1234, None),
+            ),
+        ):
+            manager._build("docker")
+
+        args = captured["args"]
+        self.assertEqual(args[:3], ["docker", "build", "--pull"])
+        self.assertEqual(args[-1], str(PYTHON_GUI_RUNTIME_CONTEXT))
+        self.assertIn(str(PYTHON_GUI_RUNTIME_CONTEXT / "Dockerfile"), args)
+        self.assertIn(PYTHON_GUI_IMAGE, args)
+        self.assertFalse(any("atlas-run-" in value for value in args))
+        self.assertEqual(manager.status("docker")["state"], "ready")
+
+    def test_runner_runtime_preparation_rejects_unbundled_gui_dependencies_early(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "does not include.*customtkinter"):
+            prepare_runner_runtime("python", "import customtkinter")
+
+        with patch(
+            "atlas_local.code_runner.prepare_python_gui_runtime",
+            return_value={"state": "preparing", "started": True},
+        ):
+            prepared = prepare_runner_runtime("python", "import pygame")
+
+        self.assertTrue(prepared["required"])
+        self.assertTrue(prepared["started"])
+        self.assertEqual(prepared["runtime"]["state"], "preparing")
+
+    def test_python_gui_uses_versioned_prepared_runtime_without_live_installs(self) -> None:
         plan = resolve_plan("python", "import tkinter\nroot = tkinter.Tk()\nroot.mainloop()")
 
-        self.assertEqual(PYTHON_GUI_IMAGE, "docker.io/library/python:3.12-slim")
+        self.assertEqual(
+            PYTHON_GUI_IMAGE,
+            f"localhost/atlas-python-gui-runtime:{PYTHON_GUI_RUNTIME_VERSION}",
+        )
         self.assertIn("atlas-python-gui:workspace1", LEGACY_PYTHON_GUI_IMAGES)
         self.assertIn("atlas-python-gui:workspace2", LEGACY_PYTHON_GUI_IMAGES)
         self.assertNotIn(PYTHON_GUI_IMAGE, LEGACY_PYTHON_GUI_IMAGES)
         self.assertEqual(plan.image, PYTHON_GUI_IMAGE)
-        self.assertIn("apt-get install", plan.command[-1])
+        self.assertEqual(plan.runtime, PYTHON_GUI_RUNTIME_NAME)
+        self.assertTrue(plan.isolated_gui_preview)
+        self.assertFalse(plan.uses_apt)
+        self.assertFalse(plan.requires_network)
+        self.assertNotIn("apt-get", plan.command[-1])
+        self.assertNotIn("pip install", plan.command[-1])
+        self.assertIn("prepared offline Python GUI runtime", plan.command[-1])
         self.assertIn("session.screen0.workspaces: 1", plan.command[-1])
-        self.assertIn("fluxbox -rc /root/.fluxbox/init", plan.command[-1])
-        self.assertIn("tcl8.6", plan.command[-1])
-        self.assertIn("tk8.6", plan.command[-1])
+        self.assertIn("fluxbox -rc /tmp/atlas-fluxbox-init", plan.command[-1])
+        self.assertNotIn("/root/.fluxbox", plan.command[-1])
+        self.assertEqual(plan.unsupported_packages, ())
 
-    def test_python_gui_plan_installs_gui_dependencies_on_demand(self) -> None:
+    def test_python_gui_separates_preview_services_and_submitted_code(self) -> None:
+        plan = resolve_plan("python", "import pygame\npygame.display.set_mode((400, 300))")
+        script = plan.command[-1]
+
+        self.assertTrue(plan.isolated_gui_preview)
+        self.assertEqual(plan.requested_packages, ("pygame",))
+        self.assertEqual(plan.unsupported_packages, ())
+        self.assertNotIn("chown", script)
+        self.assertNotIn("setpriv", script)
+        self.assertNotIn("apt-get", script)
+        self.assertNotIn("pip install", script)
+        self.assertRegex(
+            script,
+            r"env HOME=/tmp/atlas-web-home .* websockify --web /usr/share/novnc",
+        )
+        self.assertRegex(script, r"env HOME=/tmp/atlas-display-home .* Xvfb :99")
+        self.assertRegex(script, r"env HOME=/tmp/atlas-display-home .* x11vnc -display :99")
+        self.assertRegex(
+            script,
+            r"env HOME=/tmp/atlas-user .* python /tmp/atlas_python_repair.py "
+            r"python -u /tmp/main.py",
+        )
+        self.assertIn("offline GUI runtime does not include", script)
+
+    def test_python_gui_plan_uses_bundled_pygame_offline(self) -> None:
         plan = resolve_plan("python", "import pygame\npygame.display.set_mode((400, 300))")
 
         self.assertEqual(plan.image, PYTHON_GUI_IMAGE)
         self.assertTrue(plan.gui)
-        self.assertTrue(plan.uses_apt)
-        self.assertTrue(plan.requires_network)
+        self.assertFalse(plan.uses_apt)
+        self.assertFalse(plan.requires_network)
+        self.assertEqual(plan.runtime, PYTHON_GUI_RUNTIME_NAME)
+        self.assertEqual(plan.requested_packages, ("pygame",))
+        self.assertEqual(plan.unsupported_packages, ())
 
     def test_python_pygame_import_uses_gui_runner_even_without_literal_display_call(self) -> None:
         plan = resolve_plan("python", "import pygame\npygame.init()\nprint('ready')")
 
         self.assertTrue(plan.gui)
-        self.assertTrue(plan.uses_apt)
-        self.assertIn("libsdl2-2.0-0", plan.command[-1])
-        self.assertIn("pygame", plan.command[-1])
+        self.assertFalse(plan.uses_apt)
+        self.assertFalse(plan.requires_network)
+        self.assertNotIn("libsdl2-2.0-0", plan.command[-1])
+        self.assertIn("prepared offline Python GUI runtime", plan.command[-1])
 
     def test_python_input_script_uses_terminal_vnc_runner(self) -> None:
         plan = resolve_plan("python", "name = input('Name: ')\nprint(name)")
 
         self.assertTrue(plan.gui)
-        self.assertTrue(plan.uses_apt)
+        self.assertFalse(plan.uses_apt)
+        self.assertFalse(plan.requires_network)
+        self.assertEqual(plan.unsupported_packages, ())
         self.assertIn("xterm", plan.command[-1])
         self.assertIn("TERM=xterm-256color", plan.command[-1])
         self.assertIn("starting terminal UI in virtual display", plan.command[-1])
 
-    def test_click_cli_uses_terminal_vnc_runner(self) -> None:
+    def test_click_cli_is_rejected_when_not_bundled_in_offline_runtime(self) -> None:
         plan = resolve_plan("python", "import click\nname = click.prompt('Name')\nprint(name)")
 
         self.assertTrue(plan.gui)
-        self.assertTrue(plan.requires_network)
-        self.assertIn("click", plan.command[-1])
+        self.assertFalse(plan.requires_network)
+        self.assertEqual(plan.unsupported_packages, ("click",))
         self.assertIn("xterm", plan.command[-1])
 
     def test_curses_import_uses_terminal_vnc_runner(self) -> None:
@@ -622,20 +1040,20 @@ class CodeRunnerPolicyTests(unittest.TestCase):
 
         self.assertEqual(plan.image, PYTHON_GUI_IMAGE)
         self.assertTrue(plan.gui)
-        self.assertTrue(plan.uses_apt)
-        self.assertTrue(plan.requires_network)
+        self.assertFalse(plan.uses_apt)
+        self.assertFalse(plan.requires_network)
+        self.assertEqual(plan.unsupported_packages, ())
         self.assertIn("xterm", plan.command[-1])
-        self.assertIn("ncurses-term", plan.command[-1])
         self.assertIn("TERM=xterm-256color", plan.command[-1])
         self.assertIn("starting terminal UI in virtual display", plan.command[-1])
         self.assertNotIn("pip install", plan.command[-1])
 
-    def test_textual_import_uses_terminal_vnc_runner(self) -> None:
+    def test_textual_import_is_rejected_when_not_bundled_in_offline_runtime(self) -> None:
         plan = resolve_plan("python", "from textual.app import App\nclass Demo(App): pass\nDemo().run()")
 
         self.assertTrue(plan.gui)
-        self.assertTrue(plan.requires_network)
-        self.assertIn("textual", plan.command[-1])
+        self.assertFalse(plan.requires_network)
+        self.assertEqual(plan.unsupported_packages, ("textual",))
         self.assertIn("xterm", plan.command[-1])
 
     def test_stdlib_python_keeps_default_network_isolation(self) -> None:
@@ -790,21 +1208,22 @@ class CodeRunnerPolicyTests(unittest.TestCase):
         self.assertEqual(plan.web_container_port, 8000)
         self.assertIn(8000, plan.ports.values())
 
-    def test_customtkinter_import_triggers_pip_and_tk_system_dependencies(self) -> None:
+    def test_customtkinter_import_is_rejected_when_not_bundled(self) -> None:
         plan = resolve_plan("python", "import customtkinter as ctk\napp = ctk.CTk()\napp.mainloop()")
 
         self.assertTrue(plan.gui)
-        self.assertTrue(plan.uses_apt)
-        self.assertTrue(plan.requires_network)
-        self.assertIn("customtkinter", plan.command[-1])
-        self.assertIn("tcl8.6", plan.command[-1])
+        self.assertFalse(plan.uses_apt)
+        self.assertFalse(plan.requires_network)
+        self.assertEqual(plan.unsupported_packages, ("customtkinter",))
 
     def test_tkinter_import_uses_gui_runner_for_system_tk_deps(self) -> None:
         plan = resolve_plan("python", "import tkinter as tk\nprint('cli mode')")
 
         self.assertEqual(plan.image, PYTHON_GUI_IMAGE)
         self.assertTrue(plan.gui)
-        self.assertTrue(plan.uses_apt)
+        self.assertFalse(plan.uses_apt)
+        self.assertFalse(plan.requires_network)
+        self.assertEqual(plan.unsupported_packages, ())
 
     def test_tkinter_from_import_uses_gui_runner_for_system_tk_deps(self) -> None:
         plan = resolve_plan("python", "from tkinter import ttk\nprint('cli mode')")

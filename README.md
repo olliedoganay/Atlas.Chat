@@ -7,7 +7,7 @@
 
 Atlas Chat is a local-first desktop app for working with local AI models. It provides a multi-thread chat workspace, profile-scoped memory, hardware-aware model discovery, run inspection, and a built-in code runner while keeping Atlas-managed state on the local machine.
 
-Current version: `1.2.0`
+Current version: `1.3.0`
 
 <p align="center">
   <img src="docs/assets/atlas-chat-workspace.png" alt="Atlas Chat workspace" style="max-width: 100%; height: auto;">
@@ -239,7 +239,7 @@ For desktop use, prefer **Settings > Connections** for the chat provider, local 
 | `LANGGRAPH_CHECKPOINT_DB` | SQLite checkpoint path for thread state | `.data/langgraph/checkpoints.sqlite` |
 | `MEM0_HISTORY_DB` | SQLite history path for memory records | `.data/mem0_history.sqlite` |
 | `MEMORY_TOP_K` | Number of recalled memories to inject into a turn | `5` |
-| `ATLAS_COMPACTION_TIMEOUT_SECONDS` | Max seconds to wait for a model-backed context compaction before falling back | `25` |
+| `ATLAS_COMPACTION_TIMEOUT_SECONDS` | Max seconds to wait for a model-backed context compaction before leaving the existing context unchanged | `25` |
 
 Runtime overrides:
 
@@ -252,6 +252,7 @@ Runtime overrides:
 | `ATLAS_API_PORT` | Port for direct backend runs | `8765` |
 | `ATLAS_ALLOWED_ORIGINS` | Comma-separated explicit origin allowlist override | built-in Tauri/dev origins |
 | `ATLAS_ALLOW_INSECURE_LOCALHOST` | Allow localhost-only direct backend development without the managed instance token | off |
+| `ATLAS_ALLOW_LEGACY_PLAINTEXT_MIGRATION` | Explicit one-launch opt-in to import pre-encryption run indexes/artifacts; remove immediately after migration | off |
 | `ATLAS_DISCOVERY_MANIFEST` | Optional path to a versioned Discovery recommendation manifest | bundled manifest |
 | `ATLAS_RUNNER_NETWORK` | Docker network mode for code runs; `none` or `bridge` | `none` |
 | `ATLAS_RUNNER_TIMEOUT_SECONDS` | Non-GUI code-runner timeout in seconds | `120` |
@@ -272,16 +273,18 @@ Runnable code blocks get a **Run** button next to **Copy**. Clicking it opens a 
 
 Server-side languages run through Docker: Python, JavaScript, TypeScript, Go, Rust, C, C++, Java, Ruby, PHP, Bash, C#, Kotlin, Swift, Perl, Lua, R, Elixir, and Dart. The first run for a language may need its Docker image to be downloaded, which can use substantial disk space.
 
-HTML renders in a sandboxed client-side preview and does not require Docker.
+HTML renders in a sandboxed, offline-by-default client-side preview and does not require Docker.
 
 Runner behavior:
 
-- Outbound access is never enabled implicitly. `ATLAS_RUNNER_NETWORK=none` keeps ordinary runs offline; dependency-aware runs warn instead of silently switching networks. Set `ATLAS_RUNNER_NETWORK=bridge` only when the submitted code may access the network.
-- GUI and web previews use an Atlas-owned internal Docker network when outbound access is disabled, so their loopback preview ports work without internet routing.
-- Dependencies are installed on demand based on snippet imports only when outbound network access is explicitly enabled for the run.
-- Python GUI snippets can open a live embedded noVNC view for supported toolkits. GUI system packages are installed inside the disposable run container only when needed.
+- Outbound access is never enabled implicitly. HTML previews block remote scripts, requests, media, and form submissions. `ATLAS_RUNNER_NETWORK=none` keeps Docker runs offline; dependency-aware runs warn instead of silently switching networks. Set `ATLAS_RUNNER_NETWORK=bridge` only when submitted Docker code may access the network.
+- GUI previews use an Atlas-owned internal Docker network when outbound access is disabled. Server-generated web pages are not loaded into the host WebView in this mode; their browser preview is available only with the explicit `ATLAS_RUNNER_NETWORK=bridge` opt-in because browser-side requests are outside Docker's network boundary.
+- Non-GUI dependency-aware runs attempt on-demand installation under the configured network policy. With `none`, Atlas warns and the download normally fails without widening access; `bridge` must be selected explicitly for package resolution.
+- Python GUI snippets use the versioned Atlas Python GUI runtime. On first use, the runner can build it from the checked-in Dockerfile and hash-locked allowlist while showing preparation progress. This trusted preparation phase may download the pinned base image and dependencies, but it never mounts or executes submitted code and concurrent requests share one build.
+- The prepared GUI runtime currently bundles `pygame==2.6.1`, its `numpy==2.5.2` optional array/audio support, and the fixed Tk, SDL, terminal, and noVNC system stack. GUI snippets that request any undeclared third-party package fail before execution with an actionable offline-runtime error; Atlas does not grant the snippet network access or run apt/pip for it.
+- Submitted Python GUI code runs in a separate disposable container as UID 65534 with a read-only root filesystem and source mount, all capabilities dropped, `no-new-privileges`, and only Atlas's internal preview network. The prepared image remains cached for later offline GUI runs.
 - Docker-backed runs use fully qualified, versioned images and disposable containers with CPU, memory, PID, file-size, timeout, output, queue, and concurrency controls. Containers drop capabilities, enable `no-new-privileges`, and use a read-only root filesystem plus an unprivileged user for compatible workloads.
-- Closing the run window stops its owned container and removes the run-installed dependencies with it; Atlas also cleans up owned containers during backend shutdown. Docker may still keep the base language image.
+- Closing the run window stops its owned container and removes any per-run installed dependencies with it; Atlas also cleans up owned containers during backend shutdown. Docker may keep base language images and the versioned prepared GUI runtime.
 - `ATLAS_RUNNER_TIMEOUT_SECONDS` controls non-GUI run TTL and `ATLAS_RUNNER_GUI_TIMEOUT_SECONDS` controls GUI run TTL.
 - If Docker is unavailable, Atlas shows a retry path in the run window.
 
@@ -295,7 +298,9 @@ Atlas is built as a local desktop system:
 - The backend rejects unexpected origins unless explicitly configured for direct localhost development.
 - The selected model provider is expected to run locally on the same machine.
 - Provider API credentials are never returned through the settings API; Atlas reports only whether a protected key is configured.
-- Local state is stored under Atlas-managed directories, with additional at-rest protection where supported.
+- Sensitive Atlas-managed state fails closed when secure operating-system key storage is unavailable; it is not silently written as plaintext.
+
+Very old Atlas data from before encrypted run storage is rejected by default. To migrate it, launch Atlas once with `ATLAS_ALLOW_LEGACY_PLAINTEXT_MIGRATION=1`, verify the data, then remove the variable. The opt-in deliberately permits unauthenticated legacy input and must not remain enabled.
 
 For source runs, local data is written under `.data/`. Packaged builds use the app data directory for the current user.
 

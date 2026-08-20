@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 
 type BackendRuntime = {
   host: string;
@@ -6,6 +6,9 @@ type BackendRuntime = {
   token: string;
   baseUrl?: string;
 };
+
+const API_READ_REQUEST_TIMEOUT_MS = 15_000;
+const API_MUTATION_REQUEST_TIMEOUT_MS = 60_000;
 
 let runtimePromise: Promise<BackendRuntime> | null = null;
 let lastRuntime: BackendRuntime | null = null;
@@ -120,6 +123,7 @@ export type ModelCatalog = {
   models: string[];
   model_details: Array<{
     name: string;
+    size_bytes?: number | null;
     family?: string;
     families?: string[];
     capabilities?: string[];
@@ -134,6 +138,8 @@ export type ProviderSettings = {
   provider_label: string;
   base_url: string;
   has_api_key: boolean;
+  api_key_unavailable?: boolean;
+  base_url_invalid?: boolean;
   secure_key_storage_available: boolean;
   restart_required?: boolean;
   providers: Array<{
@@ -206,6 +212,8 @@ export type DiscoveryReport = {
     atlas_role: "chat" | "embedding";
     installed: boolean;
     supports_images: boolean;
+    supports_reasoning: boolean;
+    model_size_gb?: number | null;
     fit: "good" | "tight" | "cpu-only" | "unavailable" | "too-large";
     runtime: "GPU" | "Hybrid" | "CPU" | "Unknown";
     reason: string;
@@ -217,6 +225,8 @@ export type RunStatusEvent = {
   type: string;
   timestamp: string;
   payload: Record<string, unknown>;
+  sequence?: number;
+  sequence_end?: number;
 };
 
 export type RunTraceItem = {
@@ -300,6 +310,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     return await requestWithRuntime<T>(primaryRuntime, path, init);
   } catch (error) {
     invalidateBackendRuntime();
+    if (!isReadOnlyRequest(init)) {
+      throw error;
+    }
     const refreshedRuntime = await getBackendRuntime();
     const changedRuntime =
       refreshedRuntime.host !== primaryRuntime.host ||
@@ -581,6 +594,9 @@ export function resetAll() {
 
 export type RunnerStatus = {
   available: boolean;
+  busy: boolean;
+  active_runs: number;
+  runtime_preparing: boolean;
   reason?: string;
   server_version?: string;
   supported_languages: string[];
@@ -598,12 +614,46 @@ export type RunnerStartResponse = {
   web_url?: string;
 };
 
+export type RunnerRuntimeStatus = {
+  name: "python-gui";
+  version: string;
+  image: string;
+  state: "missing" | "preparing" | "ready" | "failed" | "unavailable";
+  message: string;
+  error?: string | null;
+  progress: number;
+  started_at?: number | null;
+  completed_at?: number | null;
+  image_size_bytes?: number | null;
+  bundled_packages: string[];
+  execution_network: "internal-preview-only";
+  submitted_code_used_during_preparation: false;
+  log_tail: string[];
+};
+
+export type RunnerRuntimePreparation = {
+  required: boolean;
+  started: boolean;
+  runtime: RunnerRuntimeStatus | null;
+};
+
 export type RunnerEvent =
   | { type: "output"; stream: "stdout" | "stderr"; chunk: string }
   | { type: "exit"; code: number; duration_ms: number };
 
 export function getRunnerStatus() {
   return request<RunnerStatus>("/runner/status");
+}
+
+export function getPythonGuiRuntimeStatus() {
+  return request<RunnerRuntimeStatus>("/runner/runtime/python-gui");
+}
+
+export function prepareRunnerRuntime(language: string, code: string) {
+  return request<RunnerRuntimePreparation>("/runner/runtime/prepare", {
+    method: "POST",
+    body: JSON.stringify({ language, code }),
+  });
 }
 
 export function execCode(language: string, code: string) {
@@ -626,6 +676,7 @@ export function streamRunnerRun(
 ): () => void {
   const controller = new AbortController();
   let closed = false;
+  let sawExitEvent = false;
 
   void getBackendRuntime()
     .then((runtime) => {
@@ -673,12 +724,11 @@ export function streamRunnerRun(
             if (!dataLines.length) {
               return;
             }
-            try {
-              const parsed = JSON.parse(dataLines.join("\n")) as RunnerEvent;
-              onEvent(parsed);
-            } catch (error) {
-              onError(error instanceof Error ? error.message : "Failed to parse runner event.");
+            const parsed = JSON.parse(dataLines.join("\n")) as RunnerEvent;
+            if (parsed.type === "exit") {
+              sawExitEvent = true;
             }
+            onEvent(parsed);
           };
 
           while (!closed) {
@@ -700,6 +750,10 @@ export function streamRunnerRun(
               break;
             }
           }
+
+          if (!closed && !sawExitEvent) {
+            throw new Error("Runner stream disconnected.");
+          }
         })
         .catch((error) => {
           if (closed || controller.signal.aborted) {
@@ -709,6 +763,9 @@ export function streamRunnerRun(
         });
     })
     .catch((error) => {
+      if (closed || controller.signal.aborted) {
+        return;
+      }
       onError(error instanceof Error ? error.message : "Atlas runtime is unavailable.");
     });
 
@@ -727,103 +784,184 @@ export function streamRun(
   const controller = new AbortController();
   let closed = false;
   let sawTerminalEvent = false;
-  void getBackendRuntime()
-    .then((runtime) => {
-      if (closed) {
-        return;
-      }
+  const deliveredLegacyEventFingerprints = new Set<string>();
+  const pendingSequencedEvents = new Map<number, RunStatusEvent>();
+  let nextExpectedSequence = 1;
+  let replayDedupeCapacityReached = false;
+  const maxReconnectAttempts = 3;
+  const maxReplayDedupeEvents = 20_000;
 
-      void fetch(`${buildApiUrl(runtime)}/${mode}/stream/${encodeURIComponent(runId)}`, {
+  const consumeStream = async () => {
+    const runtime = await getBackendRuntime();
+    if (closed) {
+      return;
+    }
+
+    const response = await fetch(
+      `${buildApiUrl(runtime)}/${mode}/stream/${encodeURIComponent(runId)}`,
+      {
         method: "GET",
         headers: {
           Accept: "text/event-stream",
           ...(runtime.token ? { "X-Atlas-Instance-Token": runtime.token } : {}),
         },
         signal: controller.signal,
-      })
-        .then(async (response) => {
-          if (!response.ok) {
-            const contentType = response.headers.get("content-type") ?? "";
-            const payload =
-              contentType.includes("application/json")
-                ? await response.json()
-                : { detail: await response.text() };
-            throw new Error(extractResponseErrorMessage(payload, response.statusText));
+      },
+    );
+    if (!response.ok) {
+      const contentType = response.headers.get("content-type") ?? "";
+      const payload =
+        contentType.includes("application/json")
+          ? await response.json()
+          : { detail: await response.text() };
+      throw new Error(extractResponseErrorMessage(payload, response.statusText));
+    }
+
+    const body = response.body;
+    if (!body) {
+      throw new Error("Atlas stream body was empty.");
+    }
+
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    const deliverEvent = (event: RunStatusEvent) => {
+      if (closed || sawTerminalEvent) {
+        return;
+      }
+      if (event.type === "run_completed" || event.type === "run_failed") {
+        sawTerminalEvent = true;
+      }
+      onEvent(event);
+    };
+
+    const drainSequencedEvents = (event: RunStatusEvent) => {
+      deliverEvent(event);
+      const eventRangeEnd = runEventSequenceEnd(event);
+      for (const pendingSequence of pendingSequencedEvents.keys()) {
+        if (pendingSequence <= eventRangeEnd) {
+          pendingSequencedEvents.delete(pendingSequence);
+        }
+      }
+      nextExpectedSequence = eventRangeEnd + 1;
+      while (!closed && !sawTerminalEvent) {
+        const pending = pendingSequencedEvents.get(nextExpectedSequence);
+        if (!pending) {
+          break;
+        }
+        pendingSequencedEvents.delete(nextExpectedSequence);
+        deliverEvent(pending);
+        const pendingRangeEnd = runEventSequenceEnd(pending);
+        for (const pendingSequence of pendingSequencedEvents.keys()) {
+          if (pendingSequence <= pendingRangeEnd) {
+            pendingSequencedEvents.delete(pendingSequence);
           }
+        }
+        nextExpectedSequence = pendingRangeEnd + 1;
+      }
+      if (sawTerminalEvent) {
+        pendingSequencedEvents.clear();
+      }
+    };
 
-          const body = response.body;
-          if (!body) {
-            throw new Error("Atlas stream body was empty.");
+    const dispatchEventBlock = (block: string) => {
+      if (closed || sawTerminalEvent) {
+        return;
+      }
+      const dataLines: string[] = [];
+      for (const line of block.split(/\r?\n/)) {
+        if (!line || line.startsWith(":") || line.startsWith("event:")) {
+          continue;
+        }
+        if (line.startsWith("data:")) {
+          dataLines.push(line.slice(5).trimStart());
+        }
+      }
+      if (!dataLines.length) {
+        return;
+      }
+
+      const parsed = JSON.parse(dataLines.join("\n")) as RunStatusEvent;
+      const sequence = parsed.sequence;
+      if (typeof sequence === "number" && Number.isSafeInteger(sequence) && sequence > 0) {
+        if (sequence < nextExpectedSequence || pendingSequencedEvents.has(sequence)) {
+          return;
+        }
+        if (sequence > nextExpectedSequence) {
+          if (pendingSequencedEvents.size >= maxReplayDedupeEvents) {
+            replayDedupeCapacityReached = true;
+            throw new Error("Atlas stream exceeded the safe out-of-order event limit.");
           }
+          pendingSequencedEvents.set(sequence, parsed);
+          return;
+        }
+        drainSequencedEvents(parsed);
+        return;
+      }
 
-          const reader = body.getReader();
-          const decoder = new TextDecoder();
-          let buffer = "";
+      const fingerprint = runEventFingerprint(parsed);
+      if (deliveredLegacyEventFingerprints.has(fingerprint)) {
+        return;
+      }
+      if (deliveredLegacyEventFingerprints.size < maxReplayDedupeEvents) {
+        deliveredLegacyEventFingerprints.add(fingerprint);
+      } else {
+        replayDedupeCapacityReached = true;
+      }
+      deliverEvent(parsed);
+    };
 
-          const dispatchEventBlock = (block: string) => {
-            const dataLines: string[] = [];
-            const lines = block.split(/\r?\n/);
-            for (const line of lines) {
-              if (!line || line.startsWith(":")) {
-                continue;
-              }
-              if (line.startsWith("event:")) {
-                continue;
-              }
-              if (line.startsWith("data:")) {
-                dataLines.push(line.slice(5).trimStart());
-              }
-            }
-            if (!dataLines.length) {
-              return;
-            }
-            try {
-              const parsed = JSON.parse(dataLines.join("\n")) as RunStatusEvent;
-              if (parsed.type === "run_completed" || parsed.type === "run_failed") {
-                sawTerminalEvent = true;
-              }
-              onEvent(parsed);
-            } catch (error) {
-              onError(error instanceof Error ? error.message : "Failed to parse stream event.");
-            }
-          };
+    while (!closed) {
+      const { value, done } = await reader.read();
+      buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
 
-          while (!closed) {
-            const { value, done } = await reader.read();
-            buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
+      let separatorIndex = buffer.search(/\r?\n\r?\n/);
+      while (separatorIndex !== -1) {
+        const separatorMatch = buffer.slice(separatorIndex).match(/^\r?\n\r?\n/);
+        const separatorLength = separatorMatch?.[0].length ?? 2;
+        const block = buffer.slice(0, separatorIndex);
+        buffer = buffer.slice(separatorIndex + separatorLength);
+        dispatchEventBlock(block);
+        separatorIndex = buffer.search(/\r?\n\r?\n/);
+      }
 
-            let separatorIndex = buffer.search(/\r?\n\r?\n/);
-            while (separatorIndex !== -1) {
-              const separatorMatch = buffer.slice(separatorIndex).match(/^\r?\n\r?\n/);
-              const separatorLength = separatorMatch?.[0].length ?? 2;
-              const block = buffer.slice(0, separatorIndex);
-              buffer = buffer.slice(separatorIndex + separatorLength);
-              dispatchEventBlock(block);
-              separatorIndex = buffer.search(/\r?\n\r?\n/);
-            }
+      if (done) {
+        if (buffer.trim()) {
+          dispatchEventBlock(buffer);
+        }
+        break;
+      }
+    }
 
-            if (done) {
-              if (buffer.trim()) {
-                dispatchEventBlock(buffer);
-              }
-              break;
-            }
-          }
+    if (!closed && !sawTerminalEvent) {
+      throw new Error("Atlas stream disconnected.");
+    }
+  };
 
-          if (!closed && !sawTerminalEvent) {
-            onError("Atlas stream disconnected.");
-          }
-        })
-        .catch((error) => {
-          if (closed || controller.signal.aborted) {
-            return;
-          }
+  void (async () => {
+    let reconnectAttempt = 0;
+    while (!closed && !sawTerminalEvent) {
+      try {
+        await consumeStream();
+      } catch (error) {
+        if (closed || controller.signal.aborted) {
+          return;
+        }
+        if (replayDedupeCapacityReached) {
+          onError("Atlas stream disconnected after exceeding the safe replay limit.");
+          return;
+        }
+        if (reconnectAttempt >= maxReconnectAttempts) {
           onError(error instanceof Error ? error.message : "Atlas stream disconnected.");
-        });
-    })
-    .catch((error) => {
-      onError(error instanceof Error ? error.message : "Atlas runtime is unavailable.");
-    });
+          return;
+        }
+        reconnectAttempt += 1;
+        invalidateBackendRuntime();
+        await sleep(Math.min(2000, 250 * 2 ** (reconnectAttempt - 1)));
+      }
+    }
+  })();
 
   return () => {
     closed = true;
@@ -845,6 +983,9 @@ export async function openExternalUrl(url: string) {
   try {
     await invoke("open_external_url", { url });
   } catch (error) {
+    if (isTauri()) {
+      throw error instanceof Error ? error : new Error("Could not open external URL.");
+    }
     const opened = window.open(url, "_blank", "noopener,noreferrer");
     if (!opened) {
       throw error instanceof Error ? error : new Error("Could not open external URL.");
@@ -917,41 +1058,125 @@ function buildApiUrl(runtime: BackendRuntime): string {
 
 function configuredBrowserBackendRuntime(): BackendRuntime | null {
   const rawUrl = String(import.meta.env.VITE_ATLAS_BACKEND_URL ?? "").trim();
-  if (!rawUrl) {
+  const token = String(import.meta.env.VITE_ATLAS_BACKEND_TOKEN ?? "").trim();
+  return parseLocalBackendRuntime(rawUrl, token);
+}
+
+export function parseLocalBackendRuntime(rawUrl: string, token = ""): BackendRuntime | null {
+  const configuredUrl = rawUrl.trim();
+  if (!configuredUrl) {
     return null;
   }
   try {
-    const url = new URL(rawUrl);
-    const port = url.port ? Number(url.port) : url.protocol === "https:" ? 443 : 80;
+    const url = new URL(configuredUrl);
+    const hostname = url.hostname.toLowerCase();
+    const isLoopback =
+      hostname === "localhost" ||
+      hostname === "[::1]" ||
+      hostname === "::1" ||
+      /^127(?:\.\d{1,3}){3}$/.test(hostname);
+    const hasRootPathOnly = url.pathname === "/" && !url.search && !url.hash;
+    if (
+      url.protocol !== "http:" ||
+      !isLoopback ||
+      url.username ||
+      url.password ||
+      !hasRootPathOnly
+    ) {
+      throw new Error(
+        "VITE_ATLAS_BACKEND_URL must be an HTTP loopback origin without credentials, a path, query, or fragment.",
+      );
+    }
+    const port = url.port ? Number(url.port) : 80;
     return {
       host: url.hostname,
       port,
-      token: String(import.meta.env.VITE_ATLAS_BACKEND_TOKEN ?? "").trim(),
+      token: token.trim(),
       baseUrl: url.origin,
     };
-  } catch {
-    throw new Error("VITE_ATLAS_BACKEND_URL must be a valid absolute URL.");
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("VITE_ATLAS_BACKEND_URL")) {
+      throw error;
+    }
+    throw new Error("VITE_ATLAS_BACKEND_URL must be a valid absolute loopback URL.");
   }
 }
 
 async function requestWithRuntime<T>(runtime: BackendRuntime, path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${buildApiUrl(runtime)}${path}`, {
-    ...init,
-    headers: {
-      "Content-Type": "application/json",
-      ...(runtime.token ? { "X-Atlas-Instance-Token": runtime.token } : {}),
-      ...(init?.headers ?? {}),
-    },
-  });
-
-  if (!response.ok) {
-    const contentType = response.headers.get("content-type") ?? "";
-    const payload =
-      contentType.includes("application/json") ? await response.json() : { detail: await response.text() };
-    throw new Error(extractResponseErrorMessage(payload, response.statusText));
+  const controller = new AbortController();
+  const timeoutMs = isReadOnlyRequest(init)
+    ? API_READ_REQUEST_TIMEOUT_MS
+    : API_MUTATION_REQUEST_TIMEOUT_MS;
+  const timeout = globalThis.setTimeout(() => controller.abort(), timeoutMs);
+  const callerSignal = init?.signal;
+  const abortFromCaller = () => controller.abort();
+  if (callerSignal?.aborted) {
+    controller.abort();
+  } else {
+    callerSignal?.addEventListener("abort", abortFromCaller, { once: true });
   }
+  try {
+    const response = await fetch(`${buildApiUrl(runtime)}${path}`, {
+      ...init,
+      signal: controller.signal,
+      headers: {
+        "Content-Type": "application/json",
+        ...(runtime.token ? { "X-Atlas-Instance-Token": runtime.token } : {}),
+        ...(init?.headers ?? {}),
+      },
+    });
+    if (!response.ok) {
+      const contentType = response.headers.get("content-type") ?? "";
+      const payload =
+        contentType.includes("application/json") ? await response.json() : { detail: await response.text() };
+      throw new Error(extractResponseErrorMessage(payload, response.statusText));
+    }
 
-  return (await response.json()) as T;
+    return (await response.json()) as T;
+  } catch (error) {
+    if (controller.signal.aborted && !callerSignal?.aborted) {
+      throw new Error(`Atlas backend did not respond within ${timeoutMs / 1000} seconds.`);
+    }
+    throw error;
+  } finally {
+    globalThis.clearTimeout(timeout);
+    callerSignal?.removeEventListener("abort", abortFromCaller);
+  }
+}
+
+function isReadOnlyRequest(init?: RequestInit) {
+  const method = String(init?.method ?? "GET").trim().toUpperCase();
+  return method === "GET" || method === "HEAD" || method === "OPTIONS";
+}
+
+function runEventFingerprint(event: RunStatusEvent) {
+  if (
+    Number.isSafeInteger(event.sequence)
+    && Number(event.sequence) > 0
+  ) {
+    return `seq:${event.sequence}`;
+  }
+  return `${event.timestamp}\u0000${event.type}\u0000${JSON.stringify(event.payload)}`;
+}
+
+function runEventSequenceEnd(event: RunStatusEvent) {
+  const sequence = event.sequence;
+  if (
+    typeof sequence !== "number"
+    || !Number.isSafeInteger(sequence)
+    || sequence < 1
+  ) {
+    return 0;
+  }
+  const sequenceEnd = event.sequence_end;
+  if (
+    typeof sequenceEnd === "number"
+    && Number.isSafeInteger(sequenceEnd)
+    && sequenceEnd >= sequence
+  ) {
+    return sequenceEnd;
+  }
+  return sequence;
 }
 
 function extractResponseErrorMessage(payload: unknown, fallback: string) {
