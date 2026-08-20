@@ -344,6 +344,9 @@ def _get_or_create_non_windows_master_key() -> bytes:
 
 def _derive_non_windows_encryption_key(master_key: bytes, *, entropy: bytes | None) -> bytes:
     if not entropy:
+        # Compatibility KDF for a validated, uniformly random 256-bit OS-keyring key. Changing
+        # this existing derivation would make previously encrypted Atlas data undecryptable.
+        # codeql[py/weak-sensitive-data-hashing]
         return hashlib.sha256(master_key + b":atlas").digest()
     return hmac.new(master_key, entropy, hashlib.sha256).digest()
 

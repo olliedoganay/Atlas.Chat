@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from atlas_local.security import (
+    _derive_non_windows_encryption_key,
     application_secret_protection_available,
     get_or_create_storage_key,
     local_secret_storage_label,
@@ -26,6 +27,18 @@ from atlas_local.security import (
 
 
 class SecurityStorageTests(unittest.TestCase):
+    def test_non_windows_encryption_key_derivation_compatibility_vectors(self) -> None:
+        master_key = bytes(range(32))
+
+        self.assertEqual(
+            _derive_non_windows_encryption_key(master_key, entropy=None).hex(),
+            "60e2e7ea7273baa4275c0cea8f2df69b069f6cf273b3e66d22f8831ee413ad85",
+        )
+        self.assertEqual(
+            _derive_non_windows_encryption_key(master_key, entropy=b"profile-key").hex(),
+            "60ca3251ca2d56613dbfd9a6f76a170f9140fb013d220ea09859be7ac80768ca",
+        )
+
     def test_storage_key_is_stable_per_data_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
