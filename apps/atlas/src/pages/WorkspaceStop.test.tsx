@@ -150,6 +150,33 @@ describe("Workspace Stop failure recovery", () => {
     });
     unmountWorkspace(rendered);
   });
+
+  it("falls back to scrollTop when the viewport does not implement scrollTo", () => {
+    const scheduledFrames: FrameRequestCallback[] = [];
+    const requestAnimationFrame = vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      scheduledFrames.push(callback);
+      return scheduledFrames.length;
+    });
+    const rendered = renderWorkspace();
+
+    try {
+      const viewport = rendered.container.querySelector<HTMLElement>(".conversation-viewport");
+      expect(viewport).not.toBeNull();
+      Object.defineProperty(viewport, "scrollHeight", { configurable: true, value: 240 });
+      Object.defineProperty(viewport, "scrollTo", { configurable: true, value: undefined });
+
+      act(() => {
+        for (const callback of scheduledFrames.splice(0)) {
+          callback(0);
+        }
+      });
+
+      expect(viewport?.scrollTop).toBe(240);
+    } finally {
+      unmountWorkspace(rendered);
+      requestAnimationFrame.mockRestore();
+    }
+  });
 });
 
 function renderWorkspace() {

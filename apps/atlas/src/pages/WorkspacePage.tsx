@@ -624,7 +624,11 @@ export function WorkspacePage() {
     if (!viewport || !autoScrollToLatestRef.current) {
       return;
     }
-    viewport.scrollTo({ top: viewport.scrollHeight });
+    if (typeof viewport.scrollTo === "function") {
+      viewport.scrollTo({ top: viewport.scrollHeight });
+      return;
+    }
+    viewport.scrollTop = viewport.scrollHeight;
   }, []);
 
   const scheduleScrollToLatest = useCallback(() => {
