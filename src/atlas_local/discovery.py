@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import platform
 import shutil
@@ -9,11 +10,15 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib import error, request
+from urllib import error
 from urllib.parse import urljoin
 
 from .config import AppConfig, is_ollama_chat_provider
 from .llm import OllamaCatalogSnapshot
+from .local_provider import (
+    normalize_local_provider_base_url,
+    provider_urlopen,
+)
 
 
 @dataclass(frozen=True)
@@ -27,10 +32,16 @@ class RecommendedModel:
     min_vram_gb: float | None = None
     good_vram_gb: float | None = None
     supports_images: bool = False
+    supports_reasoning: bool = False
+    model_size_gb: float | None = None
 
 
 DISCOVERY_MANIFEST_VERSION = 1
 DEFAULT_DISCOVERY_MANIFEST = Path(__file__).with_name("discovery_models.json")
+MAX_OLLAMA_TAGS_RESPONSE_BYTES = 4 * 1024 * 1024
+MAX_DISCOVERY_MANIFEST_BYTES = 1024 * 1024
+MAX_DISCOVERY_MODELS = 256
+MAX_HARDWARE_COMMAND_OUTPUT_CHARS = 1024 * 1024
 
 
 FALLBACK_DISCOVERY_MODELS: tuple[RecommendedModel, ...] = (
@@ -239,11 +250,20 @@ def detect_local_hardware() -> dict[str, Any]:
 
 
 def list_installed_ollama_model_names(config: AppConfig, *, timeout_seconds: float = 3.0) -> list[str]:
-    endpoint = urljoin(f"{config.ollama_url.rstrip('/')}/", "api/tags")
+    base_url = normalize_local_provider_base_url(config.ollama_url)
+    endpoint = urljoin(f"{base_url}/", "api/tags")
     try:
-        with request.urlopen(endpoint, timeout=timeout_seconds) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except (error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+        with provider_urlopen(endpoint, timeout=timeout_seconds) as response:
+            content_length = response.headers.get("Content-Length")
+            if content_length and int(content_length) > MAX_OLLAMA_TAGS_RESPONSE_BYTES:
+                return []
+            raw_payload = response.read(MAX_OLLAMA_TAGS_RESPONSE_BYTES + 1)
+            if len(raw_payload) > MAX_OLLAMA_TAGS_RESPONSE_BYTES:
+                return []
+            payload = json.loads(raw_payload.decode("utf-8"))
+    except (error.URLError, TimeoutError, json.JSONDecodeError, OSError, ValueError):
+        return []
+    if not isinstance(payload, dict):
         return []
 
     models = payload.get("models", [])
@@ -252,7 +272,7 @@ def list_installed_ollama_model_names(config: AppConfig, *, timeout_seconds: flo
 
     seen: set[str] = set()
     names: list[str] = []
-    for item in models:
+    for item in models[:MAX_DISCOVERY_MODELS]:
         if not isinstance(item, dict):
             continue
         name = str(item.get("name", "")).strip()
@@ -285,6 +305,7 @@ def _build_recommendations(
         installed = _is_model_installed(candidate.name, installed_lookup)
         fit, runtime, reason = _estimate_model_fit(candidate, system)
         chat_info = chat_lookup.get(_normalize_model_name(candidate.name))
+        catalog_model_size_gb = _model_size_gb_from_ollama_info(chat_info)
         recommendations.append(
             {
                 "name": candidate.name,
@@ -295,6 +316,12 @@ def _build_recommendations(
                 "supports_images": (candidate.supports_images or bool(chat_info.supports_images))
                 if chat_info
                 else candidate.supports_images,
+                "supports_reasoning": (
+                    candidate.supports_reasoning or bool(chat_info.supports_reasoning)
+                )
+                if chat_info
+                else candidate.supports_reasoning,
+                "model_size_gb": candidate.model_size_gb or catalog_model_size_gb,
                 "fit": fit,
                 "runtime": runtime,
                 "reason": reason,
@@ -314,16 +341,24 @@ def load_discovery_models(config: AppConfig) -> tuple[RecommendedModel, ...]:
     if manifest_path is None:
         return FALLBACK_DISCOVERY_MODELS
     try:
+        if manifest_path.stat().st_size > MAX_DISCOVERY_MANIFEST_BYTES:
+            return FALLBACK_DISCOVERY_MODELS
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError, ValueError):
         return FALLBACK_DISCOVERY_MODELS
-    if int(payload.get("version", 0) or 0) != DISCOVERY_MANIFEST_VERSION:
+    if not isinstance(payload, dict):
+        return FALLBACK_DISCOVERY_MODELS
+    try:
+        version = int(payload.get("version", 0) or 0)
+    except (TypeError, ValueError, OverflowError):
+        return FALLBACK_DISCOVERY_MODELS
+    if version != DISCOVERY_MANIFEST_VERSION:
         return FALLBACK_DISCOVERY_MODELS
     raw_models = payload.get("models", [])
     if not isinstance(raw_models, list):
         return FALLBACK_DISCOVERY_MODELS
     models: list[RecommendedModel] = []
-    for item in raw_models:
+    for item in raw_models[:MAX_DISCOVERY_MODELS]:
         parsed = _parse_manifest_model(item)
         if parsed:
             models.append(parsed)
@@ -346,11 +381,30 @@ def _parse_manifest_model(item: Any) -> RecommendedModel | None:
         return None
     name = str(item.get("name", "") or "").strip()
     title = str(item.get("title", "") or "").strip()
-    if not name or not title:
+    if (
+        not name
+        or len(name) > 200
+        or not title
+        or len(title) > 200
+        or any(ord(character) < 0x20 for character in name + title)
+    ):
         return None
     min_ram = _safe_float(item.get("min_ram_gb"))
     good_ram = _safe_float(item.get("good_ram_gb"))
-    if min_ram is None or good_ram is None:
+    if (
+        min_ram is None
+        or good_ram is None
+        or min_ram <= 0
+        or good_ram < min_ram
+    ):
+        return None
+    min_vram = _safe_float(item.get("min_vram_gb"))
+    good_vram = _safe_float(item.get("good_vram_gb"))
+    if min_vram is not None and min_vram <= 0:
+        return None
+    if good_vram is not None and (
+        good_vram <= 0 or (min_vram is not None and good_vram < min_vram)
+    ):
         return None
     return RecommendedModel(
         name=name,
@@ -359,9 +413,9 @@ def _parse_manifest_model(item: Any) -> RecommendedModel | None:
         atlas_role=str(item.get("atlas_role", "chat") or "chat").strip() or "chat",
         min_ram_gb=min_ram,
         good_ram_gb=good_ram,
-        min_vram_gb=_safe_float(item.get("min_vram_gb")),
-        good_vram_gb=_safe_float(item.get("good_vram_gb")),
-        supports_images=bool(item.get("supports_images", False)),
+        min_vram_gb=min_vram,
+        good_vram_gb=good_vram,
+        supports_images=item.get("supports_images") is True,
     )
 
 
@@ -371,18 +425,48 @@ def _recommended_model_from_ollama_metadata(model_info: Any) -> RecommendedModel
     supports_images = bool(getattr(model_info, "supports_images", False))
     supports_reasoning = bool(getattr(model_info, "supports_reasoning", False))
     use_case = "vision" if supports_images else "reasoning" if supports_reasoning or "r1" in normalized else "chat"
-    title = "Installed vision model" if use_case == "vision" else "Installed reasoning model" if use_case == "reasoning" else "Installed chat model"
+    if supports_images and supports_reasoning:
+        title = "Installed vision and reasoning model"
+    elif use_case == "vision":
+        title = "Installed vision model"
+    elif use_case == "reasoning":
+        title = "Installed reasoning model"
+    else:
+        title = "Installed chat model"
+    model_size_gb = _model_size_gb_from_ollama_info(model_info)
+    default_min_vram = 6.0 if supports_images else 4.0
+    if model_size_gb is None:
+        min_ram_gb = 8.0
+        good_ram_gb = 16.0
+        min_vram_gb = default_min_vram
+        good_vram_gb = 8.0
+    else:
+        # Ollama's on-disk weight size is a materially better lower bound than
+        # the model name. Leave room for the OS, runtime, and KV cache as well.
+        min_ram_gb = float(max(8, math.ceil((model_size_gb * 1.15) + 4)))
+        good_ram_gb = float(max(16, math.ceil((model_size_gb * 1.35) + 8)))
+        min_vram_gb = float(max(default_min_vram, math.ceil(model_size_gb * 1.05)))
+        good_vram_gb = float(max(8, math.ceil(model_size_gb * 1.2)))
     return RecommendedModel(
         name=name,
         title=title,
         use_case=use_case,
         atlas_role="chat",
-        min_ram_gb=8.0,
-        good_ram_gb=16.0,
-        min_vram_gb=6.0 if supports_images else 4.0,
-        good_vram_gb=8.0,
+        min_ram_gb=min_ram_gb,
+        good_ram_gb=good_ram_gb,
+        min_vram_gb=min_vram_gb,
+        good_vram_gb=good_vram_gb,
         supports_images=supports_images,
+        supports_reasoning=supports_reasoning,
+        model_size_gb=model_size_gb,
     )
+
+
+def _model_size_gb_from_ollama_info(model_info: Any | None) -> float | None:
+    size_bytes = getattr(model_info, "size_bytes", None)
+    if not isinstance(size_bytes, int) or isinstance(size_bytes, bool) or size_bytes <= 0:
+        return None
+    return round(size_bytes / (1024**3), 1)
 
 
 def _recommendation_sort_key(item: dict[str, Any]) -> tuple[int, int, int, str]:
@@ -417,9 +501,26 @@ def _estimate_model_fit(candidate: RecommendedModel, system: dict[str, Any]) -> 
         return ("tight", "GPU", f"Detected GPU memory should run {candidate.name}, but headroom will be limited.")
     if total_ram is not None and total_ram >= candidate.good_ram_gb:
         runtime = "Hybrid" if best_gpu_vram is not None else "CPU"
-        return ("tight", runtime, f"System RAM should support {candidate.name}, but expect heavier CPU or mixed offload.")
+        detail = "mixed CPU/GPU offload" if runtime == "Hybrid" else "CPU execution"
+        return ("tight", runtime, f"System RAM should support {candidate.name} with {detail}; first load can be slower.")
     if total_ram is not None and total_ram >= candidate.min_ram_gb:
+        if best_gpu_vram is not None:
+            return (
+                "tight",
+                "Hybrid",
+                f"{candidate.name} should fit with mixed CPU/GPU offload, but GPU memory is below the full-model estimate.",
+            )
         return ("cpu-only", "CPU", f"{candidate.name} should fit in system RAM, but expect slower CPU-first performance.")
+    if (
+        total_ram is not None
+        and best_gpu_vram is not None
+        and total_ram + best_gpu_vram >= candidate.min_ram_gb
+    ):
+        return (
+            "tight",
+            "Hybrid",
+            f"Combined system and GPU memory may run {candidate.name}, but available headroom will be limited.",
+        )
     if total_ram is None and best_gpu_vram is None:
         return ("unavailable", "Unknown", f"Atlas could not detect enough hardware detail to estimate {candidate.name}.")
     return ("too-large", "Unknown", f"Detected RAM or VRAM looks too small for a comfortable {candidate.name} setup.")
@@ -465,7 +566,8 @@ def _safe_float(value: Any) -> float | None:
     try:
         if value in (None, ""):
             return None
-        return float(value)
+        parsed = float(value)
+        return parsed if math.isfinite(parsed) else None
     except (TypeError, ValueError):
         return None
 
@@ -587,7 +689,7 @@ def _read_linux_total_ram_gb() -> float | None:
 def _safe_read_text(path: str) -> str:
     try:
         with open(path, "r", encoding="utf-8", errors="ignore") as handle:
-            return handle.read()
+            return handle.read(MAX_HARDWARE_COMMAND_OUTPUT_CHARS)
     except OSError:
         return ""
 
@@ -782,7 +884,7 @@ def _run_text_command(command: list[str], *, timeout_seconds: float = 3.0) -> st
         return ""
     if completed.returncode != 0:
         return ""
-    return completed.stdout.strip()
+    return completed.stdout[:MAX_HARDWARE_COMMAND_OUTPUT_CHARS].strip()
 
 
 def _run_json_command(command: list[str], *, timeout_seconds: float = 3.0) -> Any:

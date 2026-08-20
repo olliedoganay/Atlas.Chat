@@ -42,6 +42,7 @@ export function ChatSearchDialog({
   open,
 }: ChatSearchDialogProps) {
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const resultsRef = useRef<HTMLDivElement | null>(null);
   const [query, setQuery] = useState("");
   const [activeResultIndex, setActiveResultIndex] = useState(0);
   const deferredQuery = useDeferredValue(query.trim());
@@ -49,7 +50,7 @@ export function ChatSearchDialog({
   const addRecentSearchQuery = useAtlasStore((state) => state.addRecentSearchQuery);
   const canSearch = open && Boolean(currentUserId) && deferredQuery.length >= 2;
 
-  const { data, isFetching } = useQuery({
+  const { data, isFetching, isError, error } = useQuery({
     queryKey: ["chat-search", currentUserId, currentThreadId, deferredQuery],
     queryFn: () => searchChats(deferredQuery, currentUserId, currentThreadId),
     enabled: canSearch,
@@ -81,6 +82,9 @@ export function ChatSearchDialog({
     ],
     [currentResults, otherResults],
   );
+  const activeResultKey = flatResults[activeResultIndex]
+    ? searchResultKey(flatResults[activeResultIndex].result)
+    : null;
   const otherResultGroups = useMemo(() => {
     const groups = new Map<
       string,
@@ -121,15 +125,24 @@ export function ChatSearchDialog({
     if (isFetching) {
       return "Searching local chats...";
     }
+    if (isError) {
+      return "Atlas could not search local chats.";
+    }
     if (totalResults === 0) {
       return "No matching threads or messages in local history.";
     }
     return `${totalResults} match${totalResults === 1 ? "" : "es"} across local chats.`;
-  }, [currentUserId, deferredQuery.length, isFetching, totalResults]);
+  }, [currentUserId, deferredQuery.length, isError, isFetching, totalResults]);
 
   useEffect(() => {
     setActiveResultIndex(0);
   }, [deferredQuery, open, totalResults]);
+
+  useEffect(() => {
+    resultsRef.current
+      ?.querySelector<HTMLElement>('[data-search-active="true"]')
+      ?.scrollIntoView?.({ block: "nearest" });
+  }, [activeResultIndex]);
 
   const pickResult = (selected: SearchResultRef) => {
     const normalizedQuery = deferredQuery || query.trim();
@@ -175,15 +188,6 @@ export function ChatSearchDialog({
     return null;
   }
 
-  const activeCurrentHistoryIndex =
-    flatResults[activeResultIndex]?.scope === "current"
-      ? flatResults[activeResultIndex]?.result.history_index ?? null
-      : null;
-  const activeOtherThreadId =
-    flatResults[activeResultIndex]?.scope === "other"
-      ? flatResults[activeResultIndex]?.result.thread_id ?? null
-      : null;
-
   return (
     <Dialog.Root onOpenChange={onOpenChange} open={open}>
       <Dialog.Portal>
@@ -215,11 +219,15 @@ export function ChatSearchDialog({
         <label className="search-input-shell">
           <Search size={18} />
           <input
+            aria-activedescendant={
+              activeResultKey ? searchResultDomId(activeResultKey) : undefined
+            }
             aria-controls="chat-search-results"
             aria-label="Search chat history"
             className="search-input"
             onChange={(event) => setQuery(event.currentTarget.value)}
             placeholder="Search this chat and all chats"
+            maxLength={1000}
             ref={inputRef}
             role="searchbox"
             value={query}
@@ -243,6 +251,11 @@ export function ChatSearchDialog({
             {statusCopy}
           </p>
         </Dialog.Description>
+        {isError ? (
+          <div className="error-inline" role="alert">
+            {error instanceof Error ? error.message : "Atlas could not search local chats."}
+          </div>
+        ) : null}
 
         {!deferredQuery && recentSearchQueries.length > 0 ? (
           <div className="search-recent-row">
@@ -262,9 +275,9 @@ export function ChatSearchDialog({
           </div>
         ) : null}
 
-        <div className="search-dialog-sections" id="chat-search-results">
+        <div className="search-dialog-sections" id="chat-search-results" ref={resultsRef}>
           <SearchSection
-            activeHistoryIndex={activeCurrentHistoryIndex}
+            activeResultKey={activeResultKey}
             emptyLabel={deferredQuery.length >= 2 ? "No hits in this chat." : "Start typing to search inside this chat."}
             onPick={(result) => pickResult({ result, scope: "current" })}
             query={deferredQuery}
@@ -273,7 +286,7 @@ export function ChatSearchDialog({
             sectionTitle={currentThreadLabel}
           />
           <GroupedSearchSection
-            activeThreadId={activeOtherThreadId}
+            activeResultKey={activeResultKey}
             emptyLabel={deferredQuery.length >= 2 ? "No hits in other chats." : "Search will also scan your other local chats."}
             groups={otherResultGroups}
             onPick={(result) => pickResult({ result, scope: "other" })}
@@ -289,7 +302,7 @@ export function ChatSearchDialog({
 }
 
 type SearchSectionProps = {
-  activeHistoryIndex?: number | null;
+  activeResultKey?: string | null;
   emptyLabel: string;
   onPick: (result: ChatSearchResult) => void;
   query: string;
@@ -299,7 +312,7 @@ type SearchSectionProps = {
 };
 
 function SearchSection({
-  activeHistoryIndex,
+  activeResultKey,
   emptyLabel,
   onPick,
   query,
@@ -319,13 +332,18 @@ function SearchSection({
 
       {results.length > 0 ? (
         <div className="search-result-list">
-          {results.map((result, index) => (
-            <button
-              className={`search-result-card${activeHistoryIndex === result.history_index ? " active" : ""}`}
-              key={`${result.thread_id}-${result.match_type}-${result.history_index ?? "thread"}-${index}`}
+          {results.map((result, index) => {
+            const resultKey = searchResultKey(result);
+            const active = activeResultKey === resultKey;
+            return (
+              <button
+              className={`search-result-card${active ? " active" : ""}`}
+              data-search-active={active ? "true" : undefined}
+              id={searchResultDomId(resultKey)}
+              key={`${resultKey}-${index}`}
               onClick={() => onPick(result)}
               type="button"
-            >
+              >
               <div className="search-result-top">
                 <div className="search-result-title-block">
                   <strong>{highlightSearchText(displayThreadTitle(result.thread_title, result.thread_id), query)}</strong>
@@ -344,8 +362,9 @@ function SearchSection({
                 <span>{result.chat_model || "Local model"}</span>
                 <span>{result.history_index === null || result.history_index === undefined ? "Open chat" : "Jump to match"}</span>
               </div>
-            </button>
-          ))}
+              </button>
+            );
+          })}
         </div>
       ) : (
         <div className="search-empty-state">{emptyLabel}</div>
@@ -355,7 +374,7 @@ function SearchSection({
 }
 
 type GroupedSearchSectionProps = {
-  activeThreadId?: string | null;
+  activeResultKey?: string | null;
   emptyLabel: string;
   groups: Array<{
     threadId: string;
@@ -371,7 +390,7 @@ type GroupedSearchSectionProps = {
 };
 
 function GroupedSearchSection({
-  activeThreadId,
+  activeResultKey,
   emptyLabel,
   groups,
   onPick,
@@ -392,7 +411,14 @@ function GroupedSearchSection({
       {groups.length > 0 ? (
         <div className="search-result-list">
           {groups.map((group) => (
-            <div className={`search-thread-group${activeThreadId === group.threadId ? " active" : ""}`} key={group.threadId}>
+            <div
+              className={`search-thread-group${
+                group.results.some((result) => searchResultKey(result) === activeResultKey)
+                  ? " active"
+                  : ""
+              }`}
+              key={group.threadId}
+            >
               <div className="search-thread-group-head">
                 <div className="search-thread-group-copy">
                   <strong>{highlightSearchText(group.threadTitle, query)}</strong>
@@ -401,13 +427,18 @@ function GroupedSearchSection({
                 <span className="search-result-meta">{formatSearchDate(group.updatedAt)}</span>
               </div>
               <div className="search-thread-group-results">
-                {group.results.map((result, index) => (
-                  <button
-                    className="search-result-card grouped"
-                    key={`${group.threadId}-${result.match_type}-${result.history_index ?? "thread"}-${index}`}
+                {group.results.map((result, index) => {
+                  const resultKey = searchResultKey(result);
+                  const active = activeResultKey === resultKey;
+                  return (
+                    <button
+                    className={`search-result-card grouped${active ? " active" : ""}`}
+                    data-search-active={active ? "true" : undefined}
+                    id={searchResultDomId(resultKey)}
+                    key={`${resultKey}-${index}`}
                     onClick={() => onPick(result)}
                     type="button"
-                  >
+                    >
                     <div className="search-result-top">
                       <div className="search-result-title-block">
                         <span className="search-result-badge">
@@ -423,8 +454,9 @@ function GroupedSearchSection({
                     <div className="search-result-foot">
                       <span>{result.history_index === null || result.history_index === undefined ? "Open chat" : "Jump to match"}</span>
                     </div>
-                  </button>
-                ))}
+                    </button>
+                  );
+                })}
               </div>
             </div>
           ))}
@@ -434,6 +466,19 @@ function GroupedSearchSection({
       )}
     </section>
   );
+}
+
+function searchResultKey(result: ChatSearchResult) {
+  return [
+    result.thread_id,
+    result.match_type,
+    result.history_index ?? "thread",
+    result.role ?? "",
+  ].join(":");
+}
+
+function searchResultDomId(resultKey: string) {
+  return `chat-search-result-${encodeURIComponent(resultKey)}`;
 }
 
 function highlightSearchText(value: string, query: string): ReactNode {

@@ -15,7 +15,15 @@ fn main() {
     write_placeholder_if_missing(&backend_placeholder, "backend");
     write_placeholder_if_missing(&prompts_placeholder, "prompt");
 
-    tauri_build::build()
+    let app_manifest = tauri_build::AppManifest::new().commands(&[
+        "restart_backend",
+        "backend_runtime",
+        "open_external_url",
+        "app_diagnostics",
+        "open_app_location",
+    ]);
+    tauri_build::try_build(tauri_build::Attributes::new().app_manifest(app_manifest))
+        .expect("failed to build Tauri application metadata")
 }
 
 fn write_placeholder_if_missing(path: &PathBuf, label: &str) {

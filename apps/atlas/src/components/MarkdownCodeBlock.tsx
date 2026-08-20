@@ -15,6 +15,7 @@ import yaml from "react-syntax-highlighter/dist/esm/languages/prism/yaml";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 
 import { openRunnerWindow, RUNNABLE_LANGUAGES, resolveRunnableLanguage } from "../lib/runner";
+import { useAtlasStore } from "../store/useAtlasStore";
 
 type MarkdownCodeBlockProps = {
   code: string;
@@ -43,6 +44,8 @@ SyntaxHighlighter.registerLanguage("yml", yaml);
 export function MarkdownCodeBlock({ code, language }: MarkdownCodeBlockProps) {
   const [copied, setCopied] = useState(false);
   const [launching, setLaunching] = useState(false);
+  const currentUserId = useAtlasStore((state) => state.currentUserId);
+  const currentThreadId = useAtlasStore((state) => state.currentThreadId);
   const runnable = resolveRunnableLanguage(language);
 
   const copy = async () => {
@@ -64,7 +67,13 @@ export function MarkdownCodeBlock({ code, language }: MarkdownCodeBlockProps) {
     }
     setLaunching(true);
     try {
-      await openRunnerWindow({ language: runnable, code });
+      await openRunnerWindow({
+        language: runnable,
+        code,
+        ...(currentUserId && currentThreadId
+          ? { originUserId: currentUserId, originThreadId: currentThreadId }
+          : {}),
+      });
     } catch (error) {
       console.error("Atlas runner window failed to open", error);
     } finally {

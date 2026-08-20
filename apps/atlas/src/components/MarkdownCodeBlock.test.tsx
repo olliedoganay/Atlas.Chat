@@ -17,10 +17,12 @@ vi.mock("../lib/runner", async (importOriginal) => {
 });
 
 import { MarkdownCodeBlock } from "./MarkdownCodeBlock";
+import { useAtlasStore } from "../store/useAtlasStore";
 
 let root: Root | null = null;
 let container: HTMLDivElement | null = null;
 const originalClipboardDescriptor = Object.getOwnPropertyDescriptor(Navigator.prototype, "clipboard");
+const initialAtlasState = useAtlasStore.getInitialState();
 
 function render(element: React.ReactElement) {
   container = document.createElement("div");
@@ -41,6 +43,7 @@ describe("MarkdownCodeBlock", () => {
     container?.remove();
     container = null;
     runnerMocks.openRunnerWindow.mockClear();
+    useAtlasStore.setState(initialAtlasState, true);
     vi.restoreAllMocks();
     if (originalClipboardDescriptor) {
       Object.defineProperty(Navigator.prototype, "clipboard", originalClipboardDescriptor);
@@ -73,6 +76,25 @@ describe("MarkdownCodeBlock", () => {
     const buttons = Array.from(node.querySelectorAll("button"));
     expect(buttons).toHaveLength(1);
     expect(buttons[0].textContent).toContain("Copy");
+  });
+
+  it("links a run to the active local profile and thread for safe repair handoff", async () => {
+    useAtlasStore.setState({ currentUserId: "ollie", currentThreadId: "snake-chat" });
+    const node = render(<MarkdownCodeBlock code="print('hello')" language="python" />);
+    const runButton = Array.from(node.querySelectorAll("button")).find((button) =>
+      button.textContent?.includes("Run"),
+    );
+
+    await act(async () => {
+      runButton?.click();
+    });
+
+    expect(runnerMocks.openRunnerWindow).toHaveBeenCalledWith({
+      language: "python",
+      code: "print('hello')",
+      originUserId: "ollie",
+      originThreadId: "snake-chat",
+    });
   });
 
   it("copies code when clipboard access is available", async () => {

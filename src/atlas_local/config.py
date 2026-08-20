@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -7,6 +8,7 @@ from typing import Mapping
 
 from dotenv import load_dotenv
 
+from .local_provider import normalize_local_provider_base_url
 from .provider_settings import load_provider_settings
 
 
@@ -33,6 +35,9 @@ DEFAULT_MEM0_COLLECTION = "atlas_local_memory"
 DEFAULT_EMBED_DIM = 768
 DEFAULT_MEMORY_TOP_K = 5
 DEFAULT_COMPACTION_TIMEOUT_SECONDS = 25.0
+MAX_COMPACTION_TIMEOUT_SECONDS = 180.0
+MAX_EMBED_DIM = 65_536
+MAX_MEMORY_TOP_K = 100
 
 
 @dataclass(frozen=True)
@@ -53,6 +58,7 @@ class AppConfig:
     embed_dim: int
     memory_top_k: int
     compaction_timeout_seconds: float
+    allow_legacy_plaintext_migration: bool
 
 
 def _repo_root() -> Path:
@@ -146,14 +152,63 @@ def _optional_float_value(env: Mapping[str, str], key: str, default: float | Non
     text = raw.strip() if isinstance(raw, str) else str(raw).strip()
     if not text:
         return None
-    return float(text)
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        return default
+    return value if math.isfinite(value) else default
 
 
-def _positive_float_value(env: Mapping[str, str], key: str, default: float) -> float:
+def _bounded_float_value(
+    env: Mapping[str, str],
+    key: str,
+    default: float,
+    *,
+    minimum: float,
+    maximum: float,
+) -> float:
     value = _optional_float_value(env, key, default)
     if value is None:
         return default
-    return max(1.0, float(value))
+    return min(maximum, max(minimum, float(value)))
+
+
+def _bounded_int_value(
+    env: Mapping[str, str],
+    key: str,
+    default: int,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    raw = env.get(key)
+    if raw is None:
+        return default
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return min(maximum, max(minimum, value))
+
+
+def _bool_value(
+    env: Mapping[str, str],
+    key: str,
+    default: bool = False,
+) -> bool:
+    raw = env.get(key)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _restrict_private_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
 
 
 def load_config(
@@ -198,11 +253,22 @@ def load_config(
         legacy_default=".data/mem0_history.sqlite",
     )
 
-    qdrant_path.mkdir(parents=True, exist_ok=True)
+    data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    qdrant_path.mkdir(parents=True, exist_ok=True, mode=0o700)
     checkpoint_db.parent.mkdir(parents=True, exist_ok=True)
     mem0_history_db.parent.mkdir(parents=True, exist_ok=True)
+    _restrict_private_directory(data_dir)
+    _restrict_private_directory(qdrant_path)
+    for storage_parent in (checkpoint_db.parent, mem0_history_db.parent):
+        try:
+            if storage_parent.resolve().is_relative_to(data_dir.resolve()):
+                _restrict_private_directory(storage_parent)
+        except (OSError, ValueError):
+            pass
 
-    ollama_url = _value(source, "OLLAMA_URL", DEFAULT_OLLAMA_URL)
+    ollama_url = normalize_local_provider_base_url(
+        _value(source, "OLLAMA_URL", DEFAULT_OLLAMA_URL)
+    )
     configured_provider = saved_provider_settings.get("provider") or _value(
         source,
         "ATLAS_CHAT_PROVIDER",
@@ -210,9 +276,11 @@ def load_config(
     )
     chat_provider = normalize_chat_provider(configured_provider)
     if is_ollama_chat_provider(chat_provider) and saved_provider_settings.get("base_url"):
-        ollama_url = saved_provider_settings["base_url"]
+        ollama_url = normalize_local_provider_base_url(
+            saved_provider_settings["base_url"]
+        )
     default_chat_base_url = _default_chat_base_url(chat_provider, ollama_url)
-    chat_base_url = (
+    chat_base_url = normalize_local_provider_base_url(
         saved_provider_settings.get("base_url")
         or _value(source, "ATLAS_CHAT_BASE_URL", default_chat_base_url)
         or default_chat_base_url
@@ -230,14 +298,42 @@ def load_config(
         chat_provider=chat_provider,
         chat_base_url=chat_base_url,
         chat_api_key=saved_api_key or _optional_secret_value(source, "ATLAS_CHAT_API_KEY"),
-        chat_temperature=_optional_float_value(source, "CHAT_TEMPERATURE", DEFAULT_CHAT_TEMPERATURE),
+        chat_temperature=(
+            None
+            if _optional_float_value(source, "CHAT_TEMPERATURE", DEFAULT_CHAT_TEMPERATURE) is None
+            else _bounded_float_value(
+                source,
+                "CHAT_TEMPERATURE",
+                0.0,
+                minimum=0.0,
+                maximum=2.0,
+            )
+        ),
         embed_model=_value(source, "EMBED_MODEL", DEFAULT_EMBED_MODEL),
         mem0_collection=_value(source, "MEM0_COLLECTION", DEFAULT_MEM0_COLLECTION),
-        embed_dim=int(_value(source, "EMBED_DIM", str(DEFAULT_EMBED_DIM))),
-        memory_top_k=int(_value(source, "MEMORY_TOP_K", str(DEFAULT_MEMORY_TOP_K))),
-        compaction_timeout_seconds=_positive_float_value(
+        embed_dim=_bounded_int_value(
+            source,
+            "EMBED_DIM",
+            DEFAULT_EMBED_DIM,
+            minimum=1,
+            maximum=MAX_EMBED_DIM,
+        ),
+        memory_top_k=_bounded_int_value(
+            source,
+            "MEMORY_TOP_K",
+            DEFAULT_MEMORY_TOP_K,
+            minimum=1,
+            maximum=MAX_MEMORY_TOP_K,
+        ),
+        compaction_timeout_seconds=_bounded_float_value(
             source,
             "ATLAS_COMPACTION_TIMEOUT_SECONDS",
             DEFAULT_COMPACTION_TIMEOUT_SECONDS,
+            minimum=1.0,
+            maximum=MAX_COMPACTION_TIMEOUT_SECONDS,
+        ),
+        allow_legacy_plaintext_migration=_bool_value(
+            source,
+            "ATLAS_ALLOW_LEGACY_PLAINTEXT_MIGRATION",
         ),
     )

@@ -18,6 +18,7 @@ from .context import GraphContext
 from .state import AgentState
 
 LOGGER = logging.getLogger(__name__)
+MAX_MEMORY_PERSISTENCE_ERROR_CHARS = 500
 
 
 class GraphNodes:
@@ -103,7 +104,10 @@ class GraphNodes:
         runtime: Runtime[GraphContext],
     ) -> dict[str, Any]:
         if not runtime.context.cross_chat_memory:
-            return {"persisted_memories": []}
+            return {
+                "persisted_memories": [],
+                "memory_persistence_warnings": [],
+            }
 
         existing_memories: set[str] = set()
         try:
@@ -116,20 +120,41 @@ class GraphNodes:
             LOGGER.warning("Could not load existing memories before persistence: %s", exc)
 
         persisted: list[dict[str, Any]] = []
+        warnings: list[dict[str, Any]] = []
         for payload in state.get("update_candidates", []):
             candidate = MemoryCandidate.from_dict(payload)
             storage_text = candidate.to_storage_text().strip()
             if not storage_text or storage_text.lower() in existing_memories:
                 continue
-            response = self.memory_service.add(
-                MemoryRecord(claim_id=f"auto:{runtime.context.thread_id}", text=storage_text),
-                user_id=runtime.context.user_id,
-                metadata={
-                    "source": "auto",
-                    "kind": "extracted_memory",
-                    "category": candidate.category,
-                },
-            )
+            try:
+                response = self.memory_service.add(
+                    MemoryRecord(
+                        claim_id=f"auto:{runtime.context.thread_id}",
+                        text=storage_text,
+                    ),
+                    user_id=runtime.context.user_id,
+                    metadata={
+                        "source": "auto",
+                        "kind": "extracted_memory",
+                        "category": candidate.category,
+                    },
+                )
+            except Exception as exc:  # pragma: no cover - integration path
+                error_message = (
+                    str(exc).strip() or "Atlas memory storage rejected the update."
+                )[:MAX_MEMORY_PERSISTENCE_ERROR_CHARS]
+                LOGGER.warning(
+                    "Could not persist an extracted %s memory: %s",
+                    candidate.category,
+                    error_message,
+                )
+                warnings.append(
+                    {
+                        "category": candidate.category,
+                        "error": error_message,
+                    }
+                )
+                continue
             existing_memories.add(storage_text.lower())
             persisted.append(
                 {
@@ -138,7 +163,10 @@ class GraphNodes:
                     "response": response,
                 }
             )
-        return {"persisted_memories": persisted}
+        return {
+            "persisted_memories": persisted,
+            "memory_persistence_warnings": warnings,
+        }
 
 
 def _latest_user_text(state: AgentState) -> str:
@@ -177,25 +205,120 @@ def _build_answer_messages(
     token_counter: MessageTokenCounter | None = None,
     answer_prompt_template: str | None = None,
 ) -> list[HumanMessage | AIMessage | SystemMessage]:
-    answer_prompt_message = _answer_prompt_message(
-        state=state,
-        runtime_context=runtime_context,
-        answer_prompt_template=answer_prompt_template,
+    messages = list(state.get("messages", []))
+    compacted_count = max(
+        0,
+        min(
+            int(state.get("compacted_message_count", 0) or 0),
+            len(messages),
+        ),
     )
-    memory_message = (
-        None
-        if answer_prompt_template and "{memory_context}" in answer_prompt_template
-        else _memory_context_message(state=state, runtime_context=runtime_context)
+    candidate_messages = messages[compacted_count:]
+    effective_context_window = int(
+        runtime_context.effective_context_window
+        or state.get("detected_context_window")
+        or 0
+    )
+
+    selected_memories = (
+        [
+            str(item)
+            for item in state.get("retrieved_memories", [])
+            if item
+        ]
+        if getattr(runtime_context, "cross_chat_memory", True)
+        else []
     )
     summary_message = _thread_summary_message(state)
+
+    def build_prefix(
+        memories: list[str],
+        summary: SystemMessage | None,
+    ) -> list[SystemMessage]:
+        answer_prompt_message = _answer_prompt_message(
+            state=state,
+            runtime_context=runtime_context,
+            answer_prompt_template=answer_prompt_template,
+            memories=memories,
+        )
+        memory_message = (
+            None
+            if answer_prompt_template
+            and "{memory_context}" in answer_prompt_template
+            else _memory_context_message(
+                state=state,
+                runtime_context=runtime_context,
+                memories=memories,
+            )
+        )
+        return [
+            item
+            for item in (
+                answer_prompt_message,
+                memory_message,
+                summary,
+            )
+            if item is not None
+        ]
+
+    if effective_context_window <= 0:
+        prefix = build_prefix(selected_memories, summary_message)
+        return prefix + candidate_messages
+
+    prompt_budget = max(256, int(effective_context_window * 0.72))
+    latest_messages = candidate_messages[-1:] if candidate_messages else []
+    prefix = build_prefix([], None)
+    if prefix:
+        minimum_tokens = (
+            _count_messages_tokens(
+                prefix + latest_messages,
+                token_counter=token_counter,
+            )
+            + 64
+        )
+        if minimum_tokens > prompt_budget:
+            raise RuntimeError(
+                "The latest request is too large for the selected model's "
+                "prompt budget. Shorten the message, remove or reduce "
+                "attachments, or choose a model with a larger context window."
+            )
+
+    if summary_message is not None:
+        summary_prefix = build_prefix([], summary_message)
+        summary_tokens = (
+            _count_messages_tokens(
+                summary_prefix + latest_messages,
+                token_counter=token_counter,
+            )
+            + 64
+        )
+        if summary_tokens > prompt_budget:
+            summary_message = None
+
+    bounded_memories: list[str] = []
+    for memory in selected_memories:
+        candidate_memories = [*bounded_memories, memory]
+        candidate_prefix = build_prefix(
+            candidate_memories,
+            summary_message,
+        )
+        candidate_tokens = (
+            _count_messages_tokens(
+                candidate_prefix + latest_messages,
+                token_counter=token_counter,
+            )
+            + 64
+        )
+        if candidate_tokens <= prompt_budget:
+            bounded_memories.append(memory)
+
+    prefix = build_prefix(bounded_memories, summary_message)
     recent_messages = _recent_prompt_messages(
         state=state,
         runtime_context=runtime_context,
-        memory_message=answer_prompt_message or memory_message,
-        summary_message=summary_message,
+        prefix_messages=prefix,
         token_counter=token_counter,
     )
-    prefix = [item for item in (answer_prompt_message, memory_message, summary_message) if item is not None]
     return prefix + recent_messages
 
 
@@ -211,15 +334,20 @@ def _answer_prompt_message(
     state: AgentState,
     runtime_context: GraphContext,
     answer_prompt_template: str | None,
+    memories: list[str] | None = None,
 ) -> SystemMessage | None:
     template = (answer_prompt_template or "").strip()
     if not template:
         return None
-    memories = [item for item in state.get("retrieved_memories", []) if item]
+    resolved_memories = (
+        [item for item in state.get("retrieved_memories", []) if item]
+        if memories is None
+        else memories
+    )
     values = {
         "user_id": runtime_context.user_id,
         "thread_id": runtime_context.thread_id,
-        "memory_context": _format_list(memories),
+        "memory_context": _format_list(resolved_memories),
         "world_context": "- none",
         "reasoning_context": "- none",
         "browser_context": "- none",
@@ -237,14 +365,26 @@ class _PromptValues(dict[str, str]):
         return ""
 
 
-def _memory_context_message(*, state: AgentState, runtime_context: GraphContext) -> SystemMessage | None:
+def _memory_context_message(
+    *,
+    state: AgentState,
+    runtime_context: GraphContext,
+    memories: list[str] | None = None,
+) -> SystemMessage | None:
     if not getattr(runtime_context, "cross_chat_memory", True):
         return None
 
-    memories = [item for item in state.get("retrieved_memories", []) if item]
-    if not memories:
+    resolved_memories = (
+        [item for item in state.get("retrieved_memories", []) if item]
+        if memories is None
+        else memories
+    )
+    if not resolved_memories:
         return None
-    return SystemMessage(content="Relevant persistent memories:\n" + _format_list(memories))
+    return SystemMessage(
+        content="Relevant persistent memories:\n"
+        + _format_list(resolved_memories)
+    )
 
 
 def _thread_summary_message(state: AgentState) -> SystemMessage | None:
@@ -258,8 +398,7 @@ def _recent_prompt_messages(
     *,
     state: AgentState,
     runtime_context: GraphContext,
-    memory_message: SystemMessage | None,
-    summary_message: SystemMessage | None,
+    prefix_messages: list[SystemMessage],
     token_counter: MessageTokenCounter | None,
 ) -> list[BaseMessage]:
     messages = list(state.get("messages", []))
@@ -273,24 +412,46 @@ def _recent_prompt_messages(
     if effective_context_window <= 0:
         return candidate_messages
 
-    prompt_budget = max(1024, int(effective_context_window * 0.72))
-    reserved_tokens = _count_messages_tokens([memory_message, summary_message], token_counter=token_counter) + 64
-    available_tokens = max(256, prompt_budget - reserved_tokens)
+    prompt_budget = max(256, int(effective_context_window * 0.72))
+    reserved_tokens = (
+        _count_messages_tokens(
+            prefix_messages,
+            token_counter=token_counter,
+        )
+        + 64
+    )
+    available_tokens = max(0, prompt_budget - reserved_tokens)
 
-    selected: list[BaseMessage] = []
-    consumed = 0
-    for message in reversed(candidate_messages):
-        message_tokens = _count_messages_tokens([message], token_counter=token_counter)
-        if selected and consumed + message_tokens > available_tokens:
-            break
-        selected.insert(0, message)
-        consumed += message_tokens
-        if len(selected) >= 12 and consumed >= available_tokens:
-            break
+    if not candidate_messages:
+        return []
+    if _count_messages_tokens(candidate_messages, token_counter=token_counter) <= available_tokens:
+        return candidate_messages
+    latest_tokens = _count_messages_tokens(
+        candidate_messages[-1:],
+        token_counter=token_counter,
+    )
+    if latest_tokens > available_tokens:
+        raise RuntimeError(
+            "The latest request is too large for the selected model's prompt "
+            "budget. Shorten the message, remove or reduce attachments, or "
+            "choose a model with a larger context window."
+        )
 
-    if not selected and candidate_messages:
-        return [candidate_messages[-1]]
-    return selected
+    earliest_fitting_index = len(candidate_messages) - 1
+    low = 0
+    high = len(candidate_messages) - 1
+    while low <= high:
+        midpoint = (low + high) // 2
+        suffix_tokens = _count_messages_tokens(
+            candidate_messages[midpoint:],
+            token_counter=token_counter,
+        )
+        if suffix_tokens <= available_tokens:
+            earliest_fitting_index = midpoint
+            high = midpoint - 1
+        else:
+            low = midpoint + 1
+    return candidate_messages[earliest_fitting_index:]
 
 
 def _estimate_message_tokens(message: BaseMessage | None) -> int:

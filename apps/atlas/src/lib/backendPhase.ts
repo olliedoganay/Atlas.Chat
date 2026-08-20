@@ -6,6 +6,7 @@ const BACKEND_STARTUP_GRACE_MS = 15000;
 
 type BackendPhaseOptions = {
   hasStatus: boolean;
+  isError: boolean;
   isPending: boolean;
   isFetching: boolean;
   bootStartedAt: number;
@@ -13,13 +14,14 @@ type BackendPhaseOptions = {
 
 export function resolveBackendPhase({
   hasStatus,
+  isError,
   isPending,
   isFetching,
   bootStartedAt,
   now,
 }: BackendPhaseOptions & { now: number }): BackendPhase {
   const graceEndsAt = bootStartedAt + BACKEND_STARTUP_GRACE_MS;
-  if (hasStatus) {
+  if (hasStatus && !isError) {
     return "online";
   }
   if (isPending || isFetching || now < graceEndsAt) {
@@ -30,6 +32,7 @@ export function resolveBackendPhase({
 
 export function useBackendPhase({
   hasStatus,
+  isError,
   isPending,
   isFetching,
   bootStartedAt,
@@ -52,6 +55,7 @@ export function useBackendPhase({
 
   return resolveBackendPhase({
     hasStatus,
+    isError,
     isPending,
     isFetching,
     bootStartedAt,

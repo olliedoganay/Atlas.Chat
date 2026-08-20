@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 
 import type { ImageAttachment, ReasoningMode, RunMode, ThemeMode } from "../lib/api";
+import type { RecoverableRun } from "../lib/runRecovery";
 
 type CompactionNotice = {
   runId: string;
@@ -78,10 +79,13 @@ type AtlasState = {
     threadId: string,
     attachments?: ImageAttachment[],
   ) => void;
+  recoverRun: (run: RecoverableRun) => boolean;
   appendThinking: (text: string) => void;
   appendToken: (text: string) => void;
   setStage: (stage: string) => void;
+  restoreRunStage: (runId: string, stage: string) => boolean;
   completeRun: () => void;
+  cancelRun: () => void;
   failRun: (message: string, userId?: string, threadId?: string) => void;
   showCompactionNotice: (notice: CompactionNotice) => void;
   clearCompactionNotice: () => void;
@@ -89,9 +93,12 @@ type AtlasState = {
   stepSearchJumpTarget: (delta: number) => void;
   clearSearchJumpTarget: () => void;
   addRecentSearchQuery: (query: string) => void;
+  clearRecentSearchQueries: () => void;
   togglePinnedThread: (userId: string, threadId: string) => void;
+  clearProfileState: (userId: string) => void;
   markBackendBooting: () => void;
   clearLiveRun: () => void;
+  resetAfterDataWipe: () => void;
 };
 
 const defaultTheme = "dark";
@@ -159,9 +166,49 @@ export const useAtlasStore = create<AtlasState>()(
           compactionNotice: null,
           isStreaming: true,
         }),
+      recoverRun: (run) => {
+        let recovered = false;
+        set((state) => {
+          if (
+            state.isStreaming ||
+            state.currentRunId ||
+            state.currentUserId !== run.userId ||
+            state.currentThreadId !== run.threadId
+          ) {
+            return {};
+          }
+          recovered = true;
+          return {
+            currentRunId: run.runId,
+            currentRunMode: run.mode,
+            activeRunUserId: run.userId,
+            activeRunThreadId: run.threadId,
+            pendingPrompt: run.prompt,
+            pendingAttachments: [],
+            currentStage: run.stage,
+            liveThinking: "",
+            liveAnswer: "",
+            liveError: "",
+            compactionNotice: null,
+            isStreaming: true,
+          };
+        });
+        return recovered;
+      },
       appendThinking: (text) => set((state) => ({ liveThinking: `${state.liveThinking}${text}` })),
       appendToken: (text) => set((state) => ({ liveAnswer: `${state.liveAnswer}${text}` })),
       setStage: (stage) => set({ currentStage: stage }),
+      restoreRunStage: (runId, stage) => {
+        let restored = false;
+        set((state) => {
+          if (!state.isStreaming || state.currentRunId !== runId) {
+            return {};
+          }
+          restored = true;
+          return { currentStage: stage };
+        });
+        return restored;
+      },
       completeRun: () =>
         set({
           currentRunId: null,
@@ -176,6 +223,21 @@ export const useAtlasStore = create<AtlasState>()(
           liveError: "",
           compactionNotice: null,
           currentStage: "completed",
+        }),
+      cancelRun: () =>
+        set({
+          currentRunId: null,
+          currentRunMode: null,
+          activeRunUserId: null,
+          activeRunThreadId: null,
+          isStreaming: false,
+          pendingPrompt: "",
+          pendingAttachments: [],
+          liveThinking: "",
+          liveAnswer: "",
+          liveError: "",
+          compactionNotice: null,
+          currentStage: "cancelled",
         }),
       failRun: (message, userId, threadId) =>
         set((state) => ({
@@ -227,6 +289,7 @@ export const useAtlasStore = create<AtlasState>()(
           ].slice(0, 6);
           return { recentSearchQueries: deduped };
         }),
+      clearRecentSearchQueries: () => set({ recentSearchQueries: [] }),
       togglePinnedThread: (userId, threadId) =>
         set((state) => {
           const key = threadStorageKey(userId, threadId);
@@ -240,6 +303,47 @@ export const useAtlasStore = create<AtlasState>()(
             existing.add(key);
           }
           return { pinnedThreadKeys: Array.from(existing).slice(0, 100) };
+        }),
+      clearProfileState: (userId) =>
+        set((state) => {
+          const resolvedUserId = userId.trim();
+          if (!resolvedUserId) {
+            return {};
+          }
+          const pinnedThreadPrefix = `${resolvedUserId}::`;
+          const nextPinnedThreadKeys = state.pinnedThreadKeys.filter(
+            (key) => !key.startsWith(pinnedThreadPrefix),
+          );
+          if (state.currentUserId !== resolvedUserId) {
+            return {
+              pinnedThreadKeys: nextPinnedThreadKeys,
+              searchJumpTarget:
+                state.searchJumpTarget?.userId === resolvedUserId ? null : state.searchJumpTarget,
+              compactionNotice:
+                state.compactionNotice?.userId === resolvedUserId ? null : state.compactionNotice,
+            };
+          }
+          return {
+            currentUserId: "",
+            currentThreadId: "main",
+            currentThreadTitle: "Main",
+            draftThreadModel: "",
+            draftThreadTemperature: null,
+            currentRunId: null,
+            currentRunMode: null,
+            activeRunUserId: null,
+            activeRunThreadId: null,
+            currentStage: "idle",
+            pendingPrompt: "",
+            pendingAttachments: [],
+            liveThinking: "",
+            liveAnswer: "",
+            liveError: "",
+            compactionNotice: null,
+            searchJumpTarget: null,
+            pinnedThreadKeys: nextPinnedThreadKeys,
+            isStreaming: false,
+          };
         }),
       markBackendBooting: () => set({ backendStartupStartedAt: Date.now() }),
       clearLiveRun: () =>
@@ -256,6 +360,29 @@ export const useAtlasStore = create<AtlasState>()(
           liveError: "",
           compactionNotice: null,
           searchJumpTarget: null,
+          isStreaming: false,
+        }),
+      resetAfterDataWipe: () =>
+        set({
+          currentUserId: "",
+          currentThreadId: "main",
+          currentThreadTitle: "Main",
+          draftThreadModel: "",
+          draftThreadTemperature: null,
+          currentRunId: null,
+          currentRunMode: null,
+          activeRunUserId: null,
+          activeRunThreadId: null,
+          currentStage: "idle",
+          pendingPrompt: "",
+          pendingAttachments: [],
+          liveThinking: "",
+          liveAnswer: "",
+          liveError: "",
+          compactionNotice: null,
+          searchJumpTarget: null,
+          recentSearchQueries: [],
+          pinnedThreadKeys: [],
           isStreaming: false,
         }),
     }),
@@ -308,6 +435,7 @@ export const useAtlasStore = create<AtlasState>()(
         reasoningMode: state.reasoningMode,
         crossChatMemoryEnabled: state.crossChatMemoryEnabled,
         autoCompactLongChats: state.autoCompactLongChats,
+        crtScanlines: state.crtScanlines,
         navCollapsed: state.navCollapsed,
         navWidth: state.navWidth,
         settingsSidebarCollapsed: state.settingsSidebarCollapsed,

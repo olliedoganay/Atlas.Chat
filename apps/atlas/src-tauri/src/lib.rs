@@ -11,7 +11,7 @@ use std::{
 
 use rand::RngCore;
 use serde::Serialize;
-use tauri::{webview::PageLoadEvent, AppHandle, Manager, RunEvent, State};
+use tauri::{webview::PageLoadEvent, AppHandle, Manager, RunEvent, State, Url};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -25,6 +25,7 @@ const BACKEND_STARTUP_RETRY_MS: u64 = 250;
 const BACKEND_GRACEFUL_SHUTDOWN_TIMEOUT_MS: u64 = 12_000;
 const BACKEND_SHUTDOWN_POLL_MS: u64 = 100;
 const WINDOW_REVEAL_FALLBACK_MS: u64 = 500;
+const MAX_EXTERNAL_URL_LENGTH: usize = 2_048;
 
 #[derive(Clone, Serialize)]
 struct BackendRuntime {
@@ -100,10 +101,21 @@ fn open_app_location(app: AppHandle, location: String) -> Result<(), String> {
 }
 
 fn is_allowed_external_url(url: &str) -> bool {
-    matches!(
-        url,
-        "https://ollama.com/download" | "https://github.com/olliedoganay/AtlasChat"
-    )
+    if url.is_empty()
+        || url.len() > MAX_EXTERNAL_URL_LENGTH
+        || url.trim() != url
+        || url.contains('\\')
+        || url.chars().any(char::is_control)
+    {
+        return false;
+    }
+    let Ok(parsed) = Url::parse(url) else {
+        return false;
+    };
+    matches!(parsed.scheme(), "http" | "https")
+        && parsed.host_str().is_some()
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
 }
 
 pub fn run() {
@@ -680,5 +692,56 @@ mod tests {
         assert!(request.starts_with("POST /admin/prepare-shutdown HTTP/1.1\r\n"));
         assert!(request.contains("\r\nX-Atlas-Instance-Token: atlas-test-token\r\n"));
         assert!(request.ends_with("\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"));
+    }
+
+    #[test]
+    fn external_urls_accept_only_absolute_http_and_https_without_credentials() {
+        assert!(is_allowed_external_url(
+            "https://example.com/docs?q=atlas#local"
+        ));
+        assert!(is_allowed_external_url("http://127.0.0.1:11434/"));
+
+        for rejected in [
+            "",
+            "/relative",
+            "javascript:alert(1)",
+            "file:///tmp/atlas",
+            "data:text/plain,atlas",
+            "https://user@example.com/",
+            "https://user:secret@example.com/",
+            " https://example.com/",
+            "https://example.com/\n",
+            "https:\\\\example.com\\docs",
+        ] {
+            assert!(
+                !is_allowed_external_url(rejected),
+                "unexpectedly allowed {rejected:?}"
+            );
+        }
+        assert!(!is_allowed_external_url(&format!(
+            "https://example.com/{}",
+            "a".repeat(MAX_EXTERNAL_URL_LENGTH)
+        )));
+    }
+
+    #[test]
+    fn runner_capability_exposes_only_the_required_app_command() {
+        let capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/runner.json"))
+                .expect("runner capability must be valid JSON");
+        let permissions = capability["permissions"]
+            .as_array()
+            .expect("runner capability permissions must be an array");
+        let app_permissions = permissions
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .filter(|permission| !permission.starts_with("core:"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(app_permissions, vec!["allow-backend-runtime"]);
+        assert!(
+            capability.get("remote").is_none(),
+            "runner commands must not be granted to remote preview origins"
+        );
     }
 }

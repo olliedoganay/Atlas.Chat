@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import closing
 from pathlib import Path
@@ -154,6 +155,125 @@ class Mem0ServiceCollectionMigrationTests(unittest.TestCase):
                 ):
                     service.list(user_id="research_user", limit=10)
 
+    def test_concurrent_first_access_constructs_one_mem0_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = load_config(project_root=Path(tmp), env={})
+            service = Mem0Service(config)
+            factory_started = threading.Event()
+            second_factory_entered = threading.Event()
+            release_factory = threading.Event()
+            factory_calls = 0
+            factory_calls_lock = threading.Lock()
+            results: list[object] = []
+            failures: list[BaseException] = []
+
+            class FakeMemory:
+                pass
+
+            memory = FakeMemory()
+
+            def construct_memory(_config):
+                nonlocal factory_calls
+                with factory_calls_lock:
+                    factory_calls += 1
+                    if factory_calls > 1:
+                        second_factory_entered.set()
+                factory_started.set()
+                if not release_factory.wait(5.0):
+                    raise AssertionError("Timed out waiting to release Mem0 construction.")
+                return memory
+
+            def require_memory() -> None:
+                try:
+                    results.append(service._require_memory())
+                except BaseException as exc:
+                    failures.append(exc)
+
+            with patch(
+                "atlas_local.memory.mem0_service.Memory.from_config",
+                side_effect=construct_memory,
+            ) as factory:
+                first = threading.Thread(target=require_memory)
+                second = threading.Thread(target=require_memory)
+                first.start()
+                self.assertTrue(factory_started.wait(2.0))
+                second.start()
+                try:
+                    self.assertFalse(second_factory_entered.wait(0.2))
+                finally:
+                    release_factory.set()
+                    first.join(2.0)
+                    second.join(2.0)
+
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            self.assertEqual(failures, [])
+            self.assertEqual(results, [memory, memory])
+            factory.assert_called_once()
+
+    def test_close_waits_for_in_progress_mem0_initialization(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = load_config(project_root=Path(tmp), env={})
+            service = Mem0Service(config)
+            factory_started = threading.Event()
+            release_factory = threading.Event()
+            close_started = threading.Event()
+            close_finished = threading.Event()
+            failures: list[BaseException] = []
+
+            class FakeMemory:
+                def __init__(self) -> None:
+                    self.closed = False
+
+                def close(self) -> None:
+                    self.closed = True
+
+            memory = FakeMemory()
+
+            def construct_memory(_config):
+                factory_started.set()
+                if not release_factory.wait(5.0):
+                    raise AssertionError("Timed out waiting to release Mem0 construction.")
+                return memory
+
+            def initialize() -> None:
+                try:
+                    service._require_memory()
+                except BaseException as exc:
+                    failures.append(exc)
+
+            def close_service() -> None:
+                close_started.set()
+                try:
+                    service.close()
+                except BaseException as exc:
+                    failures.append(exc)
+                finally:
+                    close_finished.set()
+
+            with patch(
+                "atlas_local.memory.mem0_service.Memory.from_config",
+                side_effect=construct_memory,
+            ):
+                initializer = threading.Thread(target=initialize)
+                closer = threading.Thread(target=close_service)
+                initializer.start()
+                self.assertTrue(factory_started.wait(2.0))
+                closer.start()
+                try:
+                    self.assertTrue(close_started.wait(2.0))
+                    self.assertFalse(close_finished.wait(0.2))
+                finally:
+                    release_factory.set()
+                    initializer.join(2.0)
+                    closer.join(2.0)
+
+            self.assertFalse(initializer.is_alive())
+            self.assertFalse(closer.is_alive())
+            self.assertEqual(failures, [])
+            self.assertTrue(memory.closed)
+            self.assertIsNone(service._memory)
+
     def test_search_and_list_scope_mem0_v2_queries_with_filters(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = load_config(project_root=Path(tmp), env={})
@@ -167,7 +287,16 @@ class Mem0ServiceCollectionMigrationTests(unittest.TestCase):
 
                 def get_all(self, *args, **kwargs):
                     calls.append(("get_all", args, kwargs))
-                    return {"results": []}
+                    if kwargs.get("top_k") != 1:
+                        return {"results": []}
+                    return {
+                        "results": [
+                            {
+                                "id": "memory-1",
+                                "memory": "existing memory",
+                            }
+                        ]
+                    }
 
             service._memory = FakeMemory()  # type: ignore[assignment]
 
@@ -179,6 +308,14 @@ class Mem0ServiceCollectionMigrationTests(unittest.TestCase):
             self.assertEqual(
                 calls,
                 [
+                    (
+                        "get_all",
+                        (),
+                        {
+                            "filters": {"user_id": "research_user"},
+                            "top_k": 1,
+                        },
+                    ),
                     (
                         "search",
                         ("local memory",),
@@ -196,6 +333,40 @@ class Mem0ServiceCollectionMigrationTests(unittest.TestCase):
                             "top_k": 11,
                         },
                     ),
+                ],
+            )
+
+    def test_search_skips_semantic_embedding_when_user_has_no_memories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = load_config(project_root=Path(tmp), env={})
+            service = Mem0Service(config)
+            calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+
+            class FakeMemory:
+                def search(self, *args, **kwargs):
+                    raise AssertionError("empty memory must not run semantic search")
+
+                def get_all(self, *args, **kwargs):
+                    calls.append(("get_all", args, kwargs))
+                    return {"results": []}
+
+            service._memory = FakeMemory()  # type: ignore[assignment]
+
+            self.assertEqual(
+                service.search("local memory", user_id="research_user", limit=7),
+                [],
+            )
+            self.assertEqual(
+                calls,
+                [
+                    (
+                        "get_all",
+                        (),
+                        {
+                            "filters": {"user_id": "research_user"},
+                            "top_k": 1,
+                        },
+                    )
                 ],
             )
 

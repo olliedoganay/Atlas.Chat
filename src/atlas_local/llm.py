@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
+import threading
 from dataclasses import asdict, dataclass, field
 from time import monotonic
-from typing import Any
+from typing import Any, Callable
 from urllib import error, request
 from urllib.parse import urljoin
 
@@ -18,11 +20,44 @@ from .config import (
     is_ollama_chat_provider,
     normalize_chat_provider,
 )
+from .local_provider import (
+    normalize_local_provider_base_url,
+    provider_urlopen,
+)
 
 
 OLLAMA_CONTEXT_WINDOW_PRESETS = (4096, 8192, 16384, 32768, 65536, 131072, 262144)
 MIN_OLLAMA_CONTEXT_WINDOW = 1024
 MAX_OLLAMA_CONTEXT_WINDOW = 262144
+MAX_MODEL_INSPECTION_WORKERS = 8
+MAX_MODEL_CATALOG_ENTRIES = 256
+MAX_MODEL_CATALOG_RESPONSE_BYTES = 4 * 1024 * 1024
+MAX_PROVIDER_JSON_RESPONSE_BYTES = 16 * 1024 * 1024
+MAX_PROVIDER_ERROR_RESPONSE_BYTES = 64 * 1024
+MAX_PROVIDER_STREAM_EVENT_BYTES = 1024 * 1024
+MAX_CATALOG_MODEL_NAME_LENGTH = 200
+MAX_OLLAMA_MODEL_SIZE_BYTES = 1024**5
+OLLAMA_CHAT_REQUEST_TIMEOUT_SECONDS = 300.0
+
+
+class _OpenAICompatibleRequestAborted(RuntimeError):
+    """Raised when Atlas cancels an in-flight OpenAI-compatible request."""
+
+
+class _OpenAICompatibleStreamUnsupported(RuntimeError):
+    """Raised only when a local provider explicitly cannot produce SSE."""
+
+
+_STREAM_UNSUPPORTED_HTTP_STATUSES = {400, 404, 405, 406, 415, 422, 501}
+_STREAM_PROTOCOL_MARKERS = ("stream", "streaming", "sse", "event-stream")
+_STREAM_REJECTION_MARKERS = (
+    "not supported",
+    "unsupported",
+    "not implemented",
+    "unrecognized",
+    "unknown",
+    "invalid",
+)
 
 
 def format_runtime_error(config: AppConfig, exc: Exception, *, chat_model: str | None = None) -> RuntimeError:
@@ -111,6 +146,11 @@ class LLMProvider:
                 "model": resolved_model,
                 "base_url": base_url,
                 "validate_model_on_init": True,
+                "client_kwargs": {
+                    "follow_redirects": False,
+                    "timeout": OLLAMA_CHAT_REQUEST_TIMEOUT_SECONDS,
+                    "trust_env": False,
+                },
             }
             if resolved_temperature is not None:
                 options["temperature"] = resolved_temperature
@@ -148,6 +188,11 @@ class LLMProvider:
                 "temperature": 0.0,
                 "format": "json",
                 "validate_model_on_init": True,
+                "client_kwargs": {
+                    "follow_redirects": False,
+                    "timeout": OLLAMA_CHAT_REQUEST_TIMEOUT_SECONDS,
+                    "trust_env": False,
+                },
             }
             if context_window is not None:
                 options["num_ctx"] = context_window
@@ -293,8 +338,24 @@ class OpenAICompatibleChat:
     response_format: dict[str, Any] | None = None
     api_key: str | None = None
     timeout_seconds: float = 120.0
+    _response_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _active_responses: list[Any] = field(default_factory=list, init=False, repr=False)
+    _abort_epoch: int = field(default=0, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.base_url = normalize_local_provider_base_url(self.base_url)
 
     def invoke(self, messages: list[Any]) -> AIMessage:
+        request_epoch = self._current_abort_epoch()
+        return self._invoke_at_epoch(messages, request_epoch=request_epoch)
+
+    def _invoke_at_epoch(
+        self,
+        messages: list[Any],
+        *,
+        request_epoch: int,
+    ) -> AIMessage:
+        self._raise_if_request_aborted(request_epoch)
         payload = self._chat_payload(messages, stream=False)
         response = _openai_compatible_json_request_required(
             self.base_url,
@@ -302,30 +363,133 @@ class OpenAICompatibleChat:
             timeout_seconds=self.timeout_seconds,
             body=payload,
             api_key=self.api_key,
+            on_response_opened=lambda active_response: self._register_active_response_at_epoch(
+                active_response,
+                request_epoch=request_epoch,
+            ),
+            on_response_closed=self._unregister_active_response,
         )
+        self._raise_if_request_aborted(request_epoch)
         return AIMessage(content=_openai_compatible_response_text(response))
 
     def stream(self, messages: list[Any]):
+        request_epoch = self._current_abort_epoch()
         payload = self._chat_payload(messages, stream=True)
         emitted = False
         try:
-            for content in _stream_openai_compatible_chat(
+            for delta in _stream_openai_compatible_chat(
                 self.base_url,
                 payload,
                 timeout_seconds=self.timeout_seconds,
                 api_key=self.api_key,
+                on_response_opened=lambda active_response: self._register_active_response_at_epoch(
+                    active_response,
+                    request_epoch=request_epoch,
+                ),
+                on_response_closed=self._unregister_active_response,
             ):
-                if content:
+                self._raise_if_request_aborted(request_epoch)
+                if isinstance(delta, tuple):
+                    content, reasoning_content = delta
+                else:
+                    # Preserve compatibility with simple/testing adapters that
+                    # yield only answer text.
+                    content, reasoning_content = str(delta), ""
+                if content or reasoning_content:
                     emitted = True
-                    yield AIMessage(content=content)
+                    additional_kwargs = (
+                        {"reasoning_content": reasoning_content}
+                        if reasoning_content
+                        else {}
+                    )
+                    yield AIMessage(
+                        content=content,
+                        additional_kwargs=additional_kwargs,
+                    )
             if emitted:
                 return
-        except Exception:
-            # Some local OpenAI-compatible servers expose chat but not SSE streaming.
-            pass
-        response = self.invoke(messages)
+        except Exception as exc:
+            if self._request_was_aborted(request_epoch):
+                raise _OpenAICompatibleRequestAborted(
+                    "OpenAI-compatible request was aborted."
+                ) from exc
+            if emitted:
+                # A non-streaming retry after partial output would generate a
+                # second answer and append it to the already-emitted text.
+                # Surface the interrupted stream instead; callers can preserve
+                # the partial response and report the transport failure.
+                raise
+            if not isinstance(exc, _OpenAICompatibleStreamUnsupported):
+                raise
+            # A small number of local servers explicitly reject SSE while still
+            # exposing non-streaming chat completions. Only that protocol-level
+            # incompatibility is eligible for a second request.
+        self._raise_if_request_aborted(request_epoch)
+        response = self._invoke_at_epoch(messages, request_epoch=request_epoch)
         if response.content:
             yield response
+
+    def abort(self) -> None:
+        with self._response_lock:
+            self._abort_epoch += 1
+            responses = list(self._active_responses)
+        for response in responses:
+            close = getattr(response, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except OSError:
+                    pass
+
+    def _register_active_response(self, response: Any) -> None:
+        self._register_active_response_at_epoch(
+            response,
+            request_epoch=self._current_abort_epoch(),
+        )
+
+    def _register_active_response_at_epoch(
+        self,
+        response: Any,
+        *,
+        request_epoch: int,
+    ) -> None:
+        with self._response_lock:
+            aborted = self._abort_epoch != request_epoch
+            if not aborted:
+                self._active_responses.append(response)
+        if not aborted:
+            return
+        close = getattr(response, "close", None)
+        if callable(close):
+            try:
+                close()
+            except OSError:
+                pass
+        raise _OpenAICompatibleRequestAborted(
+            "OpenAI-compatible request was aborted."
+        )
+
+    def _unregister_active_response(self, response: Any) -> None:
+        with self._response_lock:
+            self._active_responses = [
+                active_response
+                for active_response in self._active_responses
+                if active_response is not response
+            ]
+
+    def _current_abort_epoch(self) -> int:
+        with self._response_lock:
+            return self._abort_epoch
+
+    def _request_was_aborted(self, request_epoch: int) -> bool:
+        with self._response_lock:
+            return self._abort_epoch != request_epoch
+
+    def _raise_if_request_aborted(self, request_epoch: int) -> None:
+        if self._request_was_aborted(request_epoch):
+            raise _OpenAICompatibleRequestAborted(
+                "OpenAI-compatible request was aborted."
+            )
 
     def get_num_tokens_from_messages(self, messages: list[Any]) -> int:
         return _approximate_message_tokens(messages)
@@ -346,6 +510,7 @@ class OpenAICompatibleChat:
 @dataclass(frozen=True)
 class OllamaModelInfo:
     name: str
+    size_bytes: int | None = None
     family: str = ""
     families: tuple[str, ...] = ()
     capabilities: tuple[str, ...] = ()
@@ -396,7 +561,11 @@ def loaded_ollama_models(config: AppConfig, *, timeout_seconds: float = 2.0) -> 
         if not isinstance(item, dict):
             continue
         name = str(item.get("name") or item.get("model") or "").strip()
-        if not name or name in seen:
+        if (
+            not name
+            or len(name) > MAX_CATALOG_MODEL_NAME_LENGTH
+            or name in seen
+        ):
             continue
         seen.add(name)
         loaded.append(name)
@@ -430,53 +599,91 @@ def list_local_ollama_model_info(config: AppConfig, *, timeout_seconds: float = 
 
 
 def inspect_local_ollama_models(config: AppConfig, *, timeout_seconds: float = 3.0) -> OllamaCatalogSnapshot:
-    endpoint = urljoin(f"{config.ollama_url.rstrip('/')}/", "api/tags")
+    base_url = normalize_local_provider_base_url(config.ollama_url)
+    endpoint = urljoin(f"{base_url}/", "api/tags")
     try:
-        with request.urlopen(endpoint, timeout=timeout_seconds) as response:
-            payload: dict[str, Any] = json.loads(response.read().decode("utf-8"))
-    except (error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+        with provider_urlopen(endpoint, timeout=timeout_seconds) as response:
+            raw_payload = response.read(MAX_MODEL_CATALOG_RESPONSE_BYTES + 1)
+            if len(raw_payload) > MAX_MODEL_CATALOG_RESPONSE_BYTES:
+                raise ValueError("Ollama model catalog is too large.")
+            decoded_payload = json.loads(raw_payload.decode("utf-8"))
+            if not isinstance(decoded_payload, dict):
+                raise ValueError("Ollama model catalog must be a JSON object.")
+            payload: dict[str, Any] = decoded_payload
+    except (
+        error.URLError,
+        TimeoutError,
+        json.JSONDecodeError,
+        OSError,
+        ValueError,
+    ):
         return OllamaCatalogSnapshot(
             provider="ollama",
             provider_label=chat_provider_label("ollama"),
-            provider_base_url=config.ollama_url,
+            provider_base_url=base_url,
             supports_context_window=True,
             supports_model_unload=True,
         )
 
     models = payload.get("models", [])
-    entries: list[OllamaModelInfo] = []
+    if not isinstance(models, list):
+        models = []
+    model_payloads: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for item in models:
+    for item in models[:MAX_MODEL_CATALOG_ENTRIES]:
         if not isinstance(item, dict):
             continue
         name = str(item.get("name", "")).strip()
-        if not name or name in seen:
-            continue
-        show_payload = _ollama_json_request(
-            config,
-            "api/show",
-            timeout_seconds=min(timeout_seconds, 1.5),
-            body={"model": name},
-        )
-        model_payload = _merge_ollama_model_payload(item, show_payload)
-        if not _is_chat_capable_model(model_payload):
+        if (
+            not name
+            or len(name) > MAX_CATALOG_MODEL_NAME_LENGTH
+            or name in seen
+        ):
             continue
         seen.add(name)
-        details = model_payload.get("details", {}) if isinstance(model_payload.get("details"), dict) else {}
-        family = str(details.get("family", "")).strip()
-        families = tuple(str(entry).strip() for entry in details.get("families", []) if str(entry).strip())
-        capabilities = _payload_capabilities(model_payload)
-        entries.append(
-            OllamaModelInfo(
-                name=name,
-                family=family,
-                families=families,
-                capabilities=capabilities,
-                supports_images=_is_vision_capable_model(model_payload),
-                supports_reasoning=_is_reasoning_capable_model(model_payload),
-                reasoning_mode_strategy=_reasoning_mode_strategy(model_payload),
-            )
+        model_payloads.append(item)
+
+    entries: list[OllamaModelInfo] = []
+    if model_payloads:
+        worker_count = min(MAX_MODEL_INSPECTION_WORKERS, len(model_payloads))
+        executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="atlas-model-inspect",
         )
+        future_items = {
+            executor.submit(
+                _inspect_ollama_model_info,
+                config,
+                item,
+                timeout_seconds=min(timeout_seconds, 1.5),
+            ): item
+            for item in model_payloads
+        }
+        try:
+            done, pending = concurrent.futures.wait(
+                future_items,
+                timeout=max(0.05, float(timeout_seconds)),
+            )
+            entries_by_name: dict[str, OllamaModelInfo] = {}
+            for future in done:
+                try:
+                    inspected = future.result()
+                except Exception:
+                    inspected = None
+                if inspected is not None:
+                    entries_by_name[inspected.name] = inspected
+            for future in pending:
+                future.cancel()
+            for item in model_payloads:
+                name = str(item.get("name", "") or "").strip()
+                if name in entries_by_name:
+                    continue
+                fallback = _ollama_model_info_from_payload(item, {})
+                if fallback is not None:
+                    entries_by_name[name] = fallback
+            entries.extend(entries_by_name.values())
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     entries.sort(key=lambda item: item.name)
     return OllamaCatalogSnapshot(
@@ -486,10 +693,61 @@ def inspect_local_ollama_models(config: AppConfig, *, timeout_seconds: float = 3
         source="ollama",
         provider="ollama",
         provider_label=chat_provider_label("ollama"),
-        provider_base_url=config.ollama_url,
+        provider_base_url=base_url,
         provider_online=True,
         supports_context_window=True,
         supports_model_unload=True,
+    )
+
+
+def _inspect_ollama_model_info(
+    config: AppConfig,
+    tag_payload: dict[str, Any],
+    *,
+    timeout_seconds: float,
+) -> OllamaModelInfo | None:
+    name = str(tag_payload.get("name", "")).strip()
+    show_payload = _ollama_json_request(
+        config,
+        "api/show",
+        timeout_seconds=timeout_seconds,
+        body={"model": name},
+    )
+    return _ollama_model_info_from_payload(tag_payload, show_payload)
+
+
+def _ollama_model_info_from_payload(
+    tag_payload: dict[str, Any],
+    show_payload: dict[str, Any],
+) -> OllamaModelInfo | None:
+    name = str(tag_payload.get("name", "")).strip()
+    model_payload = _merge_ollama_model_payload(tag_payload, show_payload)
+    if not _is_chat_capable_model(model_payload):
+        return None
+    details = (
+        model_payload.get("details", {})
+        if isinstance(model_payload.get("details"), dict)
+        else {}
+    )
+    family = str(details.get("family", "")).strip()
+    raw_families = details.get("families", [])
+    if not isinstance(raw_families, list):
+        raw_families = []
+    families = tuple(
+        str(entry).strip()
+        for entry in raw_families
+        if str(entry).strip()
+    )
+    capabilities = _payload_capabilities(model_payload)
+    return OllamaModelInfo(
+        name=name,
+        size_bytes=_parse_ollama_model_size(tag_payload.get("size")),
+        family=family,
+        families=families,
+        capabilities=capabilities,
+        supports_images=_is_vision_capable_model(model_payload),
+        supports_reasoning=_is_reasoning_capable_model(model_payload),
+        reasoning_mode_strategy=_reasoning_mode_strategy(model_payload),
     )
 
 
@@ -501,6 +759,7 @@ def inspect_openai_compatible_models(config: AppConfig, *, timeout_seconds: floa
         "models",
         timeout_seconds=timeout_seconds,
         api_key=_config_chat_api_key(config),
+        max_response_bytes=MAX_MODEL_CATALOG_RESPONSE_BYTES,
     )
     if not payload:
         return OllamaCatalogSnapshot(
@@ -517,7 +776,7 @@ def inspect_openai_compatible_models(config: AppConfig, *, timeout_seconds: floa
     entries: list[OllamaModelInfo] = []
     seen: set[str] = set()
     if isinstance(raw_models, list):
-        for item in raw_models:
+        for item in raw_models[:MAX_MODEL_CATALOG_ENTRIES]:
             model_payload = item if isinstance(item, dict) else {"id": item}
             name = str(
                 model_payload.get("id")
@@ -525,7 +784,11 @@ def inspect_openai_compatible_models(config: AppConfig, *, timeout_seconds: floa
                 or model_payload.get("model")
                 or ""
             ).strip()
-            if not name or name in seen:
+            if (
+                not name
+                or len(name) > MAX_CATALOG_MODEL_NAME_LENGTH
+                or name in seen
+            ):
                 continue
             seen.add(name)
             inferred_payload = {
@@ -597,8 +860,10 @@ def _ollama_json_request(
     *,
     timeout_seconds: float,
     body: dict[str, Any] | None = None,
+    max_response_bytes: int = MAX_MODEL_CATALOG_RESPONSE_BYTES,
 ) -> dict[str, Any]:
-    url = urljoin(f"{config.ollama_url.rstrip('/')}/", endpoint)
+    base_url = normalize_local_provider_base_url(config.ollama_url)
+    url = urljoin(f"{base_url}/", endpoint)
     data = None
     headers = {}
     if body is not None:
@@ -606,10 +871,23 @@ def _ollama_json_request(
         headers["Content-Type"] = "application/json"
     request_object = request.Request(url, data=data, headers=headers, method="POST" if body is not None else "GET")
     try:
-        with request.urlopen(request_object, timeout=timeout_seconds) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+        with provider_urlopen(request_object, timeout=timeout_seconds) as response:
+            payload = json.loads(
+                _read_bounded_response(
+                    response,
+                    max_bytes=max_response_bytes,
+                    label="Ollama JSON response",
+                ).decode("utf-8")
+            )
             return payload if isinstance(payload, dict) else {}
-    except (error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+    except (
+        error.URLError,
+        TimeoutError,
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+        OSError,
+        ValueError,
+    ):
         return {}
 
 
@@ -619,8 +897,10 @@ def _ollama_json_request_required(
     *,
     timeout_seconds: float,
     body: dict[str, Any] | None = None,
+    max_response_bytes: int = MAX_MODEL_CATALOG_RESPONSE_BYTES,
 ) -> dict[str, Any]:
-    url = urljoin(f"{config.ollama_url.rstrip('/')}/", endpoint)
+    base_url = normalize_local_provider_base_url(config.ollama_url)
+    url = urljoin(f"{base_url}/", endpoint)
     data = None
     headers = {}
     if body is not None:
@@ -628,17 +908,27 @@ def _ollama_json_request_required(
         headers["Content-Type"] = "application/json"
     request_object = request.Request(url, data=data, headers=headers, method="POST" if body is not None else "GET")
     try:
-        with request.urlopen(request_object, timeout=timeout_seconds) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+        with provider_urlopen(request_object, timeout=timeout_seconds) as response:
+            payload = json.loads(
+                _read_bounded_response(
+                    response,
+                    max_bytes=max_response_bytes,
+                    label="Ollama JSON response",
+                ).decode("utf-8")
+            )
             return payload if isinstance(payload, dict) else {}
     except error.HTTPError as exc:
-        try:
-            detail = exc.read().decode("utf-8", errors="replace").strip()
-        except OSError:
-            detail = ""
+        detail = _read_bounded_error_detail(exc)
         reason = detail or str(exc)
         raise RuntimeError(f"Ollama could not stop the model through {endpoint}: {reason}") from exc
-    except (error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+    except (
+        error.URLError,
+        TimeoutError,
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+        OSError,
+        ValueError,
+    ) as exc:
         raise RuntimeError(f"Ollama could not stop the model through {endpoint}: {exc}") from exc
 
 
@@ -649,6 +939,7 @@ def _openai_compatible_json_request(
     timeout_seconds: float,
     body: dict[str, Any] | None = None,
     api_key: str | None = None,
+    max_response_bytes: int = MAX_PROVIDER_JSON_RESPONSE_BYTES,
 ) -> dict[str, Any]:
     try:
         return _openai_compatible_json_request_required(
@@ -657,6 +948,7 @@ def _openai_compatible_json_request(
             timeout_seconds=timeout_seconds,
             body=body,
             api_key=api_key,
+            max_response_bytes=max_response_bytes,
         )
     except Exception:
         return {}
@@ -669,8 +961,12 @@ def _openai_compatible_json_request_required(
     timeout_seconds: float,
     body: dict[str, Any] | None = None,
     api_key: str | None = None,
+    max_response_bytes: int = MAX_PROVIDER_JSON_RESPONSE_BYTES,
+    on_response_opened: Callable[[Any], None] | None = None,
+    on_response_closed: Callable[[Any], None] | None = None,
 ) -> dict[str, Any]:
-    url = urljoin(f"{base_url.rstrip('/')}/", endpoint.lstrip("/"))
+    resolved_base_url = normalize_local_provider_base_url(base_url)
+    url = urljoin(f"{resolved_base_url}/", endpoint.lstrip("/"))
     data = None
     headers = {"Accept": "application/json"}
     if body is not None:
@@ -680,17 +976,33 @@ def _openai_compatible_json_request_required(
         headers["Authorization"] = f"Bearer {api_key}"
     request_object = request.Request(url, data=data, headers=headers, method="POST" if body is not None else "GET")
     try:
-        with request.urlopen(request_object, timeout=timeout_seconds) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-            return payload if isinstance(payload, dict) else {}
+        with provider_urlopen(request_object, timeout=timeout_seconds) as response:
+            if on_response_opened is not None:
+                on_response_opened(response)
+            try:
+                payload = json.loads(
+                    _read_bounded_response(
+                        response,
+                        max_bytes=max_response_bytes,
+                        label="OpenAI-compatible JSON response",
+                    ).decode("utf-8")
+                )
+                return payload if isinstance(payload, dict) else {}
+            finally:
+                if on_response_closed is not None:
+                    on_response_closed(response)
     except error.HTTPError as exc:
-        try:
-            detail = exc.read().decode("utf-8", errors="replace").strip()
-        except OSError:
-            detail = ""
+        detail = _read_bounded_error_detail(exc)
         reason = detail or str(exc)
         raise RuntimeError(f"OpenAI-compatible local request to {endpoint} failed: {reason}") from exc
-    except (error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+    except (
+        error.URLError,
+        TimeoutError,
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+        OSError,
+        ValueError,
+    ) as exc:
         raise RuntimeError(f"OpenAI-compatible local request to {endpoint} failed: {exc}") from exc
 
 
@@ -700,8 +1012,11 @@ def _stream_openai_compatible_chat(
     *,
     timeout_seconds: float,
     api_key: str | None = None,
+    on_response_opened: Callable[[Any], None] | None = None,
+    on_response_closed: Callable[[Any], None] | None = None,
 ):
-    url = urljoin(f"{base_url.rstrip('/')}/", "chat/completions")
+    resolved_base_url = normalize_local_provider_base_url(base_url)
+    url = urljoin(f"{resolved_base_url}/", "chat/completions")
     headers = {
         "Accept": "text/event-stream",
         "Content-Type": "application/json",
@@ -714,23 +1029,123 @@ def _stream_openai_compatible_chat(
         headers=headers,
         method="POST",
     )
-    with request.urlopen(request_object, timeout=timeout_seconds) as response:
-        for raw_line in response:
-            line = raw_line.decode("utf-8", errors="replace").strip()
-            if not line or line.startswith(":"):
-                continue
-            if not line.startswith("data:"):
-                continue
-            data = line.partition(":")[2].strip()
-            if data == "[DONE]":
-                break
+    try:
+        with provider_urlopen(request_object, timeout=timeout_seconds) as response:
+            if on_response_opened is not None:
+                on_response_opened(response)
+            saw_sse_event = False
+            saw_non_sse_payload = False
             try:
-                payload = json.loads(data)
-            except json.JSONDecodeError:
-                continue
-            text = _openai_compatible_delta_text(payload)
-            if text:
-                yield text
+                for raw_line in _bounded_response_lines(
+                    response,
+                    max_line_bytes=MAX_PROVIDER_STREAM_EVENT_BYTES,
+                    label="OpenAI-compatible stream event",
+                ):
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line or line.startswith(":"):
+                        continue
+                    if not line.startswith("data:"):
+                        saw_non_sse_payload = True
+                        continue
+                    saw_sse_event = True
+                    data = line.partition(":")[2].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        payload = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    content, reasoning_content = _openai_compatible_delta_parts(payload)
+                    if content or reasoning_content:
+                        yield content, reasoning_content
+                if saw_non_sse_payload and not saw_sse_event:
+                    raise _OpenAICompatibleStreamUnsupported(
+                        "The local provider returned a non-SSE response to a streaming request."
+                    )
+            finally:
+                if on_response_closed is not None:
+                    on_response_closed(response)
+    except error.HTTPError as exc:
+        detail = _read_bounded_error_detail(exc)
+        if _is_explicit_stream_rejection(exc.code, detail):
+            raise _OpenAICompatibleStreamUnsupported(
+                detail or "The local provider explicitly rejected streaming."
+            ) from exc
+        reason = detail or str(exc)
+        raise RuntimeError(
+            f"OpenAI-compatible local streaming request failed: {reason}"
+        ) from exc
+
+
+def _is_explicit_stream_rejection(status_code: int, detail: str) -> bool:
+    if status_code not in _STREAM_UNSUPPORTED_HTTP_STATUSES:
+        return False
+    normalized = detail.strip().lower()
+    return (
+        any(marker in normalized for marker in _STREAM_PROTOCOL_MARKERS)
+        and any(marker in normalized for marker in _STREAM_REJECTION_MARKERS)
+    )
+
+
+def _read_bounded_response(
+    response: Any,
+    *,
+    max_bytes: int,
+    label: str,
+) -> bytes:
+    resolved_limit = max(1, int(max_bytes))
+    headers = getattr(response, "headers", None)
+    content_length = None
+    if headers is not None:
+        try:
+            content_length = headers.get("Content-Length")
+        except (AttributeError, TypeError):
+            content_length = None
+    if content_length is not None:
+        try:
+            declared_length = int(content_length)
+        except (TypeError, ValueError):
+            declared_length = None
+        if declared_length is not None and declared_length > resolved_limit:
+            raise ValueError(f"{label} exceeded the {resolved_limit:,}-byte limit.")
+    payload = response.read(resolved_limit + 1)
+    if len(payload) > resolved_limit:
+        raise ValueError(f"{label} exceeded the {resolved_limit:,}-byte limit.")
+    return payload
+
+
+def _read_bounded_error_detail(response: Any) -> str:
+    try:
+        payload = response.read(MAX_PROVIDER_ERROR_RESPONSE_BYTES + 1)
+    except OSError:
+        return ""
+    if len(payload) > MAX_PROVIDER_ERROR_RESPONSE_BYTES:
+        return "The provider returned an oversized error response."
+    return payload.decode("utf-8", errors="replace").strip()
+
+
+def _bounded_response_lines(
+    response: Any,
+    *,
+    max_line_bytes: int,
+    label: str,
+):
+    resolved_limit = max(1, int(max_line_bytes))
+    readline = getattr(response, "readline", None)
+    if callable(readline):
+        while True:
+            raw_line = readline(resolved_limit + 1)
+            if not raw_line:
+                return
+            if len(raw_line) > resolved_limit:
+                raise ValueError(f"{label} exceeded the {resolved_limit:,}-byte limit.")
+            yield raw_line
+        return
+
+    for raw_line in response:
+        if len(raw_line) > resolved_limit:
+            raise ValueError(f"{label} exceeded the {resolved_limit:,}-byte limit.")
+        yield raw_line
 
 
 def _context_from_ps_payload(payload: dict[str, Any], model: str) -> int | None:
@@ -787,6 +1202,20 @@ def _parse_positive_int(value: Any) -> int | None:
         return None
     parsed = int(digits)
     return parsed if parsed > 0 else None
+
+
+def _parse_ollama_model_size(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str) and value.strip().isdigit():
+        parsed = int(value.strip())
+    else:
+        return None
+    if parsed <= 0 or parsed > MAX_OLLAMA_MODEL_SIZE_BYTES:
+        return None
+    return parsed
 
 
 def _merge_ollama_model_payload(tag_payload: dict[str, Any], show_payload: dict[str, Any]) -> dict[str, Any]:
@@ -982,12 +1411,19 @@ def _config_chat_base_url(config: AppConfig) -> str:
     provider = _config_chat_provider(config)
     value = str(getattr(config, "chat_base_url", "") or "").strip()
     if value:
-        return value
+        return normalize_local_provider_base_url(value)
     if is_ollama_chat_provider(provider):
-        return str(getattr(config, "ollama_url", DEFAULT_OLLAMA_URL) or DEFAULT_OLLAMA_URL).strip()
-    return OPENAI_COMPATIBLE_PROVIDER_DEFAULT_URLS.get(
-        provider,
-        OPENAI_COMPATIBLE_PROVIDER_DEFAULT_URLS["openai-compatible"],
+        return normalize_local_provider_base_url(
+            str(
+                getattr(config, "ollama_url", DEFAULT_OLLAMA_URL)
+                or DEFAULT_OLLAMA_URL
+            ).strip()
+        )
+    return normalize_local_provider_base_url(
+        OPENAI_COMPATIBLE_PROVIDER_DEFAULT_URLS.get(
+            provider,
+            OPENAI_COMPATIBLE_PROVIDER_DEFAULT_URLS["openai-compatible"],
+        )
     )
 
 
@@ -1061,25 +1497,45 @@ def _openai_compatible_response_text(payload: dict[str, Any]) -> str:
 
 
 def _openai_compatible_delta_text(payload: dict[str, Any]) -> str:
+    return _openai_compatible_delta_parts(payload)[0]
+
+
+def _openai_compatible_delta_parts(payload: dict[str, Any]) -> tuple[str, str]:
     choices = payload.get("choices", [])
     if not isinstance(choices, list) or not choices:
-        return ""
+        return "", ""
     first = choices[0]
     if not isinstance(first, dict):
-        return ""
+        return "", ""
     delta = first.get("delta", {})
     if isinstance(delta, dict):
         content = delta.get("content", "")
+        reasoning_content = next(
+            (
+                str(delta[key])
+                for key in ("reasoning_content", "reasoning", "thinking")
+                if isinstance(delta.get(key), str) and delta.get(key)
+            ),
+            "",
+        )
         if isinstance(content, str):
-            return content
+            return content, reasoning_content
         if isinstance(content, list):
-            return _text_from_openai_content_parts(content)
+            return _text_from_openai_content_parts(content), reasoning_content
     message = first.get("message", {})
     if isinstance(message, dict):
         content = message.get("content", "")
+        reasoning_content = next(
+            (
+                str(message[key])
+                for key in ("reasoning_content", "reasoning", "thinking")
+                if isinstance(message.get(key), str) and message.get(key)
+            ),
+            "",
+        )
         if isinstance(content, str):
-            return content
-    return ""
+            return content, reasoning_content
+    return "", ""
 
 
 def _text_from_openai_content_parts(parts: list[Any]) -> str:
@@ -1095,6 +1551,12 @@ def _text_from_openai_content_parts(parts: list[Any]) -> str:
 
 
 def _close_chat_client(chat_model: Any) -> None:
+    abort = getattr(chat_model, "abort", None)
+    if callable(abort):
+        try:
+            abort()
+        except Exception:
+            pass
     client_wrapper = getattr(chat_model, "_client", None)
     transport_client = getattr(client_wrapper, "_client", None)
     close = getattr(transport_client, "close", None)

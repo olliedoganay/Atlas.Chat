@@ -7,6 +7,7 @@ describe("resolveBackendPhase", () => {
     expect(
       resolveBackendPhase({
         hasStatus: true,
+        isError: false,
         isPending: false,
         isFetching: false,
         bootStartedAt: 10,
@@ -15,10 +16,24 @@ describe("resolveBackendPhase", () => {
     ).toBe("online");
   });
 
+  it("returns offline when a refresh fails even if an older status payload is cached", () => {
+    expect(
+      resolveBackendPhase({
+        hasStatus: true,
+        isError: true,
+        isPending: false,
+        isFetching: false,
+        bootStartedAt: 10,
+        now: 50_000,
+      }),
+    ).toBe("offline");
+  });
+
   it("returns starting while the first status query is pending", () => {
     expect(
       resolveBackendPhase({
         hasStatus: false,
+        isError: false,
         isPending: true,
         isFetching: false,
         bootStartedAt: 10,
@@ -31,6 +46,7 @@ describe("resolveBackendPhase", () => {
     expect(
       resolveBackendPhase({
         hasStatus: false,
+        isError: false,
         isPending: false,
         isFetching: false,
         bootStartedAt: 1_000,
@@ -43,6 +59,7 @@ describe("resolveBackendPhase", () => {
     expect(
       resolveBackendPhase({
         hasStatus: false,
+        isError: false,
         isPending: false,
         isFetching: false,
         bootStartedAt: 1_000,

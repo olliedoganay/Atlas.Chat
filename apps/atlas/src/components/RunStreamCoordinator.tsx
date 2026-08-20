@@ -1,20 +1,26 @@
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef } from "react";
 
-import { getRun, streamRun, type RunSummary } from "../lib/api";
+import { getRun, getThreadRuns, streamRun, type RunSummary } from "../lib/api";
+import { selectRecoverableRun } from "../lib/runRecovery";
+import { isUserCancelledRunError } from "../lib/runTermination";
 import { useAtlasStore } from "../store/useAtlasStore";
 
-export function RunStreamCoordinator() {
+export function RunStreamCoordinator({ canRecoverRun }: { canRecoverRun: boolean }) {
   const queryClient = useQueryClient();
+  const currentUserId = useAtlasStore((state) => state.currentUserId);
+  const currentThreadId = useAtlasStore((state) => state.currentThreadId);
   const currentRunId = useAtlasStore((state) => state.currentRunId);
   const currentRunMode = useAtlasStore((state) => state.currentRunMode);
   const activeRunUserId = useAtlasStore((state) => state.activeRunUserId);
   const activeRunThreadId = useAtlasStore((state) => state.activeRunThreadId);
   const isStreaming = useAtlasStore((state) => state.isStreaming);
+  const recoverRun = useAtlasStore((state) => state.recoverRun);
   const appendThinking = useAtlasStore((state) => state.appendThinking);
   const appendToken = useAtlasStore((state) => state.appendToken);
   const setStage = useAtlasStore((state) => state.setStage);
   const completeRun = useAtlasStore((state) => state.completeRun);
+  const cancelRun = useAtlasStore((state) => state.cancelRun);
   const failRun = useAtlasStore((state) => state.failRun);
   const showCompactionNotice = useAtlasStore((state) => state.showCompactionNotice);
 
@@ -24,6 +30,47 @@ export function RunStreamCoordinator() {
   const thinkingBufferRef = useRef("");
   const tokenFlushTimerRef = useRef<number | null>(null);
   const thinkingFlushTimerRef = useRef<number | null>(null);
+  const attemptedRecoveryKeysRef = useRef(new Set<string>());
+  const recoveryKey = JSON.stringify([currentUserId, currentThreadId]);
+  const recoveryEnabled =
+    canRecoverRun &&
+    Boolean(currentUserId) &&
+    Boolean(currentThreadId) &&
+    !attemptedRecoveryKeysRef.current.has(recoveryKey) &&
+    !currentRunId &&
+    !isStreaming;
+  const {
+    data: recoveryRuns = [],
+    isFetchedAfterMount: recoveryRunsFetchedAfterMount,
+    isSuccess: recoveryRunsLoaded,
+  } = useQuery({
+    queryKey: ["thread-runs", currentUserId, currentThreadId],
+    queryFn: () => getThreadRuns(currentThreadId, currentUserId),
+    enabled: recoveryEnabled,
+    retry: 1,
+    refetchOnWindowFocus: false,
+    staleTime: 0,
+  });
+
+  useEffect(() => {
+    if (!recoveryEnabled || !recoveryRunsFetchedAfterMount || !recoveryRunsLoaded) {
+      return;
+    }
+    attemptedRecoveryKeysRef.current.add(recoveryKey);
+    const candidate = selectRecoverableRun(recoveryRuns, currentUserId, currentThreadId);
+    if (candidate) {
+      recoverRun(candidate);
+    }
+  }, [
+    currentThreadId,
+    currentUserId,
+    recoverRun,
+    recoveryKey,
+    recoveryEnabled,
+    recoveryRunsFetchedAfterMount,
+    recoveryRuns,
+    recoveryRunsLoaded,
+  ]);
 
   const clearTokenFlushTimer = () => {
     if (tokenFlushTimerRef.current !== null) {
@@ -126,7 +173,11 @@ export function RunStreamCoordinator() {
       }
       if (artifact.status === "failed") {
         await invalidateRunQueries(runId, userId, threadId);
-        failRun(artifact.error || fallbackMessage);
+        if (isUserCancelledRunError(artifact.error)) {
+          cancelRun();
+        } else {
+          failRun(artifact.error || fallbackMessage);
+        }
         return;
       }
     } catch {
@@ -230,7 +281,11 @@ export function RunStreamCoordinator() {
             teardownRef.current?.();
             teardownRef.current = null;
             void invalidateRunQueries(currentRunId, activeRunUserId, activeRunThreadId);
-            failRun(String(event.payload.error ?? "Atlas run failed."));
+            if (isUserCancelledRunError(event.payload.error)) {
+              cancelRun();
+            } else {
+              failRun(String(event.payload.error ?? "Atlas run failed."));
+            }
             break;
           default:
             break;
@@ -251,6 +306,7 @@ export function RunStreamCoordinator() {
     activeRunUserId,
     appendToken,
     appendThinking,
+    cancelRun,
     completeRun,
     currentRunId,
     currentRunMode,

@@ -51,7 +51,9 @@ export function DiscoveryPage() {
   const queryClient = useQueryClient();
   const [copiedCommand, setCopiedCommand] = useState("");
   const [activeFilter, setActiveFilter] = useState<DiscoveryFilter>("needs-pull");
+  const [actionError, setActionError] = useState("");
   const refreshedCompletedPulls = useRef(new Set<string>());
+  const copyResetTimerRef = useRef<number | null>(null);
   const { data, isPending, isFetching, isError, error } = useQuery({
     queryKey: ["discovery"],
     queryFn: getDiscovery,
@@ -59,7 +61,11 @@ export function DiscoveryPage() {
     retry: 1,
     refetchOnWindowFocus: false,
   });
-  const { data: modelPulls = [] } = useQuery({
+  const {
+    data: modelPulls = [],
+    isError: modelPullsError,
+    error: modelPullsQueryError,
+  } = useQuery({
     queryKey: ["model-pulls"],
     queryFn: listModelPulls,
     refetchInterval: (query) => {
@@ -73,18 +79,34 @@ export function DiscoveryPage() {
   });
   const startPullMutation = useMutation({
     mutationFn: startModelPull,
+    onMutate: () => {
+      setActionError("");
+    },
     onSuccess: (pull) => {
       queryClient.setQueryData<ModelPull[]>(["model-pulls"], (current = []) => [
         pull,
         ...current.filter((item) => item.pull_id !== pull.pull_id),
       ]);
     },
+    onError: (mutationError) => {
+      setActionError(
+        mutationError instanceof Error ? mutationError.message : "Atlas could not start the model download.",
+      );
+    },
   });
   const cancelPullMutation = useMutation({
     mutationFn: cancelModelPull,
+    onMutate: () => {
+      setActionError("");
+    },
     onSuccess: (pull) => {
       queryClient.setQueryData<ModelPull[]>(["model-pulls"], (current = []) =>
         current.map((item) => (item.pull_id === pull.pull_id ? pull : item)),
+      );
+    },
+    onError: (mutationError) => {
+      setActionError(
+        mutationError instanceof Error ? mutationError.message : "Atlas could not cancel the model download.",
       );
     },
   });
@@ -120,6 +142,15 @@ export function DiscoveryPage() {
       ),
     [modelPulls],
   );
+  const activePull = modelPulls.find(
+    (pull) => pull.status === "queued" || pull.status === "pulling",
+  );
+  const canStartManagedPull = supportsManagedPulls && !activePull && !startPullMutation.isPending;
+  const pullDisabledReason = !supportsManagedPulls
+    ? "Managed downloads require Ollama."
+    : activePull
+      ? `Finish or cancel ${activePull.model} before starting another download.`
+      : undefined;
 
   useEffect(() => {
     let shouldRefresh = false;
@@ -136,29 +167,58 @@ export function DiscoveryPage() {
       void Promise.all([
         queryClient.invalidateQueries({ queryKey: ["models"] }),
         queryClient.invalidateQueries({ queryKey: ["discovery"] }),
-      ]);
+      ]).catch((refreshError) => {
+        setActionError(
+          refreshError instanceof Error
+            ? refreshError.message
+            : "The model installed, but Atlas could not refresh Discovery.",
+        );
+      });
     }
   }, [modelPulls, queryClient]);
 
   const refreshDiscovery = async () => {
-    await Promise.all([
-      queryClient.invalidateQueries({ queryKey: ["status"] }),
-      queryClient.invalidateQueries({ queryKey: ["models"] }),
-      queryClient.invalidateQueries({ queryKey: ["discovery"] }),
-    ]);
+    setActionError("");
+    try {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["status"] }),
+        queryClient.invalidateQueries({ queryKey: ["models"] }),
+        queryClient.invalidateQueries({ queryKey: ["discovery"] }),
+      ]);
+    } catch (refreshError) {
+      setActionError(
+        refreshError instanceof Error ? refreshError.message : "Atlas could not refresh Discovery.",
+      );
+    }
   };
 
   const copyCommand = async (command: string) => {
     try {
       await navigator.clipboard.writeText(command);
       setCopiedCommand(command);
-      window.setTimeout(() => {
+      if (copyResetTimerRef.current !== null) {
+        window.clearTimeout(copyResetTimerRef.current);
+      }
+      copyResetTimerRef.current = window.setTimeout(() => {
+        copyResetTimerRef.current = null;
         setCopiedCommand((current) => (current === command ? "" : current));
       }, 1400);
-    } catch {
+    } catch (copyError) {
       setCopiedCommand("");
+      setActionError(
+        copyError instanceof Error ? copyError.message : "Atlas could not copy the pull command.",
+      );
     }
   };
+
+  useEffect(
+    () => () => {
+      if (copyResetTimerRef.current !== null) {
+        window.clearTimeout(copyResetTimerRef.current);
+      }
+    },
+    [],
+  );
 
   const handleFilterKeyDown = (event: ReactKeyboardEvent<HTMLButtonElement>, index: number) => {
     if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
@@ -191,6 +251,7 @@ export function DiscoveryPage() {
           <button
             aria-label="Refresh discovery"
             className="ghost-button icon-button discovery-icon-action"
+            disabled={isFetching}
             onClick={() => void refreshDiscovery()}
             title={isFetching ? "Refreshing" : "Refresh"}
             type="button"
@@ -204,6 +265,14 @@ export function DiscoveryPage() {
         <div className="error-banner" role="alert">
           Discovery is unavailable right now.{" "}
           {error instanceof Error ? error.message : "Atlas could not load the discovery report."}
+        </div>
+      ) : null}
+      {modelPullsError || actionError ? (
+        <div className="error-banner" role="alert">
+          {actionError ||
+            (modelPullsQueryError instanceof Error
+              ? modelPullsQueryError.message
+              : "Atlas could not load model-download status.")}
         </div>
       ) : null}
 
@@ -270,6 +339,10 @@ export function DiscoveryPage() {
                     <span>{nextStep.runtime}</span>
                     <span>{useCaseLabel(nextStep.use_case)}</span>
                     {nextStep.supports_images ? <span>Vision</span> : null}
+                    {nextStep.supports_reasoning ? <span>Reasoning</span> : null}
+                    {nextStep.model_size_gb ? (
+                      <span>{formatDiscoveryMemory(nextStep.model_size_gb)} model</span>
+                    ) : null}
                   </div>
                 </div>
 
@@ -291,7 +364,7 @@ export function DiscoveryPage() {
                         pull={pullsByModel.get(nextStep.name.toLocaleLowerCase())}
                       />
                       <PullButtons
-                        canPull={supportsManagedPulls}
+                        canPull={canStartManagedPull}
                         copied={copiedCommand === nextStep.pull_command}
                         isCancelling={
                           cancelPullMutation.isPending &&
@@ -306,6 +379,7 @@ export function DiscoveryPage() {
                         onCancel={(pullId) => cancelPullMutation.mutate(pullId)}
                         onCopy={copyCommand}
                         onPull={(model) => startPullMutation.mutate(model)}
+                        pullDisabledReason={pullDisabledReason}
                         pull={pullsByModel.get(nextStep.name.toLocaleLowerCase())}
                       />
                     </div>
@@ -382,7 +456,7 @@ export function DiscoveryPage() {
                 </div>
                 {filteredRecommendations.map((item) => (
                   <RecommendationRow
-                    canPull={supportsManagedPulls}
+                    canPull={canStartManagedPull}
                     copiedCommand={copiedCommand}
                     item={item}
                     key={item.name}
@@ -396,6 +470,7 @@ export function DiscoveryPage() {
                       startPullMutation.isPending ? startPullMutation.variables : undefined
                     }
                     pull={pullsByModel.get(item.name.toLocaleLowerCase())}
+                    pullDisabledReason={pullDisabledReason}
                   />
                 ))}
               </div>
@@ -451,6 +526,7 @@ function RecommendationRow({
   pendingCancelId,
   pendingModel,
   pull,
+  pullDisabledReason,
 }: {
   item: DiscoveryReport["recommended_models"][number];
   canPull: boolean;
@@ -461,6 +537,7 @@ function RecommendationRow({
   pendingCancelId?: string;
   pendingModel?: string;
   pull?: ModelPull;
+  pullDisabledReason?: string;
 }) {
   return (
     <article className="discovery-model-row">
@@ -486,6 +563,8 @@ function RecommendationRow({
       <div className="discovery-model-caps">
         <span>{useCaseLabel(item.use_case)}</span>
         {item.supports_images ? <span>Vision</span> : null}
+        {item.supports_reasoning ? <span>Reasoning</span> : null}
+        {item.model_size_gb ? <span>{formatDiscoveryMemory(item.model_size_gb)} model</span> : null}
       </div>
 
       <div className="discovery-model-action">
@@ -508,6 +587,7 @@ function RecommendationRow({
               onCopy={onCopy}
               onPull={onPull}
               pull={pull}
+              pullDisabledReason={pullDisabledReason}
             />
           </div>
         )}
@@ -568,6 +648,7 @@ function PullButtons({
   onCopy,
   onPull,
   pull,
+  pullDisabledReason,
 }: {
   canPull: boolean;
   compact?: boolean;
@@ -579,6 +660,7 @@ function PullButtons({
   onCopy: (command: string) => Promise<void>;
   onPull: (model: string) => void;
   pull?: ModelPull;
+  pullDisabledReason?: string;
 }) {
   const active = pull?.status === "queued" || pull?.status === "pulling";
   if (pull?.status === "completed") {
@@ -605,7 +687,7 @@ function PullButtons({
         className={compact ? "ghost-button compact-button" : "primary-button compact-button"}
         disabled={!canPull || isStarting}
         onClick={() => onPull(item.name)}
-        title={canPull ? undefined : "Managed downloads require Ollama."}
+        title={canPull ? undefined : pullDisabledReason || "Managed downloads are unavailable."}
         type="button"
       >
         {isStarting ? <LoaderCircle className="spin" size={14} /> : <Download size={14} />}
