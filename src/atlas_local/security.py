@@ -137,7 +137,8 @@ def unprotect_bytes(
         ctypes.byref(output_blob),
     )
     if not result:
-        raise ctypes.WinError()
+        error = ctypes.WinError()
+        raise RuntimeError("Protected data authentication failed.") from error
     try:
         return ctypes.string_at(output_blob.pbData, output_blob.cbData)
     finally:

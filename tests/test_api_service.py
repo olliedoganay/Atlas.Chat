@@ -2,6 +2,7 @@ import unittest
 import tempfile
 import threading
 import time
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -562,9 +563,11 @@ class UserProtectionTests(unittest.TestCase):
             store.create_user("other")
             owner_thread_id = scoped_thread_id("owner", "main")
             other_thread_id = scoped_thread_id("other", "main")
-            with open_application_sqlite(
-                config.langgraph_checkpoint_db,
-                data_dir=config.data_dir,
+            with closing(
+                open_application_sqlite(
+                    config.langgraph_checkpoint_db,
+                    data_dir=config.data_dir,
+                )
             ) as conn:
                 conn.execute("CREATE TABLE checkpoints (thread_id TEXT)")
                 conn.execute("CREATE TABLE writes (thread_id TEXT)")
@@ -587,9 +590,11 @@ class UserProtectionTests(unittest.TestCase):
 
             service.reset_thread(user_id="owner", thread_id="main")
 
-            with open_application_sqlite(
-                config.langgraph_checkpoint_db,
-                data_dir=config.data_dir,
+            with closing(
+                open_application_sqlite(
+                    config.langgraph_checkpoint_db,
+                    data_dir=config.data_dir,
+                )
             ) as conn:
                 checkpoint_rows = conn.execute(
                     "SELECT thread_id FROM checkpoints"
@@ -604,9 +609,11 @@ class UserProtectionTests(unittest.TestCase):
             store = RunStore(config)
             store.create_user("owner")
             runtime_thread_id = scoped_thread_id("owner", "orphan")
-            with open_application_sqlite(
-                config.langgraph_checkpoint_db,
-                data_dir=config.data_dir,
+            with closing(
+                open_application_sqlite(
+                    config.langgraph_checkpoint_db,
+                    data_dir=config.data_dir,
+                )
             ) as conn:
                 conn.execute("CREATE TABLE checkpoints (thread_id TEXT)")
                 conn.execute("CREATE TABLE writes (thread_id TEXT)")
@@ -639,9 +646,11 @@ class UserProtectionTests(unittest.TestCase):
                 confirmation_user_id="owner",
             )
 
-            with open_application_sqlite(
-                config.langgraph_checkpoint_db,
-                data_dir=config.data_dir,
+            with closing(
+                open_application_sqlite(
+                    config.langgraph_checkpoint_db,
+                    data_dir=config.data_dir,
+                )
             ) as conn:
                 checkpoint_count = conn.execute(
                     "SELECT count(*) FROM checkpoints"
@@ -1488,9 +1497,11 @@ class MutationBarrierTests(unittest.TestCase):
                 temp_dir,
                 memory_service=SimpleNamespace(reset=reset_memory),
             )
-            with open_application_sqlite(
-                service.config.langgraph_checkpoint_db,
-                data_dir=service.config.data_dir,
+            with closing(
+                open_application_sqlite(
+                    service.config.langgraph_checkpoint_db,
+                    data_dir=service.config.data_dir,
+                )
             ) as conn:
                 conn.execute("CREATE TABLE checkpoints (thread_id TEXT)")
                 conn.execute("CREATE TABLE writes (thread_id TEXT)")

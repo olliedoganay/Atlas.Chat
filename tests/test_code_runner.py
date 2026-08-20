@@ -926,6 +926,7 @@ class CodeRunnerPolicyTests(unittest.TestCase):
             ),
         ):
             manager._build("docker")
+            self.assertEqual(manager.status("docker")["state"], "ready")
 
         args = captured["args"]
         self.assertEqual(args[:3], ["docker", "build", "--pull"])
@@ -933,7 +934,6 @@ class CodeRunnerPolicyTests(unittest.TestCase):
         self.assertIn(str(PYTHON_GUI_RUNTIME_CONTEXT / "Dockerfile"), args)
         self.assertIn(PYTHON_GUI_IMAGE, args)
         self.assertFalse(any("atlas-run-" in value for value in args))
-        self.assertEqual(manager.status("docker")["state"], "ready")
 
     def test_runner_runtime_preparation_rejects_unbundled_gui_dependencies_early(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "does not include.*customtkinter"):

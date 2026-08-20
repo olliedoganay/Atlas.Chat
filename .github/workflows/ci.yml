@@ -74,6 +74,14 @@ jobs:
         run: python scripts/check_atlas_version.py
 
       - name: Run backend tests
+        if: runner.os != 'Linux'
+        run: python -m unittest discover -s tests
+
+      - name: Run backend tests with isolated CI keyring
+        if: runner.os == 'Linux'
+        env:
+          PYTHON_KEYRING_BACKEND: ci_keyring.MemoryKeyring
+          PYTHONPATH: ${{ github.workspace }}/scripts
         run: python -m unittest discover -s tests
 
       - name: Lint Python

@@ -3,7 +3,9 @@ from __future__ import annotations
 import atexit
 import ast
 import hashlib
+import io
 import json
+import logging
 import os
 import queue
 import re
@@ -15,6 +17,7 @@ import sys
 import tempfile
 import threading
 import time
+import tokenize
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
@@ -22,6 +25,9 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .run_contract import DEFAULT_SUBSCRIBER_QUEUE_SIZE, put_bounded_queue
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -281,11 +287,15 @@ PYTHON_SAFE_PACKAGE_SPEC_RE = re.compile(
     r"(?:(?:===|==|!=|~=|>=|<=|>|<)[A-Za-z0-9][A-Za-z0-9_.!+*:-]*"
     r"(?:,(?:===|==|!=|~=|>=|<=|>|<)[A-Za-z0-9][A-Za-z0-9_.!+*:-]*)*)?$"
 )
-PYTHON_PIP_INSTALL_HINT_RE = re.compile(
-    r"(?i)(?:^|[^\w.-])(?:python(?:3)?\s+-m\s+pip|pip(?:3)?|%\s*pip)\s+install\s+(.+)$"
-)
-PYTHON_REQUIREMENTS_HINT_RE = re.compile(
-    r"(?i)^\s*(?:[#/]+\s*)?(?:requirements?|dependencies?|packages?|requires?)\b\s*:?\s*(.+)$"
+PYTHON_REQUIREMENTS_HINT_LABELS = (
+    "requirements",
+    "requirement",
+    "dependencies",
+    "dependency",
+    "packages",
+    "package",
+    "requires",
+    "require",
 )
 PYTHON_PIP_OPTION_VALUE_FLAGS = {
     "-C",
@@ -464,8 +474,47 @@ def _python_terminal_detected(code: str, imports: set[str]) -> bool:
 
 
 def _python_gui_args(code: str) -> list[str]:
-    if re.search(r"add_argument\s*\([^)]*['\"]--gui['\"]", code, re.DOTALL):
-        return ["--gui"]
+    waiting_for_call = False
+    call_depth = 0
+    ignored_types = {
+        tokenize.COMMENT,
+        tokenize.DEDENT,
+        tokenize.ENCODING,
+        tokenize.INDENT,
+        tokenize.NL,
+        tokenize.NEWLINE,
+    }
+    try:
+        tokens = tokenize.generate_tokens(io.StringIO(code).readline)
+        for token in tokens:
+            if call_depth:
+                if token.type == tokenize.OP:
+                    if token.string == "(":
+                        call_depth += 1
+                    elif token.string == ")":
+                        call_depth -= 1
+                elif token.type == tokenize.STRING:
+                    try:
+                        value = ast.literal_eval(token.string)
+                    except (SyntaxError, ValueError):
+                        continue
+                    if value == "--gui":
+                        return ["--gui"]
+                continue
+
+            if waiting_for_call:
+                if token.type in ignored_types:
+                    continue
+                if token.type == tokenize.OP and token.string == "(":
+                    call_depth = 1
+                    waiting_for_call = False
+                    continue
+                waiting_for_call = False
+
+            if token.type == tokenize.NAME and token.string == "add_argument":
+                waiting_for_call = True
+    except (IndentationError, tokenize.TokenError):
+        pass
     return []
 
 
@@ -647,24 +696,122 @@ def _python_declared_pip_packages(code: str) -> list[str]:
         line = raw_line.strip()
         if not line:
             continue
-        normalized = re.sub(r"^\s*(?:#|//)+\s*", "", line)
-        for match in PYTHON_PIP_INSTALL_HINT_RE.finditer(normalized):
-            packages.extend(_python_package_tokens_from_hint(match.group(1)))
+        normalized = _strip_python_hint_comment(line)
+        pip_hint = _python_pip_install_hint(normalized)
+        if pip_hint is not None:
+            packages.extend(_python_package_tokens_from_hint(pip_hint))
 
-        requirements_match = PYTHON_REQUIREMENTS_HINT_RE.match(normalized)
-        if requirements_match:
-            hint = requirements_match.group(1)
+        requirements_hint = _python_requirements_hint(normalized)
+        if requirements_hint is not None:
+            hint = requirements_hint
             if _python_hint_declares_no_packages(hint):
                 continue
-            pip_match = PYTHON_PIP_INSTALL_HINT_RE.search(hint)
-            if pip_match:
-                hint = pip_match.group(1)
+            nested_pip_hint = _python_pip_install_hint(hint)
+            if nested_pip_hint is not None:
+                hint = nested_pip_hint
             packages.extend(_python_package_tokens_from_hint(hint.replace(",", " ")))
     return sorted(dict.fromkeys(packages))
 
 
+def _strip_python_hint_comment(line: str) -> str:
+    normalized = line.lstrip()
+    while normalized:
+        if normalized.startswith("//"):
+            normalized = normalized[2:].lstrip()
+        elif normalized.startswith("#"):
+            normalized = normalized[1:].lstrip()
+        else:
+            break
+    return normalized
+
+
+def _skip_python_hint_whitespace(value: str, index: int) -> int:
+    while index < len(value) and value[index].isspace():
+        index += 1
+    return index
+
+
+def _require_python_hint_whitespace(value: str, index: int) -> int | None:
+    end = _skip_python_hint_whitespace(value, index)
+    return end if end > index else None
+
+
+def _python_pip_install_hint(value: str) -> str | None:
+    lowered = value.lower()
+    for start in range(len(value)):
+        if start and (value[start - 1].isalnum() or value[start - 1] in "_.-"):
+            continue
+        payload_start = _python_pip_install_payload_start(value, lowered, start)
+        if payload_start is not None:
+            return value[payload_start:]
+    return None
+
+
+def _python_pip_install_payload_start(value: str, lowered: str, start: int) -> int | None:
+    index = start
+    if lowered.startswith("%", index):
+        index = _skip_python_hint_whitespace(value, index + 1)
+        if not lowered.startswith("pip", index):
+            return None
+        index += len("pip")
+    elif lowered.startswith("python3", index):
+        index += len("python3")
+        index = _require_python_hint_whitespace(value, index)
+        if index is None or not lowered.startswith("-m", index):
+            return None
+        index = _require_python_hint_whitespace(value, index + len("-m"))
+        if index is None or not lowered.startswith("pip", index):
+            return None
+        index += len("pip")
+    elif lowered.startswith("python", index):
+        index += len("python")
+        index = _require_python_hint_whitespace(value, index)
+        if index is None or not lowered.startswith("-m", index):
+            return None
+        index = _require_python_hint_whitespace(value, index + len("-m"))
+        if index is None or not lowered.startswith("pip", index):
+            return None
+        index += len("pip")
+    elif lowered.startswith("pip3", index):
+        index += len("pip3")
+    elif lowered.startswith("pip", index):
+        index += len("pip")
+    else:
+        return None
+
+    index = _require_python_hint_whitespace(value, index)
+    if index is None or not lowered.startswith("install", index):
+        return None
+    index = _require_python_hint_whitespace(value, index + len("install"))
+    if index is None or index >= len(value):
+        return None
+    return index
+
+
+def _python_requirements_hint(value: str) -> str | None:
+    normalized = value.lstrip()
+    lowered = normalized.lower()
+    for label in PYTHON_REQUIREMENTS_HINT_LABELS:
+        if not lowered.startswith(label):
+            continue
+        index = len(label)
+        if index < len(normalized) and (normalized[index].isalnum() or normalized[index] == "_"):
+            continue
+        index = _skip_python_hint_whitespace(normalized, index)
+        if index < len(normalized) and normalized[index] == ":":
+            index = _skip_python_hint_whitespace(normalized, index + 1)
+        if index < len(normalized):
+            return normalized[index:]
+    return None
+
+
 def _python_hint_declares_no_packages(hint: str) -> bool:
-    normalized = re.sub(r"[^a-z0-9]+", " ", hint.lower()).strip()
+    normalized = " ".join(
+        "".join(
+            character if character.isascii() and character.isalnum() else " "
+            for character in hint.lower()
+        ).split()
+    )
     return (
         normalized in {"none", "no", "na", "n a", "stdlib", "standard library"}
         or normalized.startswith("none ")
@@ -675,8 +822,7 @@ def _python_hint_declares_no_packages(hint: str) -> bool:
 
 
 def _python_package_tokens_from_hint(hint: str) -> list[str]:
-    cleaned = re.split(r"\s*(?:&&|\|\||;|\|)\s*", hint, maxsplit=1)[0]
-    cleaned = re.split(r"\s+(?:and\s+then|then|before|after|to\s+run)\b", cleaned, maxsplit=1)[0]
+    cleaned = _truncate_python_package_hint(hint)
     try:
         tokens = shlex.split(cleaned, comments=True)
     except ValueError:
@@ -708,6 +854,53 @@ def _python_package_tokens_from_hint(hint: str) -> list[str]:
         if PYTHON_SAFE_PACKAGE_SPEC_RE.match(token):
             packages.append(token)
     return packages
+
+
+def _truncate_python_package_hint(hint: str) -> str:
+    end = len(hint)
+    for separator in ("&&", "||", ";", "|"):
+        position = hint.find(separator)
+        if position >= 0:
+            end = min(end, position)
+    instruction_start = _python_hint_instruction_start(hint[:end])
+    if instruction_start is not None:
+        end = min(end, instruction_start)
+    return hint[:end]
+
+
+def _python_hint_instruction_start(hint: str) -> int | None:
+    index = 0
+    while index < len(hint):
+        if not hint[index].isspace():
+            index += 1
+            continue
+        whitespace_start = index
+        index = _skip_python_hint_whitespace(hint, index)
+        word_start = index
+        while index < len(hint) and hint[index].isalpha():
+            index += 1
+        if index == word_start:
+            index += 1
+            continue
+        first_word = hint[word_start:index].lower()
+        if index < len(hint) and (hint[index].isalnum() or hint[index] == "_"):
+            continue
+        if first_word in {"then", "before", "after"}:
+            return whitespace_start
+        if first_word not in {"and", "to"}:
+            continue
+        second_start = _require_python_hint_whitespace(hint, index)
+        if second_start is None:
+            continue
+        second_end = second_start
+        while second_end < len(hint) and hint[second_end].isalpha():
+            second_end += 1
+        second_word = hint[second_start:second_end].lower()
+        if second_end < len(hint) and (hint[second_end].isalnum() or hint[second_end] == "_"):
+            continue
+        if (first_word, second_word) in {("and", "then"), ("to", "run")}:
+            return whitespace_start
+    return None
 
 
 def _python_dependency_repair_may_need_network(code: str) -> bool:
@@ -1807,8 +2000,9 @@ def _inspect_python_gui_runtime(binary: str) -> tuple[bool, int | None, str | No
             timeout=10,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return False, None, str(exc)
+    except (OSError, subprocess.TimeoutExpired):
+        logger.warning("Could not inspect the trusted Python GUI runtime image.", exc_info=True)
+        return False, None, "Docker could not inspect the Python GUI runtime image."
     if completed.returncode != 0:
         return False, None, None
     try:
@@ -1965,14 +2159,18 @@ class PythonGuiRuntimeManager:
                         f"Details: {detail}"
                     )
                     self._message = "Runtime preparation failed."
-        except OSError as exc:
+        except OSError:
+            logger.exception("Could not start the trusted Python GUI runtime build.")
             with self._lock:
                 self._process = None
                 self._completed_at = time.time()
                 self._state = "failed"
                 self._progress = 0.0
                 self._message = "Runtime preparation failed."
-                self._error = f"Could not start the trusted container build: {exc}"
+                self._error = (
+                    "Could not start the trusted container build. "
+                    "Check Docker availability and retry."
+                )
 
     def _record_build_line(self, raw_line: str) -> None:
         line = raw_line.strip()

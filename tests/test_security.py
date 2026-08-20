@@ -189,6 +189,26 @@ class SecurityStorageTests(unittest.TestCase):
         ):
             unprotect_bytes_with_key(bytes(encrypted), key=key, aad=b"scope")
 
+    def test_windows_dpapi_unprotect_failure_is_normalized(self) -> None:
+        windows_error = OSError(87, "The parameter is incorrect.")
+        with (
+            patch("atlas_local.security.os.name", "nt"),
+            patch("atlas_local.security.ctypes.windll", create=True) as windll,
+            patch(
+                "atlas_local.security.ctypes.WinError",
+                return_value=windows_error,
+                create=True,
+            ),
+        ):
+            windll.crypt32.CryptUnprotectData.return_value = 0
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Protected data authentication failed",
+            ) as raised:
+                unprotect_bytes(b"forged-windows-dpapi-payload")
+
+        self.assertIs(raised.exception.__cause__, windows_error)
+
     def test_application_sqlite_writes_encrypted_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp)

@@ -131,6 +131,9 @@ jobs:
         run: python scripts/check_atlas_version.py
 
       - name: Test and lint backend
+        env:
+          PYTHON_KEYRING_BACKEND: ci_keyring.MemoryKeyring
+          PYTHONPATH: ${{ github.workspace }}/scripts
         run: |
           python -m unittest discover -s tests
           ruff check src tests scripts
