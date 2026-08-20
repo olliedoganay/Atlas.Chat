@@ -1,6 +1,6 @@
 [package]
 name = "atlas-desktop"
-version = "1.3.0"
+version = "1.3.1"
 description = "Atlas desktop shell for the local chat runtime."
 authors = ["Atlas"]
 license = "MIT"
