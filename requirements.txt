@@ -1,5 +1,5 @@
 cryptography==50.0.0
-fastapi==0.139.2
+fastapi==0.141.1
 httpx2==2.7.0
 keyring==25.7.0
 langchain-ollama==1.1.0
