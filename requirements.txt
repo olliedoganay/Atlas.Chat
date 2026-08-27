@@ -5,7 +5,7 @@ keyring==25.7.0
 langchain-ollama==1.1.0
 langgraph==1.2.9
 langgraph-checkpoint-sqlite==3.1.1
-mem0ai==2.0.13
+mem0ai==2.0.18
 pypdf==6.15.0
 pyinstaller==6.21.0
 pytest==9.1.1
